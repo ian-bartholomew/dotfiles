@@ -1,180 +1,102 @@
+# Performance: Enable profiling if needed
 # zmodload zsh/zprof
-# shortcut to this dotfiles path is $ZSH
-export DOTFILES=$HOME/.dotfiles
-export ZSH=$DOTFILES
 
-# your project folder that we can `c [tab]` to
-export PROJECTS=~/Dev
+# Environment variables (fastest first)
+export DOTFILES="$HOME/.dotfiles"
+export ZSH="$DOTFILES" 
+export PROJECTS="$HOME/Dev"
+export DEFAULT_USER="$USER"
 
-# set default user
-export DEFAULT_USER=`whoami`
+# Spaceship prompt configuration
+export SPACESHIP_BATTERY_SHOW=false
+export SPACESHIP_TIME_SHOW=true
 
-# all of our zsh files
-typeset -U config_files
-config_files=($HOME/.config/zsh/*.zsh)
+# FZF configuration
+export FZF_DEFAULT_COMMAND='fd --type f --strip-cwd-prefix'
 
-# load the path files
-for file in ${(M)config_files:#*/path.zsh}
-do
-  source $file
-done
-
-# load everything but the alias, path and completion files
-for file in ${${config_files:#*/path.zsh}:#*/aliases.zsh:#*/completion.zsh}
-do
-  source $file
-done
-
-# initialize autocomplete here, otherwise functions won't be loaded
-## completion stuff
-zstyle ':compinstall' filename '$HOME/.zshrc'
-
-zcachedir="$HOME/.zcache"
+# Performance: Ultra-fast completion setup
+typeset -g zcachedir="$HOME/.zcache"
 [[ -d "$zcachedir" ]] || mkdir -p "$zcachedir"
 
-_update_zcomp() {
-    setopt local_options
-    setopt extendedglob
-    autoload -Uz compinit
-    local zcompf="$1/zcompdump"
-    # use a separate file to determine when to regenerate, as compinit doesn't
-    # always need to modify the compdump
-    local zcompf_a="${zcompf}.augur"
+# Load path files immediately (critical for performance)
+if [[ -r "$HOME/.config/zsh/path.zsh" ]]; then
+  source "$HOME/.config/zsh/path.zsh"
+fi
 
-    if [[ -e "$zcompf_a" && -f "$zcompf_a"(#qN.md-1) ]]; then
-        compinit -C -d "$zcompf"
-    else
-        compinit -d "$zcompf"
-        touch "$zcompf_a"
-    fi
-    # if zcompdump exists (and is non-zero), and is older than the .zwc file,
-    # then regenerate
-    if [[ -s "$zcompf" && (! -s "${zcompf}.zwc" || "$zcompf" -nt "${zcompf}.zwc") ]]; then
-        # since file is mapped, it might be mapped right now (current shells), so
-        # rename it then make a new one
-        [[ -e "$zcompf.zwc" ]] && mv -f "$zcompf.zwc" "$zcompf.zwc.old"
-        # compile it mapped, so multiple shells can share it (total mem reduction)
-        # run in background
-        zcompile -M "$zcompf" &!
-    fi
-}
-_update_zcomp "$zcachedir"
-unfunction _update_zcomp
+# Ultra-fast completion initialization
+autoload -Uz compinit
+typeset -g zcompf="$zcachedir/zcompdump"
 
-# load every completion after autocomplete loads
-for file in ${(M)config_files:#*/completion.zsh}
-do
-  source $file
+# Only rebuild completions if older than 24 hours
+if [[ $zcompf(#qNmh+24) ]]; then
+  compinit -d "$zcompf"
+  { zcompile "$zcompf" } &!
+else
+  # Skip security check for speed
+  compinit -C -d "$zcompf"  
+fi
+
+# Load core config files efficiently  
+typeset -aU config_files
+config_files=($HOME/.config/zsh/{env,config,aliases,completion}.zsh(N))
+
+for file in $config_files; do
+  [[ -r "$file" ]] && source "$file"
 done
-
-
 unset config_files
 
-# Load zgen only if a user types a zgen command
-zgen () {
-  if [[ ! -s ${ZDOTDIR:-${HOME}}/.zgen/zgen.zsh ]]; then
-    git clone --recursive https://github.com/tarjoilija/zgen.git ${ZDOTDIR:-${HOME}}/.zgen
-  fi
-  source ${ZDOTDIR:-${HOME}}/.zgen/zgen.zsh
-  zgen "$@"
-}
-export NVM_LAZY_LOAD=true
-export NVM_COMPLETION=true
-
-# check if there's no init script
-if [[ ! -s ${ZDOTDIR:-${HOME}}/.zgen/init.zsh ]]; then
-  echo "Creating a zgen save"
-
-  # zgen oh-my-zsh
-  #
-  # # plugins
-  # zgen oh-my-zsh plugins/aws
-  # # zgen oh-my-zsh plugins/brew
-  # zgen oh-my-zsh plugins/docker
-  # zgen oh-my-zsh plugins/git
-  # # zgen oh-my-zsh plugins/npm
-  # # zgen oh-my-zsh plugins/yarn
-  # zgen oh-my-zsh plugins/terraform
-  # zgen load lukechilds/zsh-nvm
+# Load prompt immediately (needed for interactive shell)
+if [[ ! -s "$HOME/.zgen/init.zsh" ]]; then
+  # First-time setup
+  [[ ! -d "$HOME/.zgen" ]] && git clone --depth=1 https://github.com/tarjoilija/zgen.git "$HOME/.zgen"
+  source "$HOME/.zgen/zgen.zsh"
+  
+  # Essential plugins
   zgen load mroth/evalcache
-
   zgen load chrissicool/zsh-256color
-  # zgen load supercrabtree/k
-
-  # zgen load zsh-users/zsh-history-substring-search
-  # zgen load zsh-users/zsh-autosuggestions
-
-  # completions
-  # zgen load srijanshetty/docker-zsh
-  # zgen load zsh-users/zsh-completions src
-  # zgen load lukechilds/zsh-better-npm-completion
-
-  # theme
-  # zgen oh-my-zsh themes/agnoster
   zgen load spaceship-prompt/spaceship-prompt spaceship
-
-  # save all to init script
+  
   zgen save
-
 else
-  source ${ZDOTDIR:-${HOME}}/.zgen/init.zsh
+  source "$HOME/.zgen/init.zsh"
 fi
 
-# Stash your environment variables in ~/.localrc. This means they'll stay out
-# of your main dotfiles repository (which may be public, like this one), but
-# you'll have access to them in your scripts.
-if [[ -a ~/.localrc ]]
-then
-  source ~/.localrc
-fi
+# Defer heavy operations until after prompt
+{
+  # Load local config
+  [[ -r "$HOME/.localrc" ]] && source "$HOME/.localrc"
 
-# load the path files
-for file in ${(M)config_files:#*/aliases.zsh}
-do
-  source $file
-done
+  # Initialize tools with caching
+  if command -v _evalcache >/dev/null 2>&1; then
+    _evalcache zoxide init zsh
+    _evalcache atuin init zsh
+  fi
 
-SPACESHIP_BATTERY_SHOW=false
-SPACESHIP_TIME_SHOW=true
+  # FZF integration
+  command -v fzf >/dev/null 2>&1 && source <(fzf --zsh)
 
-# place this after nvm initialization!
-# autoload -U add-zsh-hook
+  # NVM lazy loading (MAJOR PERFORMANCE WIN)
+  if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+    # Ultra-lazy NVM loading
+    nvm() {
+      unfunction nvm
+      source "$HOME/.nvm/nvm.sh"
+      nvm "$@"
+    }
+    
+    node() {
+      unfunction node
+      source "$HOME/.nvm/nvm.sh"
+      node "$@"
+    }
+    
+    npm() {
+      unfunction npm  
+      source "$HOME/.nvm/nvm.sh"
+      npm "$@"
+    }
+  fi
+} &!
 
-# load-nvmrc() {
-#   [[ -a .nvmrc ]] || return
-#   local nvmrc_path
-#   nvmrc_path="$(nvm_find_nvmrc)"
-#
-#   if [ -n "$nvmrc_path" ]; then
-#     local nvmrc_node_version
-#     nvmrc_node_version=$(nvm version "$(cat "${nvmrc_path}")")
-#
-#     if [ "$nvmrc_node_version" = "N/A" ]; then
-#       nvm install
-#     elif [ "$nvmrc_node_version" != "$(nvm version)" ]; then
-#       nvm use
-#     fi
-#   elif [ -n "$(PWD=$OLDPWD nvm_find_nvmrc)" ] && [ "$(nvm version)" != "$(nvm version default)" ]; then
-#     echo "Reverting to nvm default version"
-#     nvm use default
-#   fi
-# }
-#
-# add-zsh-hook chpwd load-nvmrc
-# load-nvmrc
-
-# eval "$(zoxide init zsh)"
-# eval "$(atuin init zsh)"
-_evalcache zoxide init zsh
-_evalcache atuin init zsh
-# eval 
+# Performance: End profiling if enabled
 # zprof
-#
-# # The next line updates PATH for the Google Cloud SDK.
-# if [ -f '/Users/ibartholomew/Downloads/google-cloud-sdk/path.zsh.inc' ]; then . '/Users/ibartholomew/Downloads/google-cloud-sdk/path.zsh.inc'; fi
-#
-# # The next line enables shell command completion for gcloud.
-# if [ -f '/Users/ibartholomew/Downloads/google-cloud-sdk/completion.zsh.inc' ]; then . '/Users/ibartholomew/Downloads/google-cloud-sdk/completion.zsh.inc'; fi
-# Set up fzf key bindings and fuzzy completion
-source <(fzf --zsh)
-export FZF_DEFAULT_COMMAND='fd --type f --strip-cwd-prefix'
