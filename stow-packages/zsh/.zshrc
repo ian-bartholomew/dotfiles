@@ -75,7 +75,7 @@ fi
   # FZF integration
   command -v fzf >/dev/null 2>&1 && source <(fzf --zsh)
 
-  # NVM lazy loading (MAJOR PERFORMANCE WIN)
+  # NVM lazy loading 
   if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
     # Ultra-lazy NVM loading
     nvm() {

@@ -22,6 +22,7 @@ brew 'fd'
 brew 'zoxide'
 brew 'atuin'
 brew 'the_silver_searcher'
+brew 'tpm'
 
 # Development tools
 brew 'git'
