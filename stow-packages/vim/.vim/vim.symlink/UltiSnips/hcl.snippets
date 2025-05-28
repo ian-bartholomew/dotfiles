@@ -1,0 +1,15 @@
+snippet include "include"
+include "root" {
+  path = find_in_parent_folders()
+}
+
+terraform {
+  source = $1
+}
+
+inputs = {}
+endsnippet
+
+snippet cloudposse "cloudposse"
+"git::git@github.com:cloudposse/terraform-aws-$1//?ref=$2"
+endsnippet

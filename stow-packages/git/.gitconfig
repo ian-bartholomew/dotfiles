@@ -1,0 +1,82 @@
+# Sample gitconfig
+#
+
+[hub]
+        protocol = https
+[user]
+	name = Ian Bartholomew
+	email = ian@assured.claims
+	signingkey = 850CF6442BA8BF89
+[credential]
+        helper = osxkeychain
+[alias]
+        co = checkout
+        ci = commit
+        promote = !$ZSH/bin/git-promote
+        wtf     = !$ZSH/bin/git-wtf
+        rank-contributors = !$ZSH/bin/git-rank-contributors
+        count   = !git shortlog -sn
+        gone = "!f() { git fetch --all --prune; git branch -vv | awk '/: gone]/{print $1}' | xargs git branch -D; }; f"
+        lg = !git log --pretty=format:\"%C(magenta)%h%Creset -%C(red)%d%Creset %s %C(dim green)(%cr) [%an]\" --abbrev-commit -30
+        undo = reset HEAD~1 --mixed
+        ll = log --oneline
+        se = !git rev-list --all | xargs git grep -F
+        save = !git add -A && git commit -m 'chore: commit save point'
+[color]
+        diff = auto
+        status = auto
+        branch = auto
+        ui = true
+[core]
+        excludesfile = ~/.gitignore
+	      editor = nvim
+
+[apply]
+        whitespace = nowarn
+
+[help]
+        autocorrect = 1
+
+[push]
+        # See `git help config` (search for push.default)
+        # for more information on different options of the below setting.
+        #
+        # Setting to git 2.0 default to suppress warning message
+        default = simple
+[commit]
+	gpgsign = true
+
+[init]
+	templateDir = /Users/ibartholomew/.git-template
+	defaultBranch = main
+
+
+# [diff]
+#         external = difft
+[difftool]
+        prompt = false
+[merge]
+	tool = kdiff3
+; [diff]
+;     tool = nvimdiff
+; [difftool]
+;     prompt = false
+; [difftool "nvimdiff"]
+;     cmd = "nvim -d \"$LOCAL\" \"$REMOTE\""
+; [merge]
+;     tool = nvimdiff
+; [mergetool]
+;     prompt = true
+; [mergetool "nvimdiff"]
+;     cmd = "nvim -d \"$LOCAL\" \"$MERGED\" \"$BASE\" \"$REMOTE\" -c 'wincmd w' -c 'wincmd J'"
+; [mergetool]
+;     prompt = true
+;     keepBackup = false
+;     path = nvim
+
+[pull]
+	rebase = false
+; [url "https://gitlab.com/"]
+; 	insteadOf = git@gitlab.com:
+[http]
+	sslVerify = false

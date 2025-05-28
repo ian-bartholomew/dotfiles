@@ -1,0 +1,19 @@
+snippet comment_block "comment_block"
+/**
+*
+* $1
+*
+*/
+endsnippet
+
+snippet required_provider "required_provider"
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.8.0"
+    }
+  }
+  required_version = ">= 1.0.0"
+}
+endsnippet

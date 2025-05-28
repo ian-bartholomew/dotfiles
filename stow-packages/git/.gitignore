@@ -1,0 +1,17 @@
+.DS_Store
+*.orig
+*~
+*.swp
+Session.vim
+.netrwhist
+tags
+tags-js
+.ctags
+.tags
+.tern-project
+.tern-port
+.localrc
+.agignore
+.tool-versions
+.ipynb_checkpoints/**/*
+CLAUDE.md

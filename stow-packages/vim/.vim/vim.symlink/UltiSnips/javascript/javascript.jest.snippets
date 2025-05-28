@@ -1,0 +1,47 @@
+snippet sha "shallow"
+const wrapper = shallow(<$1 />);
+endsnippet
+
+snippet des "describe"
+describe('${1}', () => {
+  ${2}
+});
+endsnippet
+
+snippet ba
+beforeAll(() => {
+  $1
+});
+endsnippet
+
+snippet be
+beforeEach(() => {
+  $1
+});
+endsnippet
+
+snippet ae
+afterEach(() => {
+  $1
+});
+endsnippet
+
+snippet tms "To Match Snapshot"
+expect(wrapper).toMatchSnapshot();
+endsnippet
+
+snippet jest
+const $1 = require('../$1.js')
+
+describe('$1 test suite', () => {
+  it('$2', () => {
+    $3
+  });
+});
+endsnippet
+
+snippet it
+it('${1}', () => {
+	${2}
+});
+endsnippet

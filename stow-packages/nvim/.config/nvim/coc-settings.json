@@ -1,0 +1,90 @@
+{
+  "languageserver": {
+    "bash": {
+      "command": "bash-language-server",
+      "args": ["start"],
+      "filetypes": ["sh"],
+      "ignoredRootPaths": ["~"]
+    },
+    "dockerfile": {
+      "command": "docker-langserver",
+      "filetypes": ["dockerfile"],
+      "args": ["--stdio"]
+    },
+    "terraform": {
+      "command": "terraform-ls",
+      "args": ["serve"],
+      "filetypes": [
+        "terraform",
+        "tf"
+      ],
+      "initializationOptions": {},
+      "settings": {}
+    },
+    "golang": {
+      "command": "gopls",
+      "rootPatterns": ["go.mod", ".vim/", ".git/", ".hg/"],
+      "filetypes": ["go"],
+      "initializationOptions": {
+        "usePlaceholders": true
+      }
+    }
+  },
+  "diagnostic.displayByAle": true,
+  "yaml.format.enable": true,
+  "yaml.schemas": {
+    "kubernetes": "/*.yaml"
+  },
+  "cSpell.userWords": [
+    "ALLOWACCESSKEY",
+    "CLIENTID",
+    "Kubernetes",
+    "SLOCTL",
+    "SLOs",
+    "Structs",
+    "agentcreds",
+    "andrzej",
+    "blocklist",
+    "boto",
+    "bridgecrew",
+    "checkov",
+    "cimg",
+    "circleci",
+    "codefresh",
+    "datadoghq",
+    "datasources",
+    "ghcr",
+    "gitlab",
+    "golangci",
+    "gruvbox",
+    "hashicorp",
+    "ibartholomew",
+    "ival",
+    "kube",
+    "maxdepth",
+    "mkdir",
+    "nobl",
+    "openslo",
+    "orgurl",
+    "polak",
+    "polakpotrafi",
+    "polakpotrafipl",
+    "promql",
+    "pyperclip",
+    "rego",
+    "rval",
+    "shellcheck",
+    "stretchr",
+    "terragrunt",
+    "tflint",
+    "thresholdmetrics",
+    "timeslices",
+    "tpope",
+    "tsandall",
+    "wafv",
+    "whitespaces",
+    "xargs",
+    "xolox",
+    "yamllint"
+  ]
+}

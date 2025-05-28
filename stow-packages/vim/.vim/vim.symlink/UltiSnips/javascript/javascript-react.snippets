@@ -1,0 +1,223 @@
+#
+#  React snippets
+#
+
+snippet nue "no unused expressions"
+// eslint-disable-next-line no-unused-expressions
+endsnippet
+
+snippet cn "className"
+className=$1
+endsnippet
+snippet cdm "component did mount" b
+componentDidMount() {
+	${1}
+}$0
+endsnippet
+
+snippet cdup "component did update" b
+componentDidUpdate(prevProps, prevState) {
+	${1}
+}$0
+endsnippet
+
+snippet cwm "component will mount" b
+componentWillMount() {
+	${1}
+}$0
+endsnippet
+
+snippet cwr "component will receive props" b
+componentWillReceiveProps(nextProps) {
+	${1}
+}$0
+endsnippet
+
+snippet cwun "component will unmount" b
+componentWillUnmount() {
+	${1}
+}$0
+endsnippet
+
+snippet cwu "component will update" b
+componentWillUpdate(nextProps, nextState) {
+	${1}
+}$0
+endsnippet
+
+snippet cx
+cx({
+	${1}: ${2}
+});
+endsnippet
+
+snippet fup
+forceUpdate(${1:callback});
+endsnippet
+
+snippet pt "propTypes"
+static propTypes = {
+  ${1}
+};
+endsnippet
+snippet dp "default props"
+static defaultProps = {
+  ${1}
+};
+endsnippet
+
+snippet jsx "define jsx dom" b
+import React from "react";
+
+class ${1:ClassName} extends React.Component {
+  static propTypes = {};
+
+  render() {
+    return (
+      ${VISUAL}$4
+    )
+  }
+}
+
+export default $1;$0
+endsnippet
+
+snippet rsc "react stateless component"
+import React from "react";
+
+const ${1:ClassName} = (props) => {
+  return(
+    $2
+  );
+};
+
+$1.propTypes ={};
+
+export default $1;
+endsnippet
+
+snippet ren
+render() {
+	return (
+		${1:<div />}
+	);
+}$0
+endsnippet
+
+snippet sst "set state" b
+this.setState({
+	${1}: ${2}
+});$0
+endsnippet
+
+snippet scu "should component update"
+shouldComponentUpdate(nextProps, nextState) {
+	${1}
+}$0
+endsnippet
+
+snippet tp "get property" i
+this.props.${1}
+endsnippet
+
+snippet ts "get state" i
+this.state.${1}
+endsnippet
+
+snippet trp
+this.transferPropsTo(${VISUAL}$0);
+endsnippet
+
+snippet ipt "import PropTypes"
+import PropTypes from "prop-types";
+endsnippet
+
+snippet pt "PropTypes"
+$1.propTypes = {
+	$2
+};
+endsnippet
+
+snippet ptf "PropTypes.function"
+PropTypes.func,$0
+endsnippet
+
+snippet ptfr "PropTypes.required function"
+PropTypes.func.isRequired,$0
+endsnippet
+
+snippet ptar "PropTypes.required array"
+PropTypes.array.isRequired,$0
+endsnippet
+
+snippet pta "PropTypes.array"
+PropTypes.array,$0
+endsnippet
+
+snippet ptb "PropTypes.boolean"
+PropTypes.bool,$0
+endsnippet
+
+snippet ptbr "PropTypes.required boolean"
+PropTypes.bool.isRequired,$0
+endsnippet
+
+snippet pts "PropTypes.string"
+PropTypes.string,$0
+endsnippet
+
+snippet ptsr "PropTypes.required string"
+PropTypes.string.isRequired,$0
+endsnippet
+
+snippet ptn "PropTypes.number"
+PropTypes.number,$0
+endsnippet
+
+snippet ptnr "PropTypes.required number"
+PropTypes.number.isRequired,$0
+endsnippet
+
+snippet pto "PropTypes.object"
+PropTypes.object,$0
+endsnippet
+
+snippet ptor "PropTypes.required object"
+PropTypes.object.isRequired,$0
+endsnippet
+
+snippet	ptaof "PropTypes.arrayOf"
+PropTypes.arrayOf($1),
+endsnippet
+
+snippet	ptoof "PropTypes.objectOf"
+PropTypes.objectOf($1),
+endsnippet
+
+snippet	ptsh "PropTypes.shape"
+PropTypes.shape({
+	$1: $2
+})
+endsnippet
+
+snippet svg "SVG"
+/* eslint react/prop-types: 0 */
+/* prop-types are defined in IconWrapper */
+
+import React from "react";
+import IconWrapper from "./IconWrapper";
+
+const aspectRatio = 1;
+
+const $1 = props => (
+  $2
+);
+
+$1.defaultProps = {
+  width: "",
+  height: "",
+};
+
+export default IconWrapper($1);
+
+endsnippet

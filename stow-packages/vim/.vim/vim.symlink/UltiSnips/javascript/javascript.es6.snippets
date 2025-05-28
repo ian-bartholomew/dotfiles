@@ -1,0 +1,71 @@
+# Generator function
+snippet gfn
+function* ${1:name}(${2}) {
+  yield ${3};
+}
+endsnippet
+
+snippet const
+const ${1} = ${0};
+endsnippet
+
+snippet let
+let ${1} = ${0};
+endsnippet
+
+snippet im
+import ${1} from "${0}";
+endsnippet
+
+snippet cla
+class ${1} {
+	${0}
+}
+endsnippet
+
+# For of loop
+snippet forof
+for (let ${1:s} of ${2:sequence}) {
+	${3}
+}
+endsnippet
+
+snippet fe
+forEach(() => {$1});
+endsnippet
+
+snippet clax
+class ${1} extends ${2} {
+	${0}
+}
+endsnippet
+
+snippet ctor
+constructor(${1}) {
+  ${2}
+}
+endsnippet
+
+snippet => "Arrow function" i
+(${1}) => {
+	${0}
+}
+endsnippet
+
+snippet af
+(${1}) => {
+	${0}
+}
+endsnippet
+
+snippet sym
+const ${1} = Symbol('${0}');
+endsnippet
+
+snippet ed
+export default ${0}
+endsnippet
+
+snippet ${
+${${1}}${0}
+endsnippet

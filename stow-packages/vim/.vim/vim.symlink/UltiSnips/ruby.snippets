@@ -1,0 +1,133 @@
+priority -50
+
+#
+# Snippets
+#
+
+snippet "^#!" "#!/usr/bin/env ruby" r
+#!/usr/bin/env ruby
+$0
+endsnippet
+
+snippet "^# ?[uU][tT][fF]-?8" "# encoding: UTF-8" r
+# encoding: UTF-8
+$0
+endsnippet
+
+snippet "\b(de)?f" "def <name>..." r
+def ${1:function_name}${2:(${3:*args})}
+  $0
+end
+endsnippet
+
+snippet defr "def <name> ... rescue ..."
+def ${1:function_name}${2:(${3:*args})}
+  $4
+rescue
+  $0
+end
+endsnippet
+
+snippet For "(<from>..<to>).each { |<i>| <block> }"
+(${1:from}..${2:to}).each { |${3:i}| $0 }
+endsnippet
+
+snippet "(\S+)\.map" ".map do |<element>| <block> end" r
+`!p snip.rv=match.group(1)`.map do |${1:`!p
+element_name = match.group(1).lstrip('$@')
+ematch = re.search("([A-Za-z][A-Za-z0-9_]+?)s?[^A-Za-z0-9_]*?$", element_name)
+try:
+  wmatch = re.search("([A-Za-z][A-Za-z0-9_]+)$", ematch.group(1))
+  snip.rv = wmatch.group(1).lower()
+except:
+  snip.rv = 'element'
+`}|
+  $0
+end
+endsnippet
+
+snippet "(\S+)\.each" ".each do |<element>| <block> end" r
+`!p snip.rv=match.group(1)`.each do |${1:`!p
+element_name = match.group(1).lstrip('$@')
+ematch = re.search("([A-Za-z][A-Za-z0-9_]+?)s?[^A-Za-z0-9_]*?$", element_name)
+try:
+  wmatch = re.search("([A-Za-z][A-Za-z0-9_]+)$", ematch.group(1))
+  snip.rv = wmatch.group(1).lower()
+except:
+  snip.rv = 'element'
+`}|
+  $0
+end
+endsnippet
+
+snippet until "until <expression> ... end"
+until ${1:expression}
+  $0
+end
+endsnippet
+
+snippet while "while <expression> ... end"
+while ${1:expression}
+  $0
+end
+endsnippet
+
+snippet "\b(case|sw(itch)?)" "case <variable> when <expression> ... end" r
+case ${1:variable}
+when ${2:expression}
+$0
+end
+endsnippet
+
+snippet class "class <class_name> def initialize ... end end"
+class ${1:class_name}
+  def initialize(${2:*args})
+    $0
+  end
+end
+endsnippet
+
+snippet module "module"
+module ${1:module_name}
+  $0
+end
+endsnippet
+
+snippet ###
+=begin
+  $0
+=end
+endsnippet
+
+snippet bpry
+binding.pry
+endsnippet
+
+snippet rpbb
+require 'pry-byebug'
+endsnippet
+
+snippet fgc
+FactoryGirl.create $0
+endsnippet
+
+snippet req "require"
+require "$0"
+endsnippet
+
+snippet trait
+trait $1 do
+  $2
+end
+endsnippet
+
+snippet test
+test "$1" do
+  $2
+end
+endsnippet
+
+snippet uc
+use_chrome
+endsnippet
+# vim: set ts=2 sw=2 expandtab:
