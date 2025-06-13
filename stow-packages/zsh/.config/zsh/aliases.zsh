@@ -30,11 +30,11 @@ alias inv='nvim $(fzf --preview="bat --color=always {}")'
 alias av="aws-vault"
 alias ave="aws-vault exec"
 alias aveo="aws-vault exec order --"
-alias tf="aws-vault exec order -- terraform"
 
 # dev folders
 alias dev="cd ~/Dev"
 
+alias tf="terraform"
 # terragrunt
 alias tg="terragrunt"
 alias tgp="terragrunt plan"
