@@ -80,3 +80,5 @@
 ; 	insteadOf = git@gitlab.com:
 [http]
 	sslVerify = false
+[gpg]
+	program = gpg

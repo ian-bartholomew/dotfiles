@@ -52,9 +52,13 @@ if [[ ! -s "$HOME/.zgen/init.zsh" ]]; then
   source "$HOME/.zgen/zgen.zsh"
   
   # Essential plugins
-  zgen load mroth/evalcache
+  zgen oh-my-zsh
+  zgen oh-my-zsh plugins/git
   zgen load chrissicool/zsh-256color
   zgen load spaceship-prompt/spaceship-prompt spaceship
+  zgen load zsh-users/zsh-history-substring-search
+  zgen load zsh-users/zsh-autosuggestions
+  zgen load zsh-users/zsh-completions src
   
   zgen save
 else
@@ -62,41 +66,50 @@ else
 fi
 
 # Defer heavy operations until after prompt
-{
-  # Load local config
-  [[ -r "$HOME/.localrc" ]] && source "$HOME/.localrc"
+# {
+#   # Load local config
+#   [[ -r "$HOME/.localrc" ]] && source "$HOME/.localrc"
 
-  # Initialize tools with caching
-  if command -v _evalcache >/dev/null 2>&1; then
-    _evalcache zoxide init zsh
-    _evalcache atuin init zsh
-  fi
 
-  # FZF integration
-  command -v fzf >/dev/null 2>&1 && source <(fzf --zsh)
+#   # NVM lazy loading 
+#   if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+#     # Ultra-lazy NVM loading
+#     nvm() {
+#       unfunction nvm
+#       source "$HOME/.nvm/nvm.sh"
+#       nvm "$@"
+#     }
+#     
+#     node() {
+#       unfunction node
+#       source "$HOME/.nvm/nvm.sh"
+#       node "$@"
+#     }
+#     
+#     npm() {
+#       unfunction npm  
+#       source "$HOME/.nvm/nvm.sh"
+#       npm "$@"
+#     }
+#   fi
+# } &!
 
-  # NVM lazy loading 
-  if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
-    # Ultra-lazy NVM loading
-    nvm() {
-      unfunction nvm
-      source "$HOME/.nvm/nvm.sh"
-      nvm "$@"
-    }
-    
-    node() {
-      unfunction node
-      source "$HOME/.nvm/nvm.sh"
-      node "$@"
-    }
-    
-    npm() {
-      unfunction npm  
-      source "$HOME/.nvm/nvm.sh"
-      npm "$@"
-    }
-  fi
-} &!
+# Initialize tools with caching
+eval "$(zoxide init zsh)"
+eval "$(atuin init zsh)"
+
+# Set up fzf key bindings and fuzzy completion
+source <(fzf --zsh)
+export FZF_DEFAULT_COMMAND='fd --type f --strip-cwd-prefix'
+
 
 # Performance: End profiling if enabled
 # zprof
+#
+#
+alias claude="/Users/ibartholomew/.claude/local/claude"
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"  # This loads nvm
+[ -s "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm" ] && \. "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm"  # This loads nvm bash_completion
+export GPG_TTY=$(tty)
