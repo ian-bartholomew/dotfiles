@@ -65,10 +65,10 @@ else
   source "$HOME/.zgen/init.zsh"
 fi
 
+# Load local config
+[[ -r "$HOME/.localrc" ]] && source "$HOME/.localrc"
 # Defer heavy operations until after prompt
 # {
-#   # Load local config
-#   [[ -r "$HOME/.localrc" ]] && source "$HOME/.localrc"
 
 
 #   # NVM lazy loading 
@@ -108,6 +108,9 @@ export FZF_DEFAULT_COMMAND='fd --type f --strip-cwd-prefix'
 #
 #
 alias claude="/Users/ibartholomew/.claude/local/claude"
+
+# Override oh-my-zsh aliases after loading
+alias ls="eza --long --icons"
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"  # This loads nvm
