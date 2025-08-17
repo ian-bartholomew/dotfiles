@@ -41,7 +41,6 @@ alias tgp="terragrunt plan"
 alias tga="terragrunt apply"
 alias tgo="terragrunt output"
 
-alias ls="eza --long --icons"
 alias exa="eza" # this shouldn't be necessary but something is causing a lingering alias using this
 alias cat="bat"
 alias psent="policy_sentry"
