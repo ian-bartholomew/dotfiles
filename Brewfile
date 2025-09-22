@@ -10,6 +10,7 @@ brew 'curl'
 brew 'htop'
 brew 'btop'
 brew 'tree'
+brew 'stow'
 
 # Shell and terminal
 brew 'zsh'
@@ -23,6 +24,7 @@ brew 'zoxide'
 brew 'atuin'
 brew 'the_silver_searcher'
 brew 'tpm'
+brew 'tree-sitter'
 
 # Development tools
 brew 'git'
@@ -46,6 +48,9 @@ brew 'aws-vault'
 brew 'docker'
 brew 'docker-completion'
 brew 'docker-compose'
+brew 'kubernetes-cli'
+brew 'helm'
+brew 'k9s'
 
 # Terraform ecosystem
 brew 'tenv'
