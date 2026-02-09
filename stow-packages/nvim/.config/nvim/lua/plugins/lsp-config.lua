@@ -36,32 +36,41 @@ return {
 		config = function()
 			local capabilities = require("cmp_nvim_lsp").default_capabilities()
 
-			local lspconfig = require("lspconfig")
-			lspconfig.bashls.setup({})
-			lspconfig.gopls.setup({})
-			lspconfig.ts_ls.setup({
+			-- Configure LSP servers with custom settings using the new vim.lsp.config API
+			-- Servers with capabilities from nvim-cmp
+			vim.lsp.config("ts_ls", {
 				capabilities = capabilities,
 			})
-			lspconfig.html.setup({
+			vim.lsp.config("html", {
 				capabilities = capabilities,
 			})
-			lspconfig.lua_ls.setup({
+			vim.lsp.config("lua_ls", {
 				capabilities = capabilities,
 			})
-			lspconfig.eslint.setup({
+			vim.lsp.config("eslint", {
 				capabilities = capabilities,
 			})
-			lspconfig.tflint.setup({})
-			lspconfig.typos_lsp.setup({})
-			lspconfig.terraformls.setup({})
-			lspconfig.pyright.setup({})
-			lspconfig.yamlls.setup({
+			vim.lsp.config("yamlls", {
 				settings = {
 					yaml = {
 						customTags = { "!reference sequence" },
 					},
 				},
 			})
+
+			-- Enable all LSP servers
+			vim.lsp.enable("bashls")
+			vim.lsp.enable("gopls")
+			vim.lsp.enable("ts_ls")
+			vim.lsp.enable("html")
+			vim.lsp.enable("lua_ls")
+			vim.lsp.enable("eslint")
+			vim.lsp.enable("tflint")
+			vim.lsp.enable("typos_lsp")
+			vim.lsp.enable("terraformls")
+			vim.lsp.enable("pyright")
+			vim.lsp.enable("yamlls")
+
 			--
 			-- Use LspAttach autocommand to only map the following keys
 			-- after the language server attaches to the current buffer

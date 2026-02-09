@@ -57,6 +57,9 @@ vim.keymap.set("n", "<c-l>", ":wincmd l<CR>")
 vim.keymap.set("n", "<leader>h", ":nohlsearch<CR>")
 vim.keymap.set("n", "<leader>bb", "<C-^><CR>")
 
+-- Replace word under cursor globally
+vim.keymap.set("n", "<leader>r", [[:%s/\<<C-r><C-w>\>/<C-r><C-w>/gI<Left><Left><Left>]], { desc = "Replace word under cursor" })
+
 -- Custom commands for fixing common typos
 vim.cmd([[
 command! WQ wq

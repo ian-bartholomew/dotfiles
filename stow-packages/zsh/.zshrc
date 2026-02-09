@@ -102,12 +102,12 @@ eval "$(atuin init zsh)"
 source <(fzf --zsh)
 export FZF_DEFAULT_COMMAND='fd --type f --strip-cwd-prefix'
 
-
+export MANPAGER='nvim +Man!'
 # Performance: End profiling if enabled
 # zprof
 #
 #
-alias claude="/Users/ibartholomew/.claude/local/claude"
+# alias claude="/Users/ibartholomew/.claude/local/claude"
 
 # Override oh-my-zsh aliases after loading
 alias ls="eza --long --icons"
@@ -116,3 +116,10 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"  # This loads nvm
 [ -s "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm" ] && \. "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm"  # This loads nvm bash_completion
 export GPG_TTY=$(tty)
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+# Added by LM Studio CLI (lms)
+export PATH="$PATH:/Users/ian/.lmstudio/bin"
+# End of LM Studio CLI section
+
+. "$HOME/.local/bin/env"
