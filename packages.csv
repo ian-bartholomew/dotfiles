@@ -1,0 +1,111 @@
+# Cross-platform package list
+# Format: category | brew_name | pacman_name | apt_name | notes
+# "-" = skip on this platform
+# "AUR:name" = Arch AUR package (installed via yay)
+# "CASK:name" = macOS cask app (brew install --cask)
+#
+# System utilities
+system | coreutils | coreutils | coreutils |
+system | findutils | findutils | findutils |
+system | grep | grep | grep |
+system | gnu-sed | sed | sed |
+system | wget | wget | wget |
+system | curl | curl | curl |
+system | htop | htop | htop |
+system | btop | btop | btop |
+system | tree | tree | tree |
+system | stow | stow | stow |
+system | less | less | less |
+#
+# Shell and terminal
+shell | zsh | zsh | zsh |
+shell | tmux | tmux | tmux |
+shell | fzf | fzf | fzf |
+shell | bat | bat | bat |
+shell | eza | eza | AUR:eza | modern ls replacement
+shell | ripgrep | ripgrep | ripgrep |
+shell | fd | fd | fd-find |
+shell | zoxide | zoxide | AUR:zoxide |
+shell | atuin | AUR:atuin | AUR:atuin | shell history manager
+shell | the_silver_searcher | the_silver_searcher | silversearcher-ag |
+shell | tpm | - | - | tmux plugin manager (macOS only)
+shell | tree-sitter | tree-sitter | - |
+shell | CASK:ghostty | AUR:ghostty | - |
+
+#
+# Development tools
+dev | git | git | git |
+dev | tig | tig | tig |
+dev | difftastic | AUR:difftastic | AUR:difftastic |
+dev | colordiff | colordiff | colordiff |
+dev | dwdiff | dwdiff | dwdiff |
+dev | wdiff | wdiff | wdiff |
+dev | - | base-devel | build-essential | build toolchain
+#
+# Text editors
+editor | neovim | neovim | neovim |
+#
+# Programming languages
+lang | go | go | golang-go |
+lang | lua | lua | lua5.4 |
+lang | luajit | luajit | luajit |
+lang | nodejs | nodejs | nodejs |
+lang | - | npm | npm |
+lang | python | python | python3 |
+lang | - | python-pip | python3-pip |
+lang | - | python-pipx | pipx |
+#
+# Cloud and DevOps
+cloud | awscli | AUR:aws-cli-v2 | - | AWS CLI
+cloud | aws-vault | AUR:aws-vault | - |
+cloud | docker | docker | docker.io |
+cloud | docker-completion | - | - | macOS only
+cloud | docker-compose | docker-compose | docker-compose |
+cloud | kubernetes-cli | kubectl | - |
+cloud | helm | helm | - |
+cloud | k9s | k9s | - |
+#
+# Terraform ecosystem
+terraform | tenv | AUR:tenv | - |
+terraform | terraform-docs | AUR:terraform-docs-bin | - |
+terraform | terraform-lsp | - | - |
+terraform | tflint | AUR:tflint-bin | - |
+terraform | tfsec | AUR:tfsec-bin | - |
+terraform | tfsort | - | - |
+terraform | tfupdate | - | - |
+terraform | tfvar | - | - |
+terraform | travelgrunt | - | - |
+#
+# Security tools
+security | age | age | age |
+security | gnupg | gnupg | gnupg |
+security | pinentry | pinentry | pinentry-curses |
+security | pinentry-mac | - | - | macOS only
+security | sops | sops | - |
+security | policy_sentry | - | - |
+#
+# JSON/YAML tools
+tools | jq | jq | jq |
+tools | bat | bat | bat |
+#
+# Code quality and formatting
+quality | shellcheck | shellcheck | shellcheck |
+quality | shfmt | shfmt | shfmt |
+quality | clang-format | clang | clang-format |
+quality | prettier | AUR:prettier | - |
+quality | codespell | AUR:codespell | codespell |
+quality | cspell | - | - |
+quality | pre-commit | pre-commit | pre-commit |
+quality | commitizen | - | - |
+#
+# Monitoring
+monitor | iamlive | - | - |
+#
+# Applications (casks / AUR)
+app | CASK:1password-cli | AUR:1password-cli | - |
+app | CASK:dbeaver-community | AUR:dbeaver | - |
+app | CASK:eloston-chromium | AUR:ungoogled-chromium | - |
+app | CASK:font-hack-nerd-font | AUR:ttf-hack-nerd | - |
+app | CASK:gpg-suite | - | - | macOS only
+app | CASK:kdiff3 | kdiff3 | kdiff3 |
+app | - | firefox | firefox | Linux only

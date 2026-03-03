@@ -7,6 +7,11 @@ DOTFILES_ROOT=$(pwd -P)
 
 set -e
 
+# Install system dependencies if requested
+if [[ "${1:-}" == "--install-deps" ]]; then
+  "$DOTFILES_ROOT/install.sh"
+fi
+
 echo ''
 
 info () {
@@ -30,7 +35,18 @@ fail () {
 check_stow () {
   if ! command -v stow &> /dev/null
   then
-    fail "GNU Stow is not installed. Install it with: brew install stow"
+    local hint="./install.sh or your package manager"
+    case "$(uname -s)" in
+      Darwin) hint="brew install stow" ;;
+      Linux)
+        if command -v pacman &>/dev/null; then
+          hint="sudo pacman -S stow"
+        elif command -v apt-get &>/dev/null; then
+          hint="sudo apt-get install stow"
+        fi
+        ;;
+    esac
+    fail "GNU Stow is not installed. Install it with: $hint"
   fi
 }
 
