@@ -122,4 +122,7 @@ export GPG_TTY=$(tty)
 export PATH="$PATH:/Users/ian/.lmstudio/bin"
 # End of LM Studio CLI section
 
-. "$HOME/.local/bin/env"
+# . "$HOME/.local/bin/env"
+
+# Created by `pipx` on 2026-02-17 22:49:27
+export PATH="$PATH:/home/ian/.local/bin"

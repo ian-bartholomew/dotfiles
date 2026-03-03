@@ -1,6 +1,6 @@
 # Ian's Dotfiles
 
-Personal dotfiles for macOS development environment, managed with GNU Stow.
+Personal dotfiles for macOS, Arch Linux, and Ubuntu, managed with GNU Stow.
 
 ## Overview
 
@@ -9,15 +9,18 @@ This repository contains configuration files for various development tools and a
 ## Quick Start
 
 ```sh
-# Install dependencies
-brew install git stow
-
 # Clone the repository
 git clone https://github.com/ian-bartholomew/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles
 
-# Install all packages
-stow-packages/bootstrap
+# Install system dependencies (detects your platform automatically)
+./install.sh
+
+# Install all dotfile packages
+stow-packages/bootstrap.sh
+
+# Or do both in one step
+stow-packages/bootstrap.sh --install-deps
 ```
 
 ## Structure
@@ -52,52 +55,45 @@ stow -D nvim  # Remove Neovim config symlinks
 
 Install all packages:
 ```sh
-~/.dotfiles/stow-packages/bootstrap
+~/.dotfiles/stow-packages/bootstrap.sh
 ```
 
 Remove all packages:
 ```sh
-~/.dotfiles/stow-packages/unstow
+~/.dotfiles/stow-packages/unstow.sh
 ```
 
 ### Dependencies
 
-Core dependencies are managed through:
-- **Brewfile**: Homebrew packages and applications
+System dependencies are defined in `packages.csv` — a single shared list with per-platform package names. Run `./install.sh` to install them for your platform:
+
+- **macOS**: Generates a Brewfile and runs `brew bundle` (installs Homebrew if needed)
+- **Arch Linux**: Installs via `pacman` and `yay` (installs yay if needed)
+- **Ubuntu/Debian**: Installs via `apt-get`
 
 ## Requirements
 
-- macOS
-- [Homebrew](https://brew.sh/)
-- GNU Stow (`brew install stow`)
+- macOS, Arch Linux, or Ubuntu/Debian
+- `git` and `bash`
+
+Everything else (including the package manager on macOS) is handled by `install.sh`.
 
 ## Installation
 
-1. **Install Homebrew** (if not already installed):
-   ```sh
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-
-2. **Install Git and Stow**:
-   ```sh
-   brew install git stow
-   ```
-
-3. **Clone this repository**:
+1. **Clone this repository**:
    ```sh
    git clone https://github.com/ian-bartholomew/dotfiles.git ~/.dotfiles
-   ```
-
-4. **Install configurations**:
-   ```sh
    cd ~/.dotfiles
-   stow-packages/bootstrap
    ```
 
-5. **Install additional dependencies**:
+2. **Install system dependencies**:
    ```sh
-   # Install Homebrew packages
-   brew bundle --file=Brewfile
+   ./install.sh
+   ```
+
+3. **Install configurations**:
+   ```sh
+   stow-packages/bootstrap.sh
    ```
 
 ## Customization
@@ -109,6 +105,7 @@ Core dependencies are managed through:
 ## Key Features
 
 - **Modular design**: Each tool has its own stow package
+- **Cross-platform**: Single package list works on macOS, Arch Linux, and Ubuntu
 - **Neovim configuration**: Full Lua-based config with lazy.nvim plugin manager
 - **Shell enhancements**: Zsh with oh-my-zsh, spaceship prompt, and useful plugins
 - **Development tools**: Git aliases, tmux configuration, and version management
