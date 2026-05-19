@@ -1,0 +1,74 @@
+{
+  "issues": [
+    {
+      "key": "FANDEVX-2596",
+      "assignedToMe": true,
+      "fields": {
+        "summary": "Enable FBG Access to FES Fanflow Kafka - prod (609732359649)",
+        "status": { "name": "In Progress" },
+        "priority": { "name": "Medium" },
+        "issuetype": { "name": "Story" },
+        "updated": "2026-05-12T16:00:00Z",
+        "parent": { "key": "FANDEVX-2598" }
+      }
+    },
+    {
+      "key": "FANDEVX-2594",
+      "assignedToMe": true,
+      "fields": {
+        "summary": "Enable FBG Access to FES Fanflow Kafka - test (610756916101)",
+        "status": { "name": "In Progress" },
+        "priority": { "name": "Medium" },
+        "issuetype": { "name": "Story" },
+        "updated": "2026-05-11T16:00:00Z",
+        "parent": { "key": "FANDEVX-2598" }
+      }
+    },
+    {
+      "key": "FANDEVX-2598",
+      "assignedToMe": false,
+      "fields": {
+        "summary": "Enable FBG to Subscribe/Publish to Topics from FES Fanflow",
+        "status": { "name": "In Progress" },
+        "priority": null,
+        "issuetype": { "name": "Epic" },
+        "updated": "2026-05-10T16:00:00Z",
+        "parent": { "key": "FESFEAT-597" }
+      }
+    },
+    {
+      "key": "FESFEAT-597",
+      "assignedToMe": false,
+      "fields": {
+        "summary": "[INJECTION] Enable FBG to Subscribe/Publish to Topics from FES Fanflow",
+        "status": { "name": "In Progress" },
+        "priority": null,
+        "issuetype": { "name": "Feature" },
+        "updated": "2026-05-09T16:00:00Z"
+      }
+    },
+    {
+      "key": "FANDEVX-2724",
+      "assignedToMe": true,
+      "fields": {
+        "summary": "IDP 1.5: Entity Definitions — Scale (Batch 2) + Adoption Strategy",
+        "status": { "name": "In Progress" },
+        "priority": { "name": "Medium" },
+        "issuetype": { "name": "Story" },
+        "updated": "2026-05-08T16:00:00Z",
+        "parent": { "key": "FANDEVX-2719" }
+      }
+    },
+    {
+      "key": "FANDEVX-2719",
+      "assignedToMe": false,
+      "fields": {
+        "summary": "Datadog IDP: Software Catalog Foundation",
+        "status": { "name": "Done" },
+        "priority": { "name": "Medium" },
+        "issuetype": { "name": "Epic" },
+        "updated": "2026-05-07T16:00:00Z"
+      }
+    }
+  ]
+}

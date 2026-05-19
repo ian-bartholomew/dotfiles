@@ -1,0 +1,18 @@
+[
+  {
+    "number": 2227,
+    "title": "feat: add fanapp-perf core infrastructure Terraform config",
+    "url": "https://github.com/fanatics-gaming/fanapp-terraform/pull/2227",
+    "repository": { "nameWithOwner": "fanatics-gaming/fanapp-terraform" },
+    "isDraft": true,
+    "updatedAt": "2026-05-12T18:23:11Z"
+  },
+  {
+    "number": 2215,
+    "title": "FANDEVX-2596 : Enable FES access to FBG Fanflow Kafka prod cluster",
+    "url": "https://github.com/fanatics-gaming/fanapp-terraform/pull/2215",
+    "repository": { "nameWithOwner": "fanatics-gaming/fanapp-terraform" },
+    "isDraft": false,
+    "updatedAt": "2026-04-22T18:23:11Z"
+  }
+]
