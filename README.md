@@ -36,10 +36,12 @@ Each directory in `stow-packages/` represents a configuration package:
 - **tmux**: Terminal multiplexer configuration (.tmux.conf)
 - **asdf**: Version manager configuration (.tool-versions)
 - **atuin**: Shell history manager configuration
+- **claude**: Claude Code user config (CLAUDE.md and skills/)
 
 ### Package Management
 
 Install specific packages:
+
 ```sh
 cd ~/.dotfiles/stow-packages
 stow nvim     # Install Neovim config to ~/.config/nvim/
@@ -48,17 +50,20 @@ stow git      # Install git config to ~/.gitconfig and ~/.gitignore
 ```
 
 Remove packages:
+
 ```sh
 cd ~/.dotfiles/stow-packages
 stow -D nvim  # Remove Neovim config symlinks
 ```
 
 Install all packages:
+
 ```sh
 ~/.dotfiles/stow-packages/bootstrap.sh
 ```
 
 Remove all packages:
+
 ```sh
 ~/.dotfiles/stow-packages/unstow.sh
 ```
@@ -81,17 +86,20 @@ Everything else (including the package manager on macOS) is handled by `install.
 ## Installation
 
 1. **Clone this repository**:
+
    ```sh
    git clone https://github.com/ian-bartholomew/dotfiles.git ~/.dotfiles
    cd ~/.dotfiles
    ```
 
 2. **Install system dependencies**:
+
    ```sh
    ./install.sh
    ```
 
 3. **Install configurations**:
+
    ```sh
    stow-packages/bootstrap.sh
    ```

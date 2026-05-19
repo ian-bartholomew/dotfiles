@@ -16,3 +16,8 @@ atom.symlink/themes
 git/gitconfig.symlink
 
 zsh/config.symlink/configstore/*
+
+# The user's global ~/.gitignore ignores .claude/ everywhere; un-ignore the
+# tracked stow package contents so this repo can manage them.
+!stow-packages/claude/.claude/
+!stow-packages/claude/.claude/**
