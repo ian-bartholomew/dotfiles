@@ -1,7 +1,7 @@
 ---
 name: start-of-day
 description: This skill should be used when the user asks to "start of day", "SOD", "run start of day", "kick off the day", "start of day routine", or runs "/start-of-day".
-version: 0.25.0
+version: 0.26.0
 allowed-tools:
   [
     Bash,
@@ -28,7 +28,7 @@ The skill now carries the full v0.17.0 feature set, end-to-end deterministic and
 
 The TUI is the wrong place for the morning snapshot — colours are flaky, the output scrolls away, and there's no record after the session ends. The snapshot is written into today's Obsidian daily note, which becomes the durable, searchable record of what was on the plate that morning.
 
-The skill is one-shot and non-interactive: fetch, write, confirm path, done. The user reviews and edits items in Obsidian (or via `td task update` / `gh` / JIRA directly) — this skill does not loop.
+The skill is one-shot and non-interactive: fetch, write, confirm path, then hand off to `/daily-standup` to append the standup section in the same daily note. The user reviews and edits items in Obsidian (or via `td task update` / `gh` / JIRA directly) — this skill does not loop.
 
 ## When to Use
 
@@ -48,7 +48,11 @@ The skill is one-shot and non-interactive: fetch, write, confirm path, done. The
   PRs / JIRA /         under a single ## Start          daily note (idempotent
   Todoist              of Day heading                   via <!-- sod:* --> markers)
                                                               ↓
-                                                  one confirmation line, exit
+                                                  one confirmation line
+                                                              ↓
+                                                  invoke /daily-standup
+                                                  (appends ## Daily Standup
+                                                   section to same note)
 ```
 
 ## Prerequisites
@@ -193,14 +197,22 @@ Detection: if `obsidian daily:read` contains the literal `<!-- sod:begin`, you'r
 
 After the write, verify: `obsidian daily:read | grep -c '<!-- sod:begin'` must return `1`. If it returns `0` or `>1`, see §Error Handling.
 
-### Step 5: Confirm in the terminal and exit
+### Step 5: Confirm the start-of-day write in the terminal
 
-Print one short, plain-text line and stop. No edit loop:
+Print one short, plain-text line before proceeding to the standup step. No edit loop:
 
 ```
 Start of Day written to: <absolute path>
   PRs: <N>  ·  JIRA: <N>  ·  Todoist: <N>
 ```
+
+### Step 6: Invoke `/daily-standup`
+
+After the start-of-day section is written and confirmed, invoke `/daily-standup` as the final step. This appends the `## Daily Standup` section (bracketed by `<!-- standup:start -->` / `<!-- standup:end -->`) to the same daily note. Both sections coexist; their markers do not collide.
+
+Call the `Skill` tool with `skill: "daily-standup"` — no arguments. `/daily-standup` runs with its own defaults (brief mode, today's date) and prints its own confirmation line on completion.
+
+If `/daily-standup` fails (Slack MCP down, JIRA timeout, etc.), the already-written `## Start of Day` section remains intact. Surface the failure to the user inline; do not retry. The user can re-run `/daily-standup` directly — both skills are idempotent.
 
 ## Error Handling
 
@@ -218,6 +230,6 @@ Start of Day written to: <absolute path>
 
 ## Summary
 
-`/start-of-day` fetches open GitHub PRs, assigned open JIRA tickets, and Todoist due-today + overdue tasks in parallel, then writes three flat bulleted sections into today's Obsidian daily note under a `## Start of Day` heading bracketed by `<!-- sod:begin -->` / `<!-- sod:end -->` markers. The write is idempotent (re-running the same day replaces the section). The skill is one-shot and non-interactive: a single confirmation line prints once the note is written, then the skill exits.
+`/start-of-day` fetches open GitHub PRs, assigned open JIRA tickets, and Todoist due-today + overdue tasks in parallel, then writes three flat bulleted sections into today's Obsidian daily note under a `## Start of Day` heading bracketed by `<!-- sod:begin -->` / `<!-- sod:end -->` markers. The write is idempotent (re-running the same day replaces the section). The skill is one-shot and non-interactive: a single confirmation line prints once the note is written, then the skill invokes `/daily-standup` as its final step to append a `## Daily Standup` section to the same daily note.
 
 From v0.19.0 the markdown is emitted by `render.py` (Python 3 stdlib) rather than composed by the model — the model writes the three fetch results to JSON files, invokes the script, and splices the script's stdout into the daily note. JIRA parent traversal, PR↔JIRA cross-linking, Potential-to-close, and emoji prefixes were intentionally left out of this baseline; they will be added to the script in subsequent versions.
