@@ -4,6 +4,10 @@ Always check the wiki (`~/Documents/Work/wiki/_index.md`) before web search, Con
 
 Always use Context7 when I need library/API documentation, code generation, setup or configuration steps without me having to explicitly ask.
 
+## Style
+
+- Do not use emojis in any output — chat responses, code, comments, commit messages, PR descriptions, file contents, or anything else — unless I explicitly ask for them. This applies even when a tool, skill, or template suggests emojis.
+
 ## Git Conventions
 
 - Branch names: `<ticket-id>-<ticket-name>`, e.g. `FANDEVX-2592-fbg-fanflow-kafka-dev`
@@ -20,7 +24,8 @@ Always use Context7 when I need library/API documentation, code generation, setu
 
 ## Confluence
 
-For all Confluence page edits, use the `claude-atlassian:confluence-editor` skill.
+- Always use the `claude-atlassian:confluence-editor` skill (or `/confluence-editor`) for ALL Confluence page edits — creating new pages, updating existing pages, draft promotions, title changes, anything that mutates a Confluence page. Do not bypass it with direct MCP calls (`createConfluencePage`, `updateConfluencePage`, etc.).
+- Reading Confluence (e.g. `getConfluencePage`, `getConfluenceSpaces`) does not require the skill — direct MCP calls are fine for read operations.
 
 ## JIRA Defaults
 

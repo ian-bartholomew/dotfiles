@@ -1,20 +1,38 @@
 ---
 name: finish-work
-description: Close out a JIRA ticket inferred from the current branch — transition based on PR state, capture learnings into project documents, and optionally clean up the worktree.
-arguments: []
+description: Close out a JIRA ticket — inferred from the current branch, or targeted explicitly via a ticket key or PR number. Transitions JIRA based on PR state, captures learnings into project documents, and optionally cleans up the worktree and branch.
+arguments:
+  - name: target
+    description: Optional JIRA ticket key (e.g. FANDEVX-1234) or GitHub PR number (e.g. 1234). If omitted, the ticket is inferred from the current branch.
+    required: false
 ---
 
 # Finish Work Workflow
 
-You are closing out the work tied to the current git branch. This is the bookend to `/start-ticket`: it transitions the JIRA ticket, captures learnings into the right project documents, and optionally cleans up the worktree.
+You are closing out the work tied to a JIRA ticket. This is the bookend to `/start-ticket`: it transitions the JIRA ticket, captures learnings into the right project documents, and optionally cleans up the worktree and branch.
+
+The skill operates in two modes:
+
+- **No-arg mode** (`/finish-work`): infers the ticket from the current branch. Use this from inside the worktree where the work happened.
+- **Targeted mode** (`/finish-work <target>`): targets a specific ticket via JIRA key or PR number. Use this when you've already moved off the branch — e.g. PR merged overnight, branch auto-deleted, and you're on `main` the next morning.
 
 Follow these steps in order. Each step has explicit branching logic — do not skip or reorder them.
 
-## Step 1: Detect the ticket key from the branch
+## Step 1: Resolve the ticket key and branch
 
-- Run `git rev-parse --abbrev-ref HEAD`.
+**Case A — no argument provided:**
+
+- Run `git rev-parse --abbrev-ref HEAD` to get `<branch>`.
 - Extract the ticket key with regex `^[A-Z]+-\d+`. This handles both `FANDEVX-2926/foo` and `FANDEVX-2926-foo` formats.
-- If no match, stop with the message: `Branch '<name>' does not start with a JIRA ticket key. Aborting.`
+- If no match, stop with: `Branch '<name>' does not start with a JIRA ticket key. Aborting.`
+- `<branch>` = current branch.
+
+**Case B — argument provided:**
+
+- Verify cwd is inside a git repo: `git rev-parse --is-inside-work-tree`. If not, stop with: `/finish-work <target> must be run from inside a git repository. Aborting.`
+- If `<target>` matches `^[A-Z]+-\d+$`: ticket key = `<target>`. Branch resolution is deferred to Step 3 (resolved from the PR's `headRefName`).
+- If `<target>` matches `^\d+$`: run `gh pr view <target> --json number,state,merged,url,headRefName,title`. Extract the ticket key from `headRefName` via `^[A-Z]+-\d+`. If no match, stop with: `PR #<num> branch '<headRef>' does not start with a JIRA ticket key. Aborting.` Cache the PR JSON for reuse in Step 3.
+- Anything else: stop with `Argument '<value>' is neither a JIRA key (e.g. FANDEVX-1234) nor a PR number (e.g. 1234). Aborting.`
 
 ## Step 2: Confirm GitHub identity
 
@@ -23,9 +41,20 @@ Follow these steps in order. Each step has explicit branching logic — do not s
 
 ## Step 3: Fetch ticket and PR state in parallel
 
-- JIRA: use the Atlassian MCP server (`getJiraIssue` and `getTransitionsForJiraIssue`) to fetch the ticket summary, current status, and available transitions.
-- PR: `gh pr view --json state,merged,url,headRefName` on the current branch. If `gh pr view` exits non-zero, treat it as "no PR".
-- Display a short summary to the user: ticket key, summary, current JIRA status, PR state (merged / open / closed-unmerged / none) with URL when present.
+JIRA: use the Atlassian MCP server (`getJiraIssue` and `getTransitionsForJiraIssue`) to fetch the ticket summary, current status, and available transitions.
+
+PR resolution depends on mode:
+
+- **Case A (no arg):** `gh pr view --json state,merged,url,headRefName` on the current branch. If `gh pr view` exits non-zero, treat it as "no PR".
+- **Case B, PR-number arg:** reuse the JSON cached in Step 1.
+- **Case B, ticket-key arg:** `gh pr list --search "<ticket-key>" --state all --json number,state,merged,url,headRefName,title --limit 5`. Filter to PRs whose `headRefName` starts with `<ticket-key>`.
+  - 0 matches → treat as "no PR".
+  - 1 match → use it.
+  - 2+ matches → display the list (number, title, state, branch) and ask the user to pick one.
+
+Store the resolved `<branch>` = `headRefName` from the PR for use in Steps 6 and 8. In Case B with no PR, prompt the user for the branch name (or accept that branch-dependent steps will be skipped).
+
+Display a short summary to the user: ticket key, summary, current JIRA status, PR state (merged / open / closed-unmerged / none) with URL when present.
 
 ## Step 4: Determine and execute the JIRA transition
 
@@ -53,8 +82,11 @@ If the user picks "none", skip Steps 6 and 7 and continue to Step 8.
 ## Step 6: Gather learnings sources in parallel
 
 - **Conversation context**: synthesize from the current Claude session — what was tried, what failed, what worked, decisions made, dead ends.
-- **Git log**: determine the base branch (`main` for most repos; use `git symbolic-ref refs/remotes/origin/HEAD` if uncertain), then run `git log <base-branch>..HEAD --pretty=format:'%h %s%n%b'` to capture concrete shipped commits.
-- If the session is fresh and has no conversation context (e.g., running `/finish-work` cold the next morning), fall back to git-log-only and tell the user the log entry will be sparse.
+- **Shipped commits** — pick the first source that works, in this order:
+  1. **Local branch exists** (`git rev-parse --verify <branch>` succeeds): determine the base branch (`main` for most repos; use `git symbolic-ref refs/remotes/origin/HEAD` if uncertain), then run `git log <base-branch>..<branch> --pretty=format:'%h %s%n%b'`. In no-arg mode `<branch>` is `HEAD`.
+  2. **PR exists** (any state, includes merged with deleted branch): `gh pr view <pr-num> --json commits --jq '.commits[] | "\(.oid[0:7]) \(.messageHeadline)\n\(.messageBody // "")"'`. This is the critical fallback for the "PR merged overnight, branch auto-deleted" scenario.
+  3. **Neither**: fall back to `gh pr view <pr-num> --json title,body` (PR title + body). If there's no PR either, note "no shipped-commit source available" in the log entry.
+- If the session is fresh and has no conversation context (e.g., running `/finish-work` cold the next morning), fall back to the shipped-commits source only and tell the user the log entry will be sparse.
 
 ## Step 7: Draft and apply project document updates
 
@@ -88,15 +120,26 @@ Only update if new follow-up items emerged. Append as a bulleted list under a da
 
 If a target doc doesn't exist in the project folder (e.g., no `decisions.md`), create it with a minimal markdown header (`# Decisions`, `# Todos and Follow-ups`) before appending.
 
-## Step 8: Worktree cleanup
+## Step 8: Worktree and branch cleanup
 
-- Detect worktree state: parse `git worktree list --porcelain` and compare to the current working directory.
-- If the current directory is the main checkout (not a worktree): skip silently.
-- If on a worktree:
-  1. **Check for uncommitted changes**: run `git status --porcelain`. If non-empty, warn the user and ask whether to abort cleanup or discard changes.
-  2. **Decide based on PR state**:
-     - **PR merged OR closed-unmerged**: prompt `Clean up worktree '<path>' and delete branch '<name>'? [y/n]`. On `y`, change directory out of the worktree to the main checkout path (from `git worktree list`), then run `git worktree remove <path>` and `git branch -D <name>`. Prefer the `ExitWorktree` tool if available.
-     - **PR still open**: skip cleanup. Tell the user the worktree was left in place because the PR is still open.
+Detect cleanup state:
+
+- Parse `git worktree list --porcelain` and find a worktree whose branch matches `<branch>` (resolved in Steps 1/3). Note whether that worktree is the current working directory.
+- Check `git rev-parse --verify <branch>` to see if the local branch still exists at all.
+
+Then act based on the combination:
+
+| Worktree | Local branch | PR state | Action |
+|---|---|---|---|
+| current dir | n/a | merged / closed-unmerged | Existing flow: uncommitted-changes check, then prompt `Clean up worktree '<path>' and delete branch '<name>'? [y/n]`. On `y`, `cd` out to the main checkout (from `git worktree list`), `git worktree remove <path>`, `git branch -D <branch>`. Prefer `ExitWorktree` if available. |
+| current dir | n/a | open | Skip. Tell the user the worktree was left in place because the PR is still open. |
+| other dir | n/a | merged / closed-unmerged | Uncommitted-changes check inside that worktree path, then prompt `Clean up worktree '<path>' and delete branch '<name>'? [y/n]`. On `y`, `git worktree remove <path>` and `git branch -D <branch>` from the current working directory. No `cd` needed. |
+| other dir | n/a | open | Skip with a note that the worktree was left in place because the PR is still open. |
+| none | yes | merged / closed-unmerged | Prompt `Local branch '<name>' still exists. Delete it? [y/n]`. On `y`, `git branch -D <branch>`. |
+| none | yes | open | Skip. Branch is still active. |
+| none | no | any | Skip silently — nothing to clean up. |
+
+Uncommitted-changes check (`git status --porcelain` against the worktree path) only applies when a worktree exists. If non-empty, warn the user and ask whether to abort cleanup or discard changes before proceeding.
 
 ## Step 9: Final summary
 
@@ -104,7 +147,7 @@ Print a recap:
 
 - **Ticket**: transitioned `<from>` → `<to>` (with JIRA URL)
 - **Project updates**: list of files modified, or "skipped"
-- **Worktree**: removed / left in place / not applicable
+- **Cleanup**: worktree removed / worktree left in place / branch deleted / nothing to clean up
 
 ## What this skill does NOT do
 
