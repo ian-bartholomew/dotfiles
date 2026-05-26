@@ -52,3 +52,8 @@ alias t='_tg(){ travelgrunt -out-file ~/.tg-path ${@} && cd "$(cat ~/.tg-path)" 
 alias tt='_tt(){ travelgrunt -top -out-file ~/.tg-path && cd "$(cat ~/.tg-path)" }; _tt'
 
 alias k='kubectl'
+
+# Traverse to the root of the current project
+alias cdr='cd "$(git rev-parse --show-toplevel)"'
+
+alias c='claude'

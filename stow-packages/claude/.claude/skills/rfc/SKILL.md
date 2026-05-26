@@ -78,10 +78,10 @@ Suggested per-section length:
 
 All file paths are relative to the **vault root** (`~/Documents/Work/`):
 
-- Drafts: `raw/rfcs/.draft-<slug>.md`
+- Drafts: `raw/rfcs/draft-<slug>.md`
 - Final: `raw/rfcs/<slug>.md`
 
-The dot-prefix on drafts mirrors the `one-pager` and `research` skill conventions and hides them from any `/compile`-style scanners.
+The `draft-` prefix distinguishes work-in-progress from finalized RFCs. Do not prefix with a dot — hidden files are invisible to Finder, `ls`, and most editors.
 
 ## Confluence constants
 
@@ -144,7 +144,7 @@ SLUG=$(printf '%s' "$TITLE" \
   | tr '[:upper:]' '[:lower:]' \
   | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
 
-DRAFT_PATH="$RFCS_DIR/.draft-$SLUG.md"
+DRAFT_PATH="$RFCS_DIR/draft-$SLUG.md"
 FINAL_PATH="$RFCS_DIR/$SLUG.md"
 ```
 
@@ -490,7 +490,7 @@ Authors? Ian Bartholomew
 Jira epics? FANDEVX-2448
 Review-until date? 2026-06-15
 
-Wrote draft: ~/Documents/Work/raw/rfcs/.draft-karpenter-arm-migration.md (1,943 words)
+Wrote draft: ~/Documents/Work/raw/rfcs/draft-karpenter-arm-migration.md (1,943 words)
 
 Dispatching 2 reviewers in parallel...
 
@@ -507,7 +507,7 @@ Merged edits applied:
 
 Word count: 2,037
 
-Draft ready. Review at raw/rfcs/.draft-karpenter-arm-migration.md.
+Draft ready. Review at raw/rfcs/draft-karpenter-arm-migration.md.
 [Approve / Revise / Cancel] > Approve
 
 Creating Confluence draft under TechOps RFC's...
@@ -548,7 +548,7 @@ Goals & non-goals? <…>
 ```
 User: /rfc karpenter ARM migration
 
-Found existing: raw/rfcs/.draft-karpenter-arm-migration.md
+Found existing: raw/rfcs/draft-karpenter-arm-migration.md
 [Resume / Overwrite / Rename / Cancel] > Resume
 
 Loaded draft (2,037 words). Skipping to review.

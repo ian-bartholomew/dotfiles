@@ -6,6 +6,8 @@ export DOTFILES="$HOME/.dotfiles"
 export ZSH="$DOTFILES" 
 export PROJECTS="$HOME/Dev"
 export DEFAULT_USER="$USER"
+export FZF_ALT_C_COMMAND='root=$(git rev-parse --show-toplevel 2>/dev/null) && { printf ".\t%s\n" "$root"; git -C "$root" ls-files | sed -n "s|/[^/]*\$||p" | sort -u | awk -v r="$root/" "{print \$0 \"\t\" r \$0}"; }'
+export FZF_ALT_C_OPTS="--delimiter=\t --with-nth=1 --accept-nth=2 --preview 'tree -C {2} | head -200'"
 
 # Spaceship prompt configuration
 export SPACESHIP_BATTERY_SHOW=false
@@ -126,3 +128,6 @@ export PATH="$PATH:/Users/ian/.lmstudio/bin"
 
 # Created by `pipx` on 2026-02-17 22:49:27
 export PATH="$PATH:/home/ian/.local/bin"
+
+# Added by LM Studio CLI tool (lms)
+export PATH="$PATH:/Users/ian.bartholomew/.lmstudio/bin"

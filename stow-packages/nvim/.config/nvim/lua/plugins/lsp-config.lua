@@ -22,7 +22,6 @@ return {
 					"eslint",
 					"gopls",
 					"pyright",
-					"markdownlint",
 					"stylua",
 				},
 			})
