@@ -46,6 +46,20 @@ def test_rejects_corrupt_thread_file():
         assert not out_path.exists(), "must not emit a cache on failure"
 
 
+def test_rejects_missing_fields():
+    with tempfile.TemporaryDirectory() as d:
+        tdir = Path(d) / "threads"
+        tdir.mkdir()
+        (tdir / "123.456.json").write_text("{}")
+        out_path = Path(d) / "cache.json"
+        r = subprocess.run(
+            [sys.executable, str(BUILDER), str(tdir), "-o", str(out_path),
+             "--channel", "C06PUG6V6NT", "--window-oldest", "1"],
+            capture_output=True, text=True)
+        assert r.returncode != 0
+        assert not out_path.exists(), "must not emit a cache on failure"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
