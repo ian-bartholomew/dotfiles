@@ -36,6 +36,10 @@ Invoke this skill when:
 Step 1: Meetings (background)     ──┐  Pull Zoom transcripts into meetings/<date>/
                                     │  (meeting-ingest, background subagent)
                                     │
+Step 1.5: Thread cache (fg)       ──┤  Fetch new #fes-platform-support thread
+                                    │  bodies once to /tmp/eod-fes-support-cache.json
+                                    │  (consumed by Steps 2 and 3)
+                                    │
 Step 2: FES Support (background)  ──┤  Extract #fes-platform-support threads to Confluence
                                     │  (fes-support-learnings:fes-support-learnings,
                                     │   background subagent, non-interactive)
@@ -79,6 +83,7 @@ Why this shape:
 
 - **Step 1 in parallel:** `meeting-ingest` writes to `meetings/` (not `raw/`), uses Zoom MCP (not Slack), and nothing downstream within Steps 2–4 reads its output. Fully independent, runs as a background subagent and overlaps with everything else.
 - **Step 2 in parallel:** `fes-support-learnings` reads `#fes-platform-support` and publishes to Confluence — the *same channel* Step 3 (`support-learnings`) reads. Because the user will already be reviewing those threads interactively in Step 3, Step 2 can run unattended in the background — any classification it would otherwise prompt on will get a second look during Step 3's review. Confluence output is reviewable post-hoc.
+- **Step 1.5 in the foreground:** the single thread fetch must complete before Step 2's subagent is dispatched so the cache exists when the subagent starts; the cost is a short serial block, the win is that each new thread's body is fetched once instead of once per consumer.
 - **Steps 3 and 4 sequential:** these two retain interactive per-thread review (classify / resolve / dismiss). They share the user's attention, so they run one at a time.
 - **Step 5 after the join:** `meeting-action-items` reads from `meetings/`, which Step 1 populates. Placing it after the join guarantees Step 1's background subagent has finished without pulling Step 1 foreground and killing the parallelism with Steps 2–4.
 - **Step 6 (project-log gate) before compile:** auditing `projects/*/log.md` against today's PR/JIRA/git activity belongs before compile so any new log entries created at this gate get indexed by Step 7's compile. The user's attention is already on today's work after Step 5's action-item review, so this is the natural moment to flag missing log entries. Enforces the CLAUDE.md rule.
@@ -165,7 +170,7 @@ Agent prompt template:
 
 Set `run_in_background: true` so the orchestrator does not block on this. Note the agent ID so it can be joined later (at Step 4.5).
 
-Do NOT poll or sleep waiting on it — the runtime notifies on completion. Proceed straight to Step 2.
+Do NOT poll or sleep waiting on it — the runtime notifies on completion. Proceed straight to Step 1.5.
 
 Track (recorded at the join in Step 4.5): meetings ingested, meetings skipped.
 
@@ -175,13 +180,55 @@ Record status as one of:
 - `nothing-to-do` — all meetings already ingested
 - `failed` — see failure-handling below
 
+### Step 1.5: Fetch fes-support threads to the shared cache (foreground)
+
+Both Step 2 (Confluence) and Step 3 (raw/) read the same `#fes-platform-support`
+threads. Fetch the thread bodies once here so each consumer classifies from the
+cache instead of re-reading Slack.
+
+1. Start clean: `rm -rf /tmp/eod-cache-threads && mkdir -p /tmp/eod-cache-threads`
+   and `rm -f /tmp/eod-fes-support-cache.json`.
+2. Compute the widest window either consumer needs: read
+   `raw/support_learnings/_metadata.yml`, find the most recent `date_processed`,
+   and take the older of (start of that day, now minus 7 days) as `oldest`.
+3. Run `mcp__claude_ai_Slack__slack_read_channel` (channel `C06PUG6V6NT`,
+   that `oldest`).
+4. For each threaded message whose `ts` is NOT already in
+   `raw/support_learnings/_metadata.yml`: read it with
+   `mcp__claude_ai_Slack__slack_read_thread`, then IMMEDIATELY write that one
+   thread to `/tmp/eod-cache-threads/<ts>.json` via the Write tool as
+   `{"parent": {"author", "ts", "text", "reactions"?}, "replies": [{"author",
+   "ts", "text"}, ...]}` (verbatim text; reactions optional). One file per
+   thread; never hand-assemble the combined JSON.
+5. Assemble and validate:
+
+   ```bash
+   python3 ~/.claude/skills/end-of-day/build_cache.py /tmp/eod-cache-threads \
+     -o /tmp/eod-fes-support-cache.json \
+     --channel C06PUG6V6NT --window-oldest <oldest>
+   ```
+
+   On a non-zero exit, delete `/tmp/eod-fes-support-cache.json` if present and
+   continue WITHOUT a cache: both consumers fall back to live fetches. Never
+   halt the pipeline over the cache.
+
+Track: threads cached, cache path, or `no-cache (reason)`.
+
 ### Step 2: FES Support Learnings → Confluence (background subagent)
 
 Dispatch fes-support-learnings as a second background subagent so it runs in parallel with meeting-ingest and Steps 3–4. It lives in the `fes-support-learnings` plugin (separate from `lyt-assistant`) — use the fully-qualified skill name.
 
 Agent prompt template:
 
-> Run the `fes-support-learnings:fes-support-learnings` skill end-to-end with no arguments. It extracts threads from `#fes-platform-support` (default 7-day lookback) and publishes domain-grouped pages to Confluence. The Slack MCP and Atlassian MCP must both be authenticated — if either is missing, stop and report that, do not try to authenticate. **Run non-interactively** using these explicit auto-defaults so behavior is consistent run-to-run and the user knows what to spot-check at the join:
+> Run the `fes-support-learnings:fes-support-learnings` skill end-to-end with no arguments. It extracts threads from `#fes-platform-support` (default 7-day lookback) and publishes domain-grouped pages to Confluence. The Slack MCP and Atlassian MCP must both be authenticated — if either is missing, stop and report that, do not try to authenticate.
+>
+> A thread cache may exist at `/tmp/eod-fes-support-cache.json`. Before reading
+> any thread from Slack, run `python3 <skill-dir>/fes_support_cache.py check`
+> (the helper ships with the fes-support-learnings skill); if trusted, take
+> thread bodies from the cache (`get <ts>`) and only call slack_read_thread for
+> threads the cache is missing. If untrusted, fetch live exactly as before.
+>
+> **Run non-interactively** using these explicit auto-defaults so behavior is consistent run-to-run and the user knows what to spot-check at the join:
 >
 > - Per-thread classification prompt → default to `knowledge` (the safest catch-all category; classifying as `incident` or `decision` requires evidence the auto-pass shouldn't infer).
 > - Per-thread resolution prompt → default to `unresolved` (let the foreground `support-learnings` step in Step 3 capture the resolution if there is one; do not guess from the thread body).
@@ -207,6 +254,10 @@ Invoke the (lyt-assistant) support-learnings skill, which writes to `~/Documents
 Skill: lyt-assistant:support-learnings
 Args: (none — process new threads since last run)
 ```
+
+A thread cache may exist at `/tmp/eod-fes-support-cache.json` (written by
+Step 1.5). The support-learnings skill consults it automatically; nothing to
+pass.
 
 Track: number of new threads processed, output file path(s). These files become inputs for Step 6 (Compile).
 
