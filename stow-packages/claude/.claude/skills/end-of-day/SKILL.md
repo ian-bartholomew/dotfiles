@@ -398,8 +398,11 @@ note = pathlib.Path(sys.argv[1])
 new_block = pathlib.Path(sys.argv[2]).read_text().rstrip("\n") + "\n"
 text = note.read_text() if note.exists() else ""
 pattern = re.compile(r"## End of Day[^\n]*\n.*?<!-- eod:end -->\n?", re.DOTALL)
-if pattern.search(text):
-    text = pattern.sub(new_block, text)
+matches = pattern.findall(text)
+if len(matches) > 1:
+    sys.exit(f"REFUSING: {len(matches)} End of Day blocks already in {note} - inspect manually")
+if matches:
+    text = pattern.sub(new_block, text, count=1)
 else:
     text = text.rstrip("\n")
     if text:
