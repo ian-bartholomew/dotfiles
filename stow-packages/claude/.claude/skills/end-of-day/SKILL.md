@@ -189,8 +189,11 @@ cache instead of re-reading Slack.
 1. Start clean: `rm -rf /tmp/eod-cache-threads && mkdir -p /tmp/eod-cache-threads`
    and `rm -f /tmp/eod-fes-support-cache.json`.
 2. Compute the widest window either consumer needs: read
-   `raw/support_learnings/_metadata.yml`, find the most recent `date_processed`,
-   and take the older of (start of that day, now minus 7 days) as `oldest`.
+   `raw/support_learnings/_metadata.yml` and find the most recent
+   `date_processed`. Compute two Unix timestamps: (a) local midnight at the
+   start of that date via `date -j -f "%Y-%m-%d %H:%M:%S" "<date> 00:00:00" "+%s"`,
+   and (b) now minus 7 days via `date -v-7d +%s`. Use the smaller (older) of
+   the two as `oldest`.
 3. Run `mcp__claude_ai_Slack__slack_read_channel` (channel `C06PUG6V6NT`,
    that `oldest`).
 4. For each threaded message whose `ts` is NOT already in
@@ -224,7 +227,8 @@ Agent prompt template:
 >
 > A thread cache may exist at `/tmp/eod-fes-support-cache.json`. Before reading
 > any thread from Slack, run `python3 <skill-dir>/fes_support_cache.py check`
-> (the helper ships with the fes-support-learnings skill); if trusted, take
+> (the helper ships with the fes-support-learnings skill) (its base directory
+> is announced when that skill loads; substitute it for `<skill-dir>`); if trusted, take
 > thread bodies from the cache (`get <ts>`) and only call slack_read_thread for
 > threads the cache is missing. If untrusted, fetch live exactly as before.
 >
