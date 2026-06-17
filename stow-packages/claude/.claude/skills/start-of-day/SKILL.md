@@ -266,6 +266,9 @@ If the check warns, add a one-line "Yesterday's end-of-day did not run -- check
 the Desktop scheduled task" note to the start-of-day terminal summary (Step 5).
 Do not block the morning routine on it.
 
+(This may emit a false warning the day after a US holiday, when the prior
+business day legitimately had no run. It is non-blocking, so that is acceptable.)
+
 ### Step 3: Invoke the render script
 
 The skill no longer composes markdown by hand. A deterministic Python script at `~/.claude/skills/start-of-day/render.py` reads the three JSON files written in Step 2 and emits the entire `## Start of Day` … `<!-- sod:end -->` block on stdout. The script owns whitespace and structure; the model captures stdout and uses it verbatim in Step 4.

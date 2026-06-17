@@ -44,6 +44,10 @@ listed here. If the `--unattended` token is absent, ignore this entire section.
   the interactive flow would ask, take the documented auto-default and continue.
 - **Best-effort.** A mid-run sub-skill failure is logged to the report and the
   run continues. The single exception is Step 0 pre-flight, which still HALTS.
+- **Error Handling prompts auto-resolve.** Every continue/retry/halt
+  ([c]/[r]/[h]) and quit ([q]) prompt in the Error Handling section
+  resolves automatically to Continue: log the failure and proceed best-effort.
+  The sole exception is Step 0 pre-flight, which still halts.
 - **External/published writes are draft/dry-run only** (see Step 2). The local
   daily note (Step 9) is the one surface auto-written, because it is local,
   reversible, and idempotently upserted.
@@ -55,6 +59,11 @@ Before Step 0, acquire an exclusive lock so a catch-up run and a manual run
 cannot double-write the shared `/tmp` caches and `_action-item-state.json`:
 
 ```bash
+# clear an orphaned lock older than 6h (a prior run that died without cleanup),
+# then acquire atomically:
+if [ -d /tmp/eod.lock ] && find /tmp/eod.lock -maxdepth 0 -mmin +360 | grep -q .; then
+  rmdir /tmp/eod.lock 2>/dev/null
+fi
 if ! mkdir /tmp/eod.lock 2>/dev/null; then
   echo "end-of-day already running (/tmp/eod.lock present); aborting."; exit 0
 fi
@@ -679,6 +688,10 @@ Then append an end-of-day block to `wiki/_log.md`:
 If any steps failed or were skipped, list them in a `- Step failures:` line.
 
 ## Error Handling
+
+In `--unattended` mode, every prompt below auto-resolves to Continue (log and
+proceed best-effort); Step 0 pre-flight is the one exception that halts. See
+Unattended Mode > Global rules.
 
 ### A Sub-Skill Reports Its MCP Isn't Authed
 
