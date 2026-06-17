@@ -248,6 +248,27 @@ documents; do not re-query JIRA). Include the sync summary (created / moved / co
 manual overrides / orphans) in the Step 5 terminal confirmation. A sync failure is
 non-fatal to start-of-day: report it and continue - the board is a view, not a gate.
 
+### Step 2.6: End-of-day heartbeat check
+
+Confirm the previous business day actually ran its end-of-day pipeline. A
+missed unattended EOD leaves no `wiki/_log.md` entry - a silent non-event.
+Surface its absence in the morning.
+
+```bash
+PREV=$(date -v-1d +%Y-%m-%d)         # Mon-Thu; on Monday use Friday:
+[ "$(date +%u)" = "1" ] && PREV=$(date -v-3d +%Y-%m-%d)
+grep -q "^## \[$PREV\] end-of-day" ~/Documents/Work/wiki/_log.md \
+  && echo "EOD heartbeat: $PREV ok" \
+  || echo "EOD heartbeat: WARNING no end-of-day entry for $PREV"
+```
+
+If the check warns, add a one-line "Yesterday's end-of-day did not run -- check
+the Desktop scheduled task" note to the start-of-day terminal summary (Step 5).
+Do not block the morning routine on it.
+
+(This may emit a false warning the day after a US holiday, when the prior
+business day legitimately had no run. It is non-blocking, so that is acceptable.)
+
 ### Step 3: Invoke the render script
 
 The skill no longer composes markdown by hand. A deterministic Python script at `~/.claude/skills/start-of-day/render.py` reads the three JSON files written in Step 2 and emits the entire `## Start of Day` … `<!-- sod:end -->` block on stdout. The script owns whitespace and structure; the model captures stdout and uses it verbatim in Step 4.
