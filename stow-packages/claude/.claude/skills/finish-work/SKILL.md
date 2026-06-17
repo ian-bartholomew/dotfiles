@@ -18,6 +18,57 @@ The skill operates in two modes:
 
 Follow these steps in order. Each step has explicit branching logic — do not skip or reorder them.
 
+## Step 0: Pre-Flight Verification (MANDATORY)
+
+Run these four checks before resolving the ticket or touching any state. `/finish-work` transitions a JIRA ticket and may delete a branch / worktree — both are state-changing operations that the user's CLAUDE.md explicitly demands be gated on live verification of JIRA + PR + git state. **Fail loudly and halt if any check cannot execute.** Do not proceed on stale local state.
+
+### 1. Sync local git state
+
+This skill always runs inside a git repo (Step 1 already enforces that for Case B; Case A reads the current branch). Sync the default branch and check staleness:
+
+```bash
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || { echo "FATAL: /finish-work must be run inside a git repository. Halting."; exit 1; }
+git fetch origin --quiet \
+  || { echo "FATAL: git fetch origin failed — cannot verify branch / PR state. Halting."; exit 1; }
+DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+BEHIND="$(git rev-list --count "$DEFAULT_BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
+[ "$BEHIND" -gt 0 ] && echo "NOTE: local $DEFAULT_BRANCH is $BEHIND commits behind origin/$DEFAULT_BRANCH — pull before starting new work."
+```
+
+The `git fetch` is critical here: PR state (merged / open / closed) drives the JIRA transition decision in Step 4 and the cleanup decision in Step 8. A stale local view of the PR will produce the wrong transition.
+
+### 2. GitHub identity must be `ian-at-fes`
+
+```bash
+gh auth status 2>&1 | grep -q "Active account: true" \
+  && gh auth status 2>&1 | grep -q "ian-at-fes" \
+  || { echo "FATAL: gh CLI is not authed as ian-at-fes. Run 'gh auth switch -u ian-at-fes' and re-run /finish-work. Halting."; exit 1; }
+```
+
+Do **not** auto-switch — the user's CLAUDE.md mandates explicit identity management. Halt and ask the user to switch.
+
+### 3. Live JIRA status for the target ticket
+
+Step 1 resolves the ticket key. Before transitioning anything in Step 4, the ticket's **live** status and available transitions must be fetched via `mcp__plugin_fbg-core_atlassian__getJiraIssue` + `mcp__plugin_fbg-core_atlassian__getTransitionsForJiraIssue`. If either call fails, halt:
+
+```
+FATAL: JIRA MCP unavailable — cannot verify <KEY> status or fetch transitions. Halting.
+```
+
+Do not transition a ticket based on the assumed status — re-fetch it. Tickets get moved by other people between when the branch was created and when `/finish-work` runs.
+
+### 4. Live PR merge state via `gh pr view`
+
+The PR state drives the JIRA transition in Step 4 (merged → Done, open → In Review) and the cleanup branching in Step 8. Step 3 already calls `gh pr view`; that call must succeed when a PR exists. If `gh pr view` returns a non-zero exit code **and** other evidence (branch name, ticket-key search) suggests a PR should exist, halt:
+
+```
+FATAL: gh pr view failed for <branch or PR #N> — cannot determine merge state. Halting.
+```
+
+The exception: a genuinely PR-less branch (Case A on a local-only branch, or Case B with `gh pr list` returning zero matches) is fine — that's "no PR", not "verification failed". Step 3 distinguishes these.
+
 ## Step 1: Resolve the ticket key and branch
 
 **Case A — no argument provided:**
@@ -36,8 +87,10 @@ Follow these steps in order. Each step has explicit branching logic — do not s
 
 ## Step 2: Confirm GitHub identity
 
+GitHub identity is already verified by Step 0's pre-flight block — if you reach this step the active `gh` account is `ian-at-fes`. This step is retained as an explicit checkpoint; re-confirm if any earlier step has been skipped or run manually out of order.
+
 - Run `gh auth status`.
-- If the active account is not `ian-at-fes`, instruct the user to switch (`gh auth switch -u ian-at-fes`) before continuing. Do not auto-switch — the user's CLAUDE.md mandates explicit identity management.
+- If the active account is not `ian-at-fes`, halt and instruct the user to switch (`gh auth switch -u ian-at-fes`) before re-running. Do not auto-switch — the user's CLAUDE.md mandates explicit identity management.
 
 ## Step 3: Fetch ticket and PR state in parallel
 
@@ -70,6 +123,18 @@ Smart default based on PR state:
 - Show the user the chosen target transition (or the prompt for "closed-unmerged" / "no PR") alongside the available transitions list from JIRA. Confirm before executing.
 - Execute the transition via the Atlassian MCP server (`transitionJiraIssue`).
 - If the transition fails (e.g., required field missing), surface the error and prompt the user — do not silently swallow.
+
+## Step 4.5: Update the work-board card
+
+After the JIRA transition, update the ticket's Todoist card directly (no full sync):
+
+- Find it: `td task list --project "Work" --json --all` filtered to content starting with
+  `<TICKET-KEY>`. No card -> skip silently (not all tickets have cards).
+- Transitioned to Done (or any done-category status): `td task complete id:<card_id>`.
+- Transitioned to In Code Review: `td task move id:<card_id> --section "In Review"`, then
+  `td task update id:<card_id> --description "<existing description with the sync: line's
+  jira-status replaced by the new status and synced set to today>"`.
+- Report the card action in the Step 9 final summary.
 
 ## Step 5: Find the project folder
 

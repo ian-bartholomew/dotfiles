@@ -1,7 +1,7 @@
 ---
 name: start-of-day
 description: This skill should be used when the user asks to "start of day", "SOD", "run start of day", "kick off the day", "start of day routine", or runs "/start-of-day".
-version: 0.26.0
+version: 0.28.0
 allowed-tools:
   [
     Bash,
@@ -61,6 +61,114 @@ The skill is one-shot and non-interactive: fetch, write, confirm path, then hand
 - **Atlassian MCP available** (`mcp__plugin_fbg-core_atlassian__searchJiraIssuesUsingJql`).
 - **Todoist CLI (`td`) authed.** Fallback absolute path: `/opt/homebrew/bin/td`.
 - **Obsidian app running** with Daily Notes enabled. The `obsidian` CLI talks to the live app and exits non-zero otherwise. Full reference: <https://help.obsidian.md/cli>.
+
+## Step 0: Pre-Flight Verification (MANDATORY)
+
+Run these checks **before fetching any data or writing the snapshot**. `/start-of-day` doesn't make recommendations directly, but its snapshot is consumed downstream by `/what-next` and `/daily-standup` — feeding them stale or partial data poisons the rest of the day's signal. **Fail loudly and halt if any check cannot execute.**
+
+The MCP probes (#3, #5, #6 below) are non-negotiable: the snapshot section itself depends on Atlassian, and `/daily-standup` invoked in Step 6 depends on Slack and Zoom. A missing MCP at the start of the day means stale signal for every downstream skill that reads the daily note. Do not skip a failing probe; do not offer the user a "continue without this MCP" path. Halt, surface the failure, ask the user to fix permissions (`/plugin` → reauthorize), and re-run.
+
+### Step 0 does NOT degrade gracefully
+
+The skill's per-source `lookup failed: <error>` fallback (see Error Handling) applies **only** to `td` and `obsidian`. It does **NOT** generalize to Atlassian, Slack, or Zoom. Those three are pre-flight gates, not graceful-degrade sources. The line is:
+
+- **Gate (halt on failure):** Atlassian MCP, Slack MCP, Zoom MCP, `gh` CLI, `gh search prs` queries.
+- **Graceful-degrade (render `lookup failed`, continue):** Todoist (`td`), Obsidian write failure (one-time terminal fallback).
+
+If you find yourself reasoning "the skill degrades gracefully elsewhere, so I can let this MCP failure through too" — stop. That reasoning is wrong. The gate exists precisely because downstream consumers (`/what-next`, `/daily-standup`) cannot recover from a poisoned snapshot or a missing standup section the way they can recover from a missing Todoist line.
+
+### Step 0 is not negotiable under time pressure
+
+If the user invokes `/start-of-day` with "go fast", "skip checks", "I'm late for standup", or any time-pressure framing — **pre-flight still runs in full**. The user's actual goal under that framing is a usable snapshot for downstream synthesis. Running the pipeline blind defeats that goal: the snapshot lands but is silently partial, `/daily-standup` fails or runs degraded, and `/what-next` reads stale data for the rest of the day. A 1-2 second parallel probe block is cheaper than the cleanup.
+
+If a probe fails under time pressure, the right response is **not** "skip and ship" — it's "halt now and surface so the user can `/plugin` reauthorize in 10 seconds and re-run before standup." That is faster than discovering the gap mid-standup.
+
+### Rationalization counters
+
+| Excuse | Reality |
+|--------|---------|
+| "User said go fast — that overrides MANDATORY." | No. User's goal is usable signal; partial signal is worse than 10s of re-auth. Pre-flight runs in full. |
+| "The skill degrades gracefully on `td`, so MCP failures should too." | No. `td`/`obsidian` are graceful-degrade by design; Atlassian/Slack/Zoom are explicit gates. The boundary is intentional. |
+| "User verbally said Slack might be flaky, but the skill doesn't say to probe — so I won't." | The skill DOES say to probe (#5). A user warning is additional evidence the probe will catch something, not a reason to skip it. |
+| "Probing Slack/Zoom is duplicate work — the downstream call will fail anyway." | Downstream failure happens AFTER a partial write. Probe failure happens BEFORE any write. Order matters — half-written daily notes pollute every downstream consumer for the rest of the day. |
+| "I'll skip probes and let `lookup failed: <error>` lines render." | Only `td` renders `lookup failed`. Atlassian/Slack/Zoom failures halt — there is no error-sentinel render path for them. |
+
+### 1. Sync local git state (when in a repo)
+
+If cwd is inside a git repo, sync the default branch and surface staleness:
+
+```bash
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git fetch origin --quiet \
+    || { echo "FATAL: git fetch origin failed. Halting."; exit 1; }
+  DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')"
+  DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+  BEHIND="$(git rev-list --count "$DEFAULT_BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
+  [ "$BEHIND" -gt 0 ] && echo "NOTE: local $DEFAULT_BRANCH is $BEHIND commits behind origin/$DEFAULT_BRANCH."
+fi
+```
+
+If cwd is not in a repo, skip silently — `/start-of-day` is commonly run from `~` or another non-repo path.
+
+### 2. GitHub identity must be `ian-at-fes` and reachable
+
+```bash
+gh auth switch --user ian-at-fes 2>&1 \
+  || { echo "FATAL: cannot switch gh CLI to ian-at-fes. Halting."; exit 1; }
+gh auth status 2>&1 | grep -q "Active account: true" \
+  || { echo "FATAL: gh auth status check failed. Halting."; exit 1; }
+```
+
+A failure here halts the skill — do **not** proceed to write a snapshot with a missing or wrong-account PR section. This is a deliberate change from prior versions, which rendered an error sentinel and continued.
+
+### 3. Atlassian MCP must be available
+
+The skill cannot produce a useful daily-note JIRA section without a live MCP call. Probe the Atlassian MCP up-front with `mcp__plugin_fbg-core_atlassian__atlassianUserInfo` (no args, minimal side-effect-free auth probe). If the probe fails — auth error, tool unavailable, permission denied — halt before writing:
+
+```
+FATAL: Atlassian MCP unavailable — cannot fetch assigned tickets. Halting.
+Fix: run /plugin, reauthorize the Atlassian server, then re-run /start-of-day.
+```
+
+The functional JQL call in Step 2 (`searchJiraIssuesUsingJql`) doubles as a second auth check at fetch time, but probing here keeps the failure mode upstream of the parallel-fetch block so the user isn't left with half-written temp files.
+
+Earlier versions rendered an error sentinel into the JIRA section. That behavior is removed — `/what-next` and `/daily-standup` cannot meaningfully recover from a poisoned JIRA section, so write nothing rather than write garbage.
+
+### 4. Live PR merge state via `gh search prs`
+
+Both the `--state=open` and `--state=closed --merged` searches in Step 2 must succeed. If either fails, halt:
+
+```
+FATAL: gh search prs failed (<open|merged>). Halting.
+```
+
+The merged-PRs query feeds the "🟢 Potential to close" flag downstream consumers read — a missing merged-PR set silently downgrades signal quality across the day. No partial writes.
+
+### 5. Slack MCP must be available
+
+`/start-of-day` doesn't read Slack directly, but it chains to `/daily-standup` (Step 6), which does. Probe up-front so the user fixes auth before the snapshot is written and the standup attempt fails halfway through.
+
+Call `mcp__claude_ai_Slack__slack_search_users` with a minimal query (e.g. `query: "ian"`, `count: 1`). Success = returns a user search response. Failure (auth error, tool unavailable, permission denied) halts:
+
+```
+FATAL: Slack MCP unavailable — /daily-standup will not have Slack signal. Halting.
+Fix: run /plugin, reauthorize the Slack server, then re-run /start-of-day.
+```
+
+### 6. Zoom MCP must be available
+
+Same reasoning as Slack — `/daily-standup` and other downstream consumers of the daily note may pull from Zoom transcripts, so a missing Zoom MCP at the start of the day means stale signal. Probe with `mcp__claude_ai_Zoom_for_Claude__recordings_list` (`page_size: 1`, today's date for any required date arg). Success = returns a recordings response (empty list is fine). Failure halts:
+
+```
+FATAL: Zoom MCP unavailable — meeting context will be missing downstream. Halting.
+Fix: run /plugin, reauthorize the Zoom server, then re-run /start-of-day.
+```
+
+### Pre-flight summary
+
+If all six checks pass, print one line — `Pre-flight: git / gh / Atlassian / gh-prs / Slack / Zoom OK` — and proceed to Step 1. If any failed, halt and surface every probe's status in the failure message so the user can fix all gaps in a single round-trip rather than re-running and discovering them one at a time.
+
+Run probes #3, #5, and #6 (the three MCPs) **in parallel** — single assistant message, three tool calls — to keep pre-flight under one round-trip when everything is healthy. The bash checks (#1, #2, #4) can run in the same message too.
 
 ## Process Flow
 
@@ -131,6 +239,14 @@ After all three fetches return (or fail), persist each result to a temp JSON fil
 - **Any source fails:** write `{"error": "<message>"}` to that source's file instead of a payload. Other sources still write their normal output.
 
 The render script in Step 3 reads these three files and emits the corresponding section text — including the `_… lookup failed: <error>._` line for any source whose file contains an `error` shape.
+
+### Step 2.5: Work-board sync (live)
+
+Run the `work-board` skill in live mode, reusing the assigned-open JIRA result already
+fetched in Step 2 (write it to `/tmp/work-board-tickets.json` in the shape the skill
+documents; do not re-query JIRA). Include the sync summary (created / moved / completed /
+manual overrides / orphans) in the Step 5 terminal confirmation. A sync failure is
+non-fatal to start-of-day: report it and continue - the board is a view, not a gate.
 
 ### Step 3: Invoke the render script
 
@@ -216,11 +332,13 @@ If `/daily-standup` fails (Slack MCP down, JIRA timeout, etc.), the already-writ
 
 ## Error Handling
 
-- **`gh` failure:** render the PR section as `_Open Pull Requests — lookup failed: <error>._` and continue.
-- **JIRA MCP failure:** render the JIRA section as `_Open JIRA Tickets — lookup failed: <error>._` and continue.
-- **`td` failure:** render the Todoist section as `` _Today + Overdue — `td` unavailable: <error>._ `` and continue.
-- **`obsidian daily` failure** (most common cause: Obsidian not running): print the error and tell the user `Obsidian doesn't appear to be running — open the app, then re-run /start-of-day. Falling back to terminal output for this run.` Emit the markdown to the terminal as a one-time fallback.
-- **Post-write marker count != 1:** print a diagnostic with `$DAILY_NOTE_PATH` and halt — ask the user to inspect the daily note manually before re-running.
+`gh`, Atlassian/JIRA MCP, merged-PR, Slack MCP, and Zoom MCP failures are now governed by the Step 0 Pre-Flight Verification block — they halt the skill loudly before any write happens. The "render error sentinel and continue" behavior for those sources was deliberately removed in v0.27.0 (and extended in v0.28.0 to cover Slack/Zoom): downstream consumers (`/what-next`, `/daily-standup`) cannot recover from a poisoned snapshot or a missing standup section, so writing nothing is better than writing garbage. Pre-flight failures must be fixed (typically `/plugin` → reauthorize) and the skill re-run; do not offer a continue-without-MCP path.
+
+Failures that **do not** halt:
+
+- **`td` failure:** render the Todoist section as `` _Today + Overdue — `td` unavailable: <error>._ `` and continue. Todoist is a lower-stakes signal — a missing section doesn't poison the rest of the day's downstream synthesis.
+- **`obsidian daily` failure** (most common cause: Obsidian not running): print the error and tell the user `Obsidian doesn't appear to be running — open the app, then re-run /start-of-day. Falling back to terminal output for this run.` Emit the rendered markdown to the terminal as a one-time fallback.
+- **Post-write marker count != 1:** print a diagnostic with `$DAILY_NOTE_PATH` and halt — ask the user to inspect the daily note manually before re-running. This is a structural integrity check on the write itself, not a pre-flight check.
 
 ## Related Skills
 

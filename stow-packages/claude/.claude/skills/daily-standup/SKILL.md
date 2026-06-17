@@ -214,14 +214,11 @@ Bucket assignment rules:
 Cap inferred bullets at **3 per bucket** to keep noise down. Mark every
 inferred bullet `source: "inferred"` so the user can prune in Obsidian.
 
-For JIRA bullets, set `status` to the JIRA status string (e.g. `"In Progress"`,
-`"Blocked"`) so the renderer can emit the matching status emoji.
-
 **Bullet text must be Slack-brief.** Aim for **≤ 12 words** per `text`.
 Prefer verb-led fragments over full sentences:
 
-- ✅ `"Shipped Karpenter migration for load-testing env"`
-- ❌ `"I shipped the Karpenter migration for the load-testing environment, which involved …"`
+- Good: `"Shipped Karpenter migration for load-testing env"`
+- Bad:  `"I shipped the Karpenter migration for the load-testing environment, which involved …"`
 
 Strip ticket keys from the `text` (they go in `ref`). Strip URLs from the
 `text` (they go in `url`). One idea per bullet — split if you find yourself
@@ -271,10 +268,10 @@ pattern = re.compile(r"## Daily Standup\n.*?<!-- standup:end -->\n?", re.DOTALL)
 if pattern.search(text):
     text = pattern.sub(new_block, text)
 else:
-    if text and not text.endswith("\n"):
-        text += "\n"
+    # Separate existing content from the new block with exactly one blank line.
+    text = text.rstrip("\n")
     if text:
-        text += "\n"
+        text += "\n\n"
     text += new_block
 note.write_text(text)
 print(note)
@@ -286,7 +283,7 @@ PY
 Print one line:
 
 ```
-✅ Daily standup written to: /Users/.../05-18-2026.md
+Daily standup written to: /Users/.../05-18-2026.md
 ```
 
 Do not loop. Do not summarise the buckets. The user reads/edits the section

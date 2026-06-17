@@ -40,15 +40,6 @@ import json
 import sys
 from pathlib import Path
 
-# Status emoji map mirrors start-of-day so the daily note reads consistently.
-STATUS_EMOJI = {
-    "to do": "📋", "backlog": "📋", "open": "📋", "new": "📋",
-    "in progress": "🚧", "in development": "🚧",
-    "in review": "👀", "code review": "👀", "qa": "👀",
-    "blocked": "🛑", "on hold": "🛑", "waiting": "🛑",
-    "done": "✅", "closed": "✅", "resolved": "✅",
-}
-
 # Source labels used for the `· _source_` italic suffix on each bullet.
 SOURCE_LABEL = {
     "jira": "jira",
@@ -70,23 +61,13 @@ WILLDO_ORDER  = ["jira", "todoist", "daily-note", "inferred"]
 BLOCKER_ORDER = ["jira", "daily-note", "input", "inferred"]
 
 
-def status_prefix(status: str | None) -> str:
-    if not status:
-        return ""
-    return STATUS_EMOJI.get(status.strip().lower(), "")
-
-
 def render_bullet(b: dict, verbose: bool) -> str:
     text = b.get("text") or "(no text)"
     ref = b.get("ref") or ""
     url = b.get("url") or ""
     source = b.get("source") or ""
-    status = b.get("status") or ""
 
     head = ""
-    sp = status_prefix(status)
-    if sp:
-        head = f"{sp} "
 
     # Verbose: [REF](url) markdown link with backtick fallback, and source suffix.
     # Brief:   bare REF (Slack-friendly; JIRA app autolinks if installed), no suffix.
