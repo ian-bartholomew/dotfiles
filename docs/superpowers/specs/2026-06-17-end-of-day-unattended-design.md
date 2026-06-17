@@ -54,8 +54,25 @@ Because Slack/Zoom/Atlassian are claude.ai **connectors** (not local `.mcp.json`
 servers), their tool names resolve to rotating UUIDs that cannot be durably
 allowlisted — allow rules cannot wildcard the server segment.
 
-- **Layer 1 — `bypassPermissions` per-task (primary).** Set in the Desktop UI.
-  Auto-approves regardless of tool name or UUID rotation. User manual step.
+> **UPDATE (post-implementation, 2026-06-17):** the chosen Layer 1 is **auto
+> mode**, not `bypassPermissions`. The Desktop app did not offer
+> `bypassPermissions` for the task; it offered "auto". Auto is a better fit
+> anyway: it keeps a background safety classifier that vets tool calls (blocking
+> escalation / hostile-content-driven actions) instead of blanket-approving
+> everything, which directly mitigates the prompt-injection surface this job
+> carries. Auto auto-approves read-only actions, working-dir edits, and
+> allow-rule matches; routes other Bash/MCP through the classifier; and still
+> honors deny rules. It is NOT a guaranteed zero-prompt for connector MCP calls
+> (the classifier can route one to a stall), so the settings allowlist (Layer 2)
+> and the observability backstops (notification + start-of-day dead-man's-switch)
+> remain load-bearing. Net posture: auto + allowlist + observability. The
+> supervised e2e on 2026-06-17 ran clean under this posture. Known UI bug #53569:
+> setting auto on a task can hide "auto" from the mode picker elsewhere.
+
+- **Layer 1 — auto mode per-task (primary).** Set in the Desktop UI. Vets tool
+  calls via a safety classifier; auto-approves read-only + working-dir edits +
+  allow-rule matches; honors deny rules. (Originally specced as
+  `bypassPermissions`; see UPDATE above for why auto was chosen.)
 - **Layer 2 — `settings.json` allow + deny.** Allow the deterministic,
   non-rotating Bash so they never stall even if Desktop silently reverts to
   `acceptEdits` (a known bug):
