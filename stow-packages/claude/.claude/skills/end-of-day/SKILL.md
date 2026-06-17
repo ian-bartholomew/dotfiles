@@ -1,8 +1,9 @@
 ---
 name: end-of-day
 description: This skill should be used when the user asks to "end of day", "EOD", "run end of day", "wrap up the day", or runs "/end-of-day". Captures the day's Zoom + Slack signal into the wiki (with FES support learnings published to Confluence), reviews meeting action items into Todoist, audits project log.md files for today's entries, runs a verify-status snapshot, and synthesizes today's daily-note EOD section. Friday adds a weekly retrospective.
-version: 0.3.0
-allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, AskUserQuestion, Skill, Agent, TaskStop]
+version: 0.4.0
+argument-hint: "[--unattended]"
+allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, AskUserQuestion, Skill, Agent, TaskStop, PushNotification]
 ---
 
 # End-of-Day Skill
@@ -29,6 +30,113 @@ Invoke this skill when:
 - If the user only wants the internal channel into `raw/`: use `/lyt-assistant:internal-channel-learnings`
 - If the user only wants to review meeting action items into Todoist: use `/lyt-assistant:meeting-action-items`
 - If the user only wants to compile already-collected sources: use `/lyt-assistant:compile`
+
+## Unattended Mode
+
+When invoked as `/end-of-day --unattended` (the scheduled Desktop task uses
+this), the pipeline runs with no human present. Manual `/end-of-day` is
+unchanged. Both modes share every step body; they differ ONLY at the points
+listed here. If the `--unattended` token is absent, ignore this entire section.
+
+### Global rules (unattended)
+
+- **No interactive prompts of any kind. No continue/retry/halt prompts.** Every place
+  the interactive flow would ask, take the documented auto-default and continue.
+- **Best-effort.** A mid-run sub-skill failure is logged to the report and the
+  run continues. The single exception is Step 0 pre-flight, which still HALTS.
+- **External/published writes are draft/dry-run only** (see Step 2). The local
+  daily note (Step 9) is the one surface auto-written, because it is local,
+  reversible, and idempotently upserted.
+- **End every run with a notification** (Observability, below).
+
+### Concurrency lock (first action, unattended)
+
+Before Step 0, acquire an exclusive lock so a catch-up run and a manual run
+cannot double-write the shared `/tmp` caches and `_action-item-state.json`:
+
+```bash
+if ! mkdir /tmp/eod.lock 2>/dev/null; then
+  echo "end-of-day already running (/tmp/eod.lock present); aborting."; exit 0
+fi
+```
+
+Remove `/tmp/eod.lock` (`rmdir /tmp/eod.lock`) as the final action of the run,
+including on any failure path that ends the run early.
+
+### Run-date under catch-up
+
+A Desktop task missed because the Mac was asleep fires a single catch-up within
+7 days. The cached `date +%Y-%m-%d` therefore reflects the **actual run day**,
+not the missed day. All source steps are "since last run", so nothing is lost;
+the daily-note section and report are labeled with the run day. This is expected
+behavior, not an error.
+
+### Per-step deltas (unattended)
+
+- **Step 0 (pre-flight):** unchanged; still HALTS on failure. On halt, send the
+  failure notification and release the lock before exiting.
+- **Step 2 (FES support -> Confluence):** the background subagent must run
+  **draft/hold only** -- do NOT publish a live Confluence page. Instruct it: if
+  the fes-support-learnings skill supports draft pages, publish as DRAFT;
+  otherwise write the would-be page content to
+  `raw/support_learnings/_pending_confluence/<date>.md` and report it as
+  deferred. Live Confluence publish is for interactive runs.
+- **Steps 3, 4 (support / internal -> raw/):** run non-interactively using the
+  exact auto-default convention Step 2 already documents (classification ->
+  `knowledge`, resolution -> `unresolved`, domain -> keyword-map else
+  `general`, duplicate -> `skip`, any other -> the skip/no-action option).
+  Record every auto-default for the report. (These write to local `raw/`, which
+  is reviewable and compiled later, so auto-defaulting is acceptable.)
+- **Step 5 (meeting action items):** run inline, no interactive prompts:
+  1. `python3 <skill-dir>/meeting_action_items.py list` -> candidates with
+     suggested title/due/priority.
+  2. `td task list --project Work --all --json` -> existing open todos.
+  3. Semantic pass: for each candidate that MEANS THE SAME as an existing open
+     todo (reworded duplicate the string layer would miss), mark it `skip`
+     (NON-terminal -- never `dismiss`). Only skip on high confidence; when
+     unsure, let it through as a `todo` (a near-dupe is recoverable; a dropped
+     commitment is not). Log each skip with the matched todo title.
+  4. Build the decisions JSON: surviving candidates -> `todo` with the script's
+     suggested due/priority; semantic dupes -> `skip`.
+  5. `python3 <skill-dir>/meeting_action_items.py apply --input <file>`. The
+     script independently dedups each `todo` against the live Work project and
+     returns `duplicate` (non-terminal) for any it catches -- this is the
+     deterministic backstop beneath the semantic pass.
+  Report created vs `skip` (semantic dupe) vs `duplicate` (script backstop);
+  never silently drop. (`<skill-dir>` is the meeting-action-items skill dir
+  announced when that skill loads.)
+- **Step 6 (project-log gate):** run the audit (detection) ONLY. Do NOT
+  auto-write `log.md` entries. Record each gap in the report and add it to the
+  Step 9 daily-note Follow-ups for the next interactive session.
+- **Step 7 (compile):** run non-interactively. (If the compile sub-skill exposes
+  any prompt, take its default.)
+- **Step 9 (daily-note synthesis):** auto-approve and write the drafted section.
+  The upsert and `grep -c '<!-- eod:begin'` post-write check are unchanged. If
+  the check returns `0` or `>1`, do NOT proceed silently: record a failure
+  marker and include it in the notification.
+- **Step 10 (report):** after writing the `wiki/_log.md` entry, send the
+  end-of-run notification (below), then release the lock.
+
+### Observability (unattended)
+
+- **End-of-run notification.** Send a `PushNotification` with a one-line status:
+  `end-of-day <date>: ok` / `end-of-day <date>: degraded (<N> step failures)` /
+  `end-of-day <date>: halted (pre-flight)`. Include the deduped/deferred counts
+  and any step failures in the body.
+- **Permission self-check.** If any tool call in the run was blocked or timed
+  out waiting on a permission decision (the symptom of the Desktop
+  `bypassPermissions` mode having silently reverted), treat the run as
+  `degraded` and say so in the notification -- this is how a reverted permission
+  mode gets surfaced instead of discovered later.
+
+### Success checklist (what "ran cleanly" means)
+
+A clean unattended run satisfies all of: pre-flight passed; Slack steps 2/3/4
+reached and produced output or an honest nothing-to-do; Confluence stayed
+draft/deferred; Step 5 reported created vs skip vs duplicate with no silent
+drop; the daily-note section was written and the post-write check returned
+exactly 1; the notification status is `ok`; and `wiki/_log.md` has the run entry
+for the resolved date.
 
 ## Pipeline Overview
 
@@ -299,6 +407,9 @@ Args: (none)
 ```
 
 **Must run interactively in the foreground session.** Invoke via the `Skill` tool in the main conversation — do NOT dispatch via `Agent` (background or foreground) and do NOT instruct it to "run non-interactively" like Step 2. The skill drives a per-item prompt loop that requires the user at the keyboard: `[t]` make todo / `[d]` dismiss / `[s]` skip / `[q]` quit, plus a bulk-triage shortcut. A subagent has no way to surface those prompts to the user, so dispatching it that way would either hang, auto-default every item, or silently dismiss work that should have become a todo.
+
+In `--unattended` mode this step does NOT run interactively -- see Unattended
+Mode > Per-step deltas > Step 5 for the inline auto-todo + dedup flow.
 
 Track for the run: number of items reviewed, number of new todos created, number dismissed, number skipped.
 
