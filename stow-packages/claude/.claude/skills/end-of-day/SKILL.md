@@ -528,7 +528,7 @@ Never construct the path manually. Do NOT write to `raw/daily/<date>.md`: that d
 **Default section template (append to existing daily note):**
 
 ```markdown
-## End of Day — <YYYY-MM-DD>
+## End of Day - <YYYY-MM-DD>
 
 <!-- eod:begin generated=<ISO-8601 UTC timestamp> -->
 
