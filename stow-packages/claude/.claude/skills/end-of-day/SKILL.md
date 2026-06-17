@@ -69,6 +69,9 @@ Step 7: Compile                       Ingest raw/ into wiki/ + validate + discov
 Step 8: Verify-Status                 Run /verify-status read-only snapshot — feeds the
                                       synthesis step with live JIRA / PR / git state
 
+Step 8.5: Work-board drift report     Run /work-board --dry-run --stale-days 7 — surface pending
+                                      moves, manual overrides, orphans, stale + sectionless cards
+
 Step 9: Daily-Note Synthesis          Draft today's EOD section into the daily note:
                                       accomplishments, decisions, follow-ups, tomorrow,
                                       blockers. On Fridays, add weekly retrospective +
@@ -370,6 +373,15 @@ Record status:
 
 - `ok` — snapshot captured
 - `failed` — verify-status itself errored; continue to Step 9 with reduced input (synthesis falls back to captured signal only)
+
+### Step 8.5: Work-board drift report (dry-run)
+
+Run the `work-board` skill with `--dry-run --stale-days 7`. Do not execute moves. Surface in the EOD
+summary: pending moves the morning sync will make, manual overrides (cards Ian parked
+deliberately), orphans needing a decision, stale manual cards (`stale` actions: cards in
+Next Up / In Progress with no Todoist activity in 7 days - ask whether each is still real),
+and any sectionless cards in the Work project
+(`td task list --project "Work" --json` entries with null sectionId) as filing candidates.
 
 ### Step 9: Daily-Note Synthesis
 

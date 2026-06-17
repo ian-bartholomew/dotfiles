@@ -5,8 +5,9 @@
         protocol = https
 [user]
 	name = Ian Bartholomew
-	email = ian@assured.claims
-	signingkey = 850CF6442BA8BF89
+	email = ian.bartholomew@betfanatics.com
+;	signingkey = 387AAFDDD84741AC
+  signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKWX9s/d4lN6z0w85HvUFSLesri72mA99ua/etjOx2Cc ian.bartholomew@FBG-K919PM6F64
 [credential]
         helper = osxkeychain
 [alias]
@@ -46,6 +47,9 @@
 [commit]
 	gpgsign = true
 
+[tag]
+  gpgSign = true
+
 [init]
 	templateDir = /Users/ibartholomew/.git-template
 	defaultBranch = main
@@ -81,4 +85,14 @@
 [http]
 	sslVerify = false
 [gpg]
-	program = gpg
+  ; program = gpg
+  format = ssh 
+[gpg "ssh"]
+  program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
+	allowedSignersFile = /Users/ian.bartholomew/.config/git/allowed_signers
+[credential "https://github.com"]
+	helper = 
+	helper = !/opt/homebrew/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/opt/homebrew/bin/gh auth git-credential

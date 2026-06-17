@@ -1,7 +1,7 @@
 ---
 name: what-next
 description: This skill should be used when the user asks "what next", "what-next", "what should I work on", "what's next", or otherwise wants a recommendation for the next piece of work to pick up. Synthesizes across active projects, project logs, the wiki log, and today's daily note to surface a single recommended task plus a triage view of overdue work, open follow-ups, and stale projects.
-version: 0.1.0
+version: 0.2.0
 allowed-tools:
   [
     Bash,
@@ -39,18 +39,84 @@ The skill is one-shot and non-interactive: read, reason, print, done.
 ## Pipeline
 
 ```
-  Read (parallel)         →   LLM synthesizes recommendation   →   Print to terminal
-  - today's daily note        - single pick + reasoning            (no file writes)
-  - projects index +          - themed sections grouped
-    each active project's       by urgency
-    README.md and log.md
-  - wiki/_log.md tail
+  /verify-status   →   Read (parallel)         →   LLM synthesizes        →   Print to terminal
+  (always first)       - today's daily note        recommendation             (no file writes)
+                       - projects index +          - single pick + reasoning
+                         each active project's     - themed sections grouped
+                         README.md and log.md      by urgency
+                       - wiki/_log.md tail
 ```
 
 ## Prerequisites
 
 - `/start-of-day` should ideally have been run today so the daily note is populated. If it hasn't, the skill notes that and continues with the other two sources.
 - `obsidian` CLI available for resolving the daily note path. If absent, fall back to constructing the path from `date`.
+
+## Step 0: Run `/verify-status` FIRST (MANDATORY, ALWAYS)
+
+**The first action of this skill — every single run, no exceptions — is to invoke the `verify-status` skill before doing anything else.** This produces the verified live snapshot of repo state, in-progress / blocked JIRA, and open PRs (mine + needing review) that every downstream step in `/what-next` depends on. Skipping it means recommending work off stale data, which the user's CLAUDE.md explicitly forbids.
+
+Invoke it via the Skill tool with `skill: "verify-status"` as the very first tool call of this skill's execution. Wait for it to complete. Feed its output into the synthesis steps below — treat it as the authoritative live snapshot, overriding anything in the daily note or local git state that disagrees.
+
+If `/verify-status` halts or errors, **do not proceed** with a recommendation. Surface the failure to the user and stop. Do not fall back to unverified sources.
+
+Only after `/verify-status` returns cleanly do you continue to the pre-flight checks and the rest of the pipeline below.
+
+## Pre-Flight Verification (MANDATORY)
+
+Run these four checks **before printing any recommendation or naming any specific ticket / PR**. The user's CLAUDE.md explicitly forbids relying on stale README files, daily notes, or local git state — this block enforces that. **Fail loudly and halt if any check cannot execute.** Do not emit a recommendation built on unverified data.
+
+### 1. Sync local git state (when in a repo)
+
+If `git rev-parse --is-inside-work-tree` succeeds, sync the default branch and surface staleness:
+
+```bash
+git fetch origin --quiet \
+  || { echo "FATAL: git fetch origin failed — cannot verify branch state. Halting."; exit 1; }
+DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+BEHIND="$(git rev-list --count "$DEFAULT_BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
+[ "$BEHIND" -gt 0 ] && echo "NOTE: local $DEFAULT_BRANCH is $BEHIND commits behind origin/$DEFAULT_BRANCH — surface in Quick context."
+```
+
+If cwd is **not** inside a git repo, that is expected (`/what-next` often runs from a notes-only directory). Skip with a `git checks skipped — not in a repo` line in the Quick context section. This is the only "not applicable" branch — every other check below is unconditional.
+
+### 2. GitHub identity must be `ian-at-fes`
+
+```bash
+gh auth status 2>&1 | grep -q "Active account: true" \
+  && gh auth status 2>&1 | grep -q "ian-at-fes" \
+  || { echo "FATAL: gh CLI is not authed as ian-at-fes. Run 'gh auth switch -u ian-at-fes'. Halting."; exit 1; }
+```
+
+### 3. Live JIRA status for every referenced ticket
+
+For every JIRA key cited anywhere in the printed output — top pick, runner-up, or any triage bullet — call `mcp__plugin_fbg-core_atlassian__getJiraIssue` and use the **live** status. The daily-note JIRA section is a snapshot and may be hours stale; do not name a ticket without re-querying its current status.
+
+If the MCP call fails for a ticket you plan to name, halt with:
+
+```
+FATAL: JIRA MCP unavailable — cannot verify <KEY>. Halting.
+```
+
+Do not fall back to the daily-note snapshot. Failure here is loud.
+
+### 4. Live PR merge state for every referenced PR
+
+For every PR cited in the output:
+
+```bash
+gh pr view <N> --repo <owner>/<repo> \
+  --json state,isDraft,author,reviewDecision,latestReviews,mergeable,mergeStateStatus,statusCheckRollup,updatedAt,headRefName
+```
+
+If the call fails for a PR you intend to name, halt with:
+
+```
+FATAL: gh pr view failed for PR #N (<owner>/<repo>) — cannot verify merge state. Halting.
+```
+
+The detailed interpretation of these responses — drop-and-replace logic, `latestReviews` semantics, ready-to-close detection, approval handling — lives in **Step 5**. This pre-flight block establishes the contract that the calls **must happen and must succeed**; Step 5 covers how to act on the results.
 
 ## Process Flow
 
@@ -87,6 +153,7 @@ Issue these Read tool uses in a single assistant message so they execute concurr
    This catches tickets added or re-assigned throughout the day that won't be in today's daily note. Capture each result's key, status, summary, priority, and updated timestamp. This list — not the daily note — is the source of truth for "what JIRA work is on my plate right now."
 3. **Projects index** — `~/Documents/Work/projects/_projects-index.md`. Enumerate the **Active** section.
 4. **Wiki log tail** — `~/Documents/Work/wiki/_log.md`. Read the last ~80 lines. Look for recent compile entries with unresolved follow-ups, `Step failures`, or themes that keep recurring.
+5. **Work kanban board** — `td task list --project "Work" --json --all`, bucketed by section (`td section list "Work"` for the id->name map). Columns: Backlog | Next Up | In Progress | In Review | Waiting on Others | Blocked. This is the user's own prioritization signal; the work-board sync keeps JIRA-linked cards honest, manual cards reflect deliberate intent.
 
 ### Step 3: For each active project, read its state
 
@@ -96,6 +163,13 @@ Issue Read calls for both files of each active project in parallel:
 - `~/Documents/Work/projects/<name>/log.md` — focus on the top ~80 lines (newest entries are first). Look for unfinished sub-tasks, "follow-up", "TODO", "blocked on", "awaiting", or in-progress markers.
 
 ### Step 4: Synthesize
+
+**Board-derived signals (from source 5):**
+
+- **In Progress cards are claimed active work.** A manual In Progress card with no matching evidence in any log or the daily note is drift — surface it ("board says X is in progress; no trace of it this week — still real?") rather than silently recommending around it.
+- **Next Up is the user's own queue.** When picking among otherwise-equal candidates, prefer ones with a Next Up card — the user already chose them.
+- **Waiting on Others / Blocked cards are NOT candidates.** Never recommend them as the next pick; at most mention what they're waiting on.
+- Bare `stale` findings from the work-board dry-run (if recent end-of-day output is available) are triage items, not picks.
 
 Apply these heuristics in narrative form. **No numeric scoring** — read between the lines.
 
@@ -108,18 +182,20 @@ Apply these heuristics in narrative form. **No numeric scoring** — read betwee
 When picking the top recommendation:
 
 - Prefer items that show up in **two or more** of the buckets above.
-- If "Ready to close" candidates exist and nothing is strictly overdue or actively blocked, lead with one of them. Phrasing: "Close FANDEVX-2920 — PR #2227 merged on 2026-05-17 and the ticket is still In Progress. 30-second admin win, then move on to …"
+- If "Ready to close" candidates exist and nothing is strictly overdue or actively blocked, lead with one of them. Phrasing: `Close FANDEVX-2920 https://fanatics.atlassian.net/browse/FANDEVX-2920 — PR #2227 https://github.com/fanatics-gaming/<repo>/pull/2227 merged on 2026-05-17 and the ticket is still In Progress. 30-second admin win, then move on to …`
 
 ### Step 5: Verify live status before recommending
 
-Before printing, verify the live status of any JIRA ticket or GitHub PR you plan to name in the recommendation. The daily note can be hours stale; recommending work on a ticket that has moved to Done or a PR that has merged or been closed wastes the user's time.
+**MANDATORY — never suggest a JIRA ticket or PR without first verifying its current status.** The daily note and JQL results can be minutes-to-hours stale; recommending work on a ticket that has moved to Done, been re-assigned, or a PR that has merged/closed wastes the user's time and erodes trust in the skill's output. No exceptions: if a JIRA key or PR appears anywhere in the printed recommendation (top pick, runner-up, or any triage bullet that names a specific ticket/PR as actionable), it must be verified live in this step first.
 
-**Only verify the candidates named in the output** — the top pick plus any runner-up mentioned in the lead paragraph. Typically 1–3 verification calls. The triage sections below the recommendation can quote the daily note's snapshot without re-verifying. Issue all verification calls in parallel (single assistant message, multiple tool uses).
+Verify the live status of every JIRA ticket and GitHub PR you plan to name in the output — the top pick, any runner-up in the lead paragraph, and any specific ticket/PR cited in the triage sections as a suggested next action. Typically 1–5 verification calls. Pure count rows in Quick context (e.g. "Open PRs: 4") don't require per-item verification. Issue all verification calls in parallel (single assistant message, multiple tool uses).
+
+If verification reveals the item is closed/merged/re-assigned, drop it from the recommendation and pick the next candidate — then verify that one too. Do not print an unverified candidate as a fallback.
 
 **JIRA ticket verification** — if the candidate references a key like `FANDEVX-1234`, `FESFEAT-5678`, or any `[A-Z]+-\d+` pattern:
 
 - Call `mcp__plugin_fbg-core_atlassian__getJiraIssue` with the key.
-- If status is **Done / Closed / Cancelled / Won't Do**, drop and pick the next candidate. Mention what changed ("FANDEVX-2920 is actually Done as of this morning — moving on to …").
+- If status is **Done / Closed / Cancelled / Won't Do**, drop and pick the next candidate. Mention what changed (`FANDEVX-2920 https://fanatics.atlassian.net/browse/FANDEVX-2920 is actually Done as of this morning — moving on to …`).
 - If **re-assigned to someone else**, drop and pick the next candidate.
 - If genuinely still open (In Progress / In Review / To Do), include the **live** status in the reasoning.
 - **Ready-to-close cross-check** — call `mcp__plugin_fbg-core_atlassian__getJiraIssueRemoteIssueLinks` to list the ticket's linked PRs. For each linked PR URL, run `gh pr view` (per the GitHub PR verification block below) to get its `state`. If the ticket is still open but **every** linked PR is `MERGED` (and there is at least one), flag this candidate as **ready to close** and lead the recommendation with "Close <KEY> — work shipped". If `getJiraIssueRemoteIssueLinks` returns no PR links, fall back to scanning the ticket description / comments returned by `getJiraIssue` for `github.com/.../pull/\d+` URLs.
@@ -130,16 +206,20 @@ Before printing, verify the live status of any JIRA ticket or GitHub PR you plan
 
   ```bash
   gh pr view <number> --repo <owner>/<repo> \
-    --json state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,updatedAt,headRefName
+    --json state,isDraft,author,reviewDecision,reviews,latestReviews,mergeable,mergeStateStatus,statusCheckRollup,updatedAt,headRefName
   ```
 
-- If `state` is **MERGED** or **CLOSED**, drop and pick the next candidate. Mention what changed ("PR #2227 already merged — the recommendation is now the follow-up on …").
+- If `state` is **MERGED** or **CLOSED**, drop and pick the next candidate. Mention what changed (`PR #2227 https://github.com/<owner>/<repo>/pull/2227 already merged — the recommendation is now the follow-up on …`).
 - If `isDraft` is true, keep it as a candidate only if the action is "finish the draft"; otherwise prefer a non-draft PR or another candidate.
-- If `reviewDecision` is **APPROVED** and `mergeable` is **MERGEABLE** with all checks green (`statusCheckRollup` all SUCCESS) → the recommendation should be "merge this PR" not "keep working on it."
-- If `reviewDecision` is **CHANGES_REQUESTED**, the recommendation should be "address review feedback on PR #N."
-- If `statusCheckRollup` shows FAILURE / PENDING for blocking checks, surface that in the reasoning ("CI failing on PR #N — fix that before moving on").
+- **Approval check — always inspect reviews before suggesting action on a PR.** Look at `latestReviews` (one entry per reviewer, most recent state) to determine:
+  - **The user (`ian-at-fes`) has already approved it.** If the PR is authored by someone else and `ian-at-fes` appears in `latestReviews` with state `APPROVED`, do not suggest "review this PR" — the user's review obligation is done. Either drop the PR from the recommendation or, if it's still the strongest candidate, reframe as a passive nudge (`PR #N <url> — you already approved; waiting on other reviewers / merge by author`).
+  - **Someone else has already approved it.** If `latestReviews` contains any `APPROVED` state from another user, surface that in the reasoning (`PR #N <url> — already approved by <login>, …`) so the user knows the review work isn't theirs to repeat. For a PR authored by the user, this often promotes the recommendation to "merge it" (see below). For a PR authored by someone else, this often means the user can drop it from their queue.
+  - **Nobody has approved yet and `ian-at-fes` is a requested reviewer.** This is a genuine "review this PR" candidate.
+- If `reviewDecision` is **APPROVED** and `mergeable` is **MERGEABLE** with all checks green (`statusCheckRollup` all SUCCESS) → the recommendation should be `merge PR #N <url>` not "keep working on it." (Only applies when the PR is authored by the user — otherwise the author merges.)
+- If `reviewDecision` is **CHANGES_REQUESTED**, the recommendation should be `address review feedback on PR #N <url>` (only if the user is the author).
+- If `statusCheckRollup` shows FAILURE / PENDING for blocking checks, surface that in the reasoning (`CI failing on PR #N <url> — fix that before moving on`).
 
-If the MCP/gh call fails (network, auth, transient), continue with the daily-note snapshot but add a one-line caveat in the Quick context section ("JIRA/PR status check failed — recommendation based on daily-note snapshot only.").
+If the MCP/gh call fails for a candidate you intend to name, **halt loudly** per the Pre-Flight Verification block at the top of the skill — do not fall back to the daily-note snapshot for the recommendation. This is a deliberate change from earlier versions: silent fallback was found to surface tickets that had already moved to Done or PRs that had already merged, eroding trust in the output. Fail loud, fix the upstream issue (re-auth, retry the MCP), then re-run the skill.
 
 If the recommendation is **not** a JIRA ticket or PR (e.g. "finish the team-proposal.md draft", "compile the open follow-ups from yesterday's wiki log"), skip this step entirely.
 
@@ -155,7 +235,7 @@ Output goes to the terminal only — no file writes. Use this format:
 ---
 
 ### Ready to close — work shipped, ticket still open
-- **[KEY](url)** — <title> · PR <#N> merged <date> · suggest transition to Done
+- **KEY** <jira-url> — <title> · PR #N <pr-url> merged <date> · suggest transition to Done
 
 ### Overdue / Due Soon
 - **<Project>** — due <date> · <one-line state>
@@ -171,7 +251,16 @@ Output goes to the terminal only — no file writes. Use this format:
 - Active projects: <count>
 - Open PRs in daily note: <count>
 - In-progress JIRA tickets: <count>
+- Board: <n> Next Up · <n> In Progress · <n> Waiting/Blocked
 ```
+
+**Linking rule — every JIRA key and PR reference in the output must be followed by its full URL as plain text.** Output renders in a terminal, so do NOT use markdown link syntax (`[text](url)`) — most terminals don't render it, and the brackets/parens become visual noise. Print the bare URL after the identifier; modern terminals will auto-detect it as clickable.
+
+This applies everywhere JIRA keys and PRs appear: the recommendation paragraph, the runner-up mention, and every triage section bullet.
+
+- **JIRA tickets:** `FANDEVX-1234 https://fanatics.atlassian.net/browse/FANDEVX-1234`. Use the same URL pattern for any project key (FANDEVX, FESFEAT, etc.).
+- **GitHub PRs:** `PR #2227 https://github.com/<owner>/<repo>/pull/2227`. Prefer the URL captured from the daily note's `· PRs: [#N](url)` hints or from `gh pr view` in Step 5; never invent a repo. If the repo cannot be determined for a PR cited in the daily note, fall back to the raw URL from the daily note as-is.
+- Bare `FANDEVX-1234` or `#2227` mentions without an accompanying URL are not allowed in the printed output.
 
 **Omit any section that has no items** — don't print empty headers. If there's nothing urgent at all, say so plainly ("Nothing overdue, no open follow-ups surfaced. Suggested pick is the project with the most open success-criteria items: …").
 
@@ -186,6 +275,7 @@ Never write to disk. Never modify the daily note. Live calls allowed: `searchJir
 
 ## Related Skills
 
+- `/verify-status` — **always invoked first** (see Step 0). Produces the verified live snapshot of repos, JIRA, and PRs that everything else here depends on.
 - `/start-of-day` — populates today's daily note (open PRs, JIRA, Todoist). Run this first if it hasn't been today.
 - `/daily-standup` — formal standup prep with blocker prompts.
 - `/end-of-day` — closes out the day and flushes to the wiki log.
