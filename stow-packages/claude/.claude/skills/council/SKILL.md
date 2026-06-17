@@ -7,7 +7,7 @@ description: |
   helps. Triggers on "ask the council", "council", "convene the council", "get a
   second opinion from the council", or "/council". For a multi-round debate to
   consensus, use /consensus instead.
-version: 1.0.0
+version: 1.1.0
 argument-hint: "<question>"
 allowed-tools: [Bash, Read, Write, AskUserQuestion]
 ---
@@ -41,10 +41,30 @@ Pick a temp path (`PROMPT_FILE=$(mktemp /tmp/council-prompt.XXXXXX)`), then use 
 break if the question contains a line that matches the terminator, and Write avoids all
 shell-quoting hazards with arbitrary user text.
 
-The prompt is the user's question followed by:
+The prompt is the user's question followed by framing chosen by task type:
 
-> Answer independently and concisely. State your reasoning and your bottom-line
-> recommendation. If you are uncertain, say so.
+**Open brainstorming / research:** "Answer independently and concisely. State your
+reasoning and your bottom-line recommendation. If you are uncertain, say so."
+
+**Review / critique / evaluation / any correctness question:** append the **findings
+contract** — this is what stops confident-wrong answers:
+
+> Be adversarial: assume the work is flawed and hunt for real failure modes. But one
+> verified finding beats five plausible ones. For each finding give:
+>
+> - **claim** — one sentence.
+> - **evidence** — the exact file:line or quoted text it rests on.
+> - **basis** — one of `ran-it` / `traced-it` / `pattern-match` / `guess`.
+> - **falsifier** — the single concrete check that would prove this wrong; if the claim is
+>   about runtime/behavior, give the exact command to run it.
+> - **confidence** — low/medium/high. **Cap at medium** for any `pattern-match` or `guess`
+>   basis; reserve high only for what you traced through the actual code or ran yourself.
+>   A confident claim you did not verify is the exact failure we are eliminating.
+>
+> Before submitting your strongest claim, try to refute it yourself; if it survives, note
+> what attack it survived. Adopt the review lens that best fits you (e.g. runtime
+> correctness, portability/edge cases, or security/architecture) and name it, so the
+> council covers different angles rather than the same one three times.
 
 If the task is about code in the current repo, say so in the prompt so members read the
 relevant files.
@@ -76,12 +96,29 @@ low-confidence — a council of one has no cross-model signal. If all failed (sc
 
 ### 5. Chairman synthesis
 
-As chairman, write a synthesis that covers:
+**Verify before you adopt.** For any load-bearing finding — anything that would change a
+decision, a fix, or a ship/no-ship call — confirm it yourself before treating it as true.
+You run under the normal permission system and can check things the members cannot:
 
-- **Consensus** — what the members agree on.
+- Read the exact cited file:line and confirm the claim matches the actual code, not a
+  remembered anti-pattern.
+- For a runtime/behavioral claim, run the member's `falsifier` command (or a minimal
+  experiment of your own) and observe the result.
+- Tag each load-bearing finding **verified** / **refuted** / **unverified** (couldn't
+  check — present as a member claim, never as fact).
+
+A member's stated confidence is not evidence. This session both councils were confidently
+wrong on bash claims that a ten-second microtest refuted; running that check is now your
+job, not theirs.
+
+Then write the synthesis:
+
+- **Consensus** — what the members agree on (note where agreement is unverified — models
+  can agree on the same wrong thing).
 - **Disagreements** — where they split, and the substance of each side's reasoning.
-- **Verdict** — your own bottom line. Where the members split, pick and justify. Where
-  they are all wrong or all miss something, say so. You are not a vote-counter.
+- **Verdict** — your own bottom line, each load-bearing point tagged with its verification
+  status. Where you refuted a member, say so and why — that is signal. You are not a
+  vote-counter.
 
 Keep it tight. Attribute claims to the member that made them.
 
