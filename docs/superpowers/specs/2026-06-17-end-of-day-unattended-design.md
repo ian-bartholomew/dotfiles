@@ -234,13 +234,15 @@ Reordered so EOD is never left non-functional:
 5. **Prove it scheduled:** let the Desktop task fire on its own and confirm a
    clean run via the checklist + notification. Require **2 consecutive clean
    scheduled runs**.
-6. **Only then** `launchctl bootout` + delete `com.ian.eod.plist`.
+6. **Only then** `launchctl bootout` + delete `com.ian.eod.plist`, AND
+   `com.ian.sod.plist` + `com.ian.standup.plist` (decided: remove all three).
 
-**sod/standup:** KEEP their LaunchAgents. Removing them now leaves their
-Desktop equivalents stalling on their own un-converted in-skill prompts. They
-come off LaunchAgent only after they receive the same `--unattended` treatment
-(separate follow-up). *(This reverses the earlier "remove all three" decision —
-flagged for explicit user confirmation at spec review.)*
+**sod/standup (decided: remove all three now).** Their LaunchAgents are removed
+in this change alongside EOD's. Accepted risk, explicitly: start-of-day and
+daily-standup have NOT received `--unattended` treatment, so their Desktop
+scheduled equivalents may stall on their own in-skill prompts until converted.
+Tracked follow-up: give start-of-day and daily-standup the same `--unattended`
+conversion. Until then, run them manually if a scheduled run stalls.
 
 **Rollback:** if the Desktop task proves unreliable after step 6, restore the
 EOD plist from backup (`launchctl bootstrap`) to return to the always-on runner.
@@ -266,8 +268,8 @@ Local machine setup (not PRs):
 1. `~/.claude/settings.json` — allow backstop + deny-list audit (direct edit;
    not stowed).
 2. `~/.claude/scheduled-tasks/end-of-day/SKILL.md` — `/end-of-day --unattended`.
-3. Remove `com.ian.eod` LaunchAgent (backup + unload + delete) — **only after**
-   2 clean scheduled runs.
+3. Remove `com.ian.eod`, `com.ian.sod`, `com.ian.standup` LaunchAgents (backup +
+   unload + delete) — EOD's **only after** 2 clean scheduled runs.
 4. Desktop UI permission mode → `bypassPermissions` (user manual step).
 
 **Cross-cutting DoD + ordering:** dedup PR merged → skill PR merged → settings
@@ -288,7 +290,8 @@ not "done" until the last item.
 ## Out of scope (with honest notes)
 
 - start-of-day / daily-standup `--unattended` treatment (follow-up; their
-  LaunchAgents stay until then).
+  LaunchAgents are removed in this change, so until the follow-up lands their
+  scheduled runs may stall — run manually if so).
 - Connector → local `.mcp.json` migration (sized above; deferred follow-up).
 - Auto-writing project `log.md` entries unsupervised.
 
