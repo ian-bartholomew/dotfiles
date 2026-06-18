@@ -1,7 +1,7 @@
 ---
 name: council
 description: |
-  Convene a council of other LLM CLIs (codex, gemini, claude-sonnet) to answer a
+  Convene a council of other LLM CLIs (codex, antigravity, claude-sonnet) to answer a
   question in parallel, then synthesize their answers as chairman. Use for
   brainstorming, research, planning, and review where a cross-model second opinion
   helps. Triggers on "ask the council", "council", "convene the council", "get a
@@ -16,7 +16,7 @@ allowed-tools: [Bash, Read, Write, AskUserQuestion]
 
 Fan a question out to three member LLM CLIs running in parallel and read-only, then
 act as **chairman** (Opus 4.8): read all answers and synthesize one verdict. Members
-are codex (OpenAI), gemini (Google), and claude pinned to `claude-sonnet-4-6`. Opus
+are codex (OpenAI), antigravity (`agy`, Google), and claude pinned to `claude-sonnet-4-6`. Opus
 chairs only — it does not submit a member answer.
 
 The members run from the current working directory in read-only mode, so for review
@@ -79,13 +79,13 @@ bash ~/.claude/skills/council/scripts/council-round.sh \
 
 The script prints a manifest (one line per member: `member<TAB>ok|failed|failed(timeout)<TAB>path`)
 and runs all three in parallel with a per-member timeout. It exits 0 if at least one
-member answered, 1 if all failed. Models are pinned (sonnet = `claude-sonnet-4-6`,
-gemini = `gemini-2.5-flash`, codex = CLI default); override with
-`COUNCIL_CODEX_MODEL` / `COUNCIL_GEMINI_MODEL` / `COUNCIL_SONNET_MODEL`.
+member answered, 1 if all failed. Models: sonnet = `claude-sonnet-4-6`; codex and
+antigravity (`agy`) use their CLI defaults. Override with `COUNCIL_CODEX_MODEL` /
+`COUNCIL_ANTIGRAVITY_MODEL` / `COUNCIL_SONNET_MODEL`.
 
 ### 4. Read the answers
 
-Read each `ok` member's `.out` file (codex.out / gemini.out / sonnet.out). If a member
+Read each `ok` member's `.out` file (codex.out / antigravity.out / sonnet.out). If a member
 `failed` or `failed(timeout)`, read the tail of its `.log` file (the manifest gives the
 path), note the actual reason (timeout, model 404, auth, crash) in the synthesis, and
 continue with the survivors — never block on one member.

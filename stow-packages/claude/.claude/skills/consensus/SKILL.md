@@ -45,7 +45,7 @@ debate over secrets, and transcript dirs are auto-gitignored when inside a repo.
 ### 1. Parse args
 
 `--with <a>,<b>` (optional) chooses the two seats; the rest of the argument is the topic.
-Seat names: `claude` (alias `sonnet`) -> the sonnet member, `codex`, `gemini`. Default
+Seat names: `claude` (alias `sonnet`) -> the sonnet member, `codex`, `antigravity`. Default
 seats are `claude,codex`. The two seats must differ. If the topic is empty, ask the user
 for it. Map seats to council member names and pick a display label for each:
 
@@ -53,7 +53,7 @@ for it. Map seats to council member names and pick a display label for each:
 | --------------- | ----------- | ---------------------- |
 | claude / sonnet | sonnet      | Claude (Sonnet 4.6)    |
 | codex           | codex       | Codex                  |
-| gemini          | gemini      | Gemini                 |
+| antigravity     | antigravity | Antigravity (agy)      |
 
 Call the two seats **A** and **B** in turn order (A speaks first).
 
