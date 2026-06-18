@@ -1,13 +1,15 @@
 ---
 name: start-of-day
 description: This skill should be used when the user asks to "start of day", "SOD", "run start of day", "kick off the day", "start of day routine", or runs "/start-of-day".
-version: 0.28.0
+version: 0.29.0
+argument-hint: "[--unattended]"
 allowed-tools:
   [
     Bash,
     mcp__plugin_fbg-core_atlassian__searchJiraIssuesUsingJql,
     mcp__plugin_fbg-core_atlassian__getJiraIssue,
     Skill,
+    PushNotification,
   ]
 ---
 
@@ -41,6 +43,153 @@ The skill is one-shot and non-interactive: fetch, write, confirm path, then hand
 - Want to edit one task: `td task update <ref>` directly
 - Only want open PRs or JIRA tickets: `gh search prs --author=ian-at-fes --state=open` or the Atlassian MCP search directly
 
+## Unattended Mode
+
+<!-- keep-in-sync-with: end-of-day "Unattended Mode" (lock, run-date, observability, permission self-check are intentionally parallel) -->
+
+When invoked as `/start-of-day --unattended` (the scheduled Desktop task uses
+this), the pipeline runs with no human present. Manual `/start-of-day` is
+unchanged. Both modes share every step body; they differ ONLY at the points
+listed here. If the `--unattended` token is absent, ignore this entire section.
+
+### Global rules (unattended)
+
+- **No interactive prompts of any kind.** Never call `AskUserQuestion`. Every
+  place the flow (or an invoked sub-skill) would ask, take the documented
+  auto-default and continue.
+- **Best-effort.** A mid-run sub-skill or step failure is logged to the report
+  and the run continues `degraded`. The exceptions are the Step 0 hard gates
+  (Atlassian, `gh` auth, open-PR query) and the Step 4 post-write integrity
+  check, which still HALT.
+- **No silent halt.** Every existing halt path in the skill (Step 0 gate;
+  `obsidian daily` failure at Step 1; render.py nonzero at Step 3; marker-count
+  != 1 at Step 4) must, before exiting, send the end-of-run notification, write
+  the `wiki/_log.md` entry, AND release the lock.
+- **End every run** with a `PushNotification` and a durable `wiki/_log.md` entry
+  (Observability, below).
+
+### Concurrency lock (first action, unattended)
+
+Before Step 0, acquire an exclusive lock so a catch-up run and a manual run
+cannot double-write the shared `/tmp/sod-*.json` caches and the daily note:
+
+```bash
+# clear an orphaned lock older than 6h (a prior run that died without cleanup),
+# then acquire atomically:
+if [ -d /tmp/sod.lock ] && find /tmp/sod.lock -maxdepth 0 -mmin +360 | grep -q .; then
+  rmdir /tmp/sod.lock 2>/dev/null
+fi
+if ! mkdir /tmp/sod.lock 2>/dev/null; then
+  echo "start-of-day already running (/tmp/sod.lock present); aborting."; exit 0
+fi
+echo "$$ $(date -u +%FT%TZ)" > /tmp/sod.lock/owner   # liveness / debug record
+```
+
+Release: remove the owner file then `rmdir /tmp/sod.lock` as the FINAL action on
+every exit path — clean completion, Step 0 gate halt, Step 1 obsidian halt,
+Step 3 render halt, Step 4 marker-count halt, and any standup/work-board failure
+that ends the run.
+
+There is no shell-level `finally` across the multi-tool run. If the agent or
+host is killed mid-run the lock persists; the 6h staleness sweep above is the
+only recovery. **Cascade:** a stuck lock blocks every subsequent scheduled run
+(and the same-day catch-up) until the 6h window elapses. Known cause, known fix:
+`rmdir /tmp/sod.lock` (see Kill-switch).
+
+SOD and EOD use independent locks (`/tmp/sod.lock` vs `/tmp/eod.lock`) and write
+disjoint marker blocks. To avoid a concurrent `Write` clobbering the other's
+block, the Step 4 upsert re-reads the note immediately before writing.
+
+### Run-date under catch-up
+
+A Desktop task missed because the Mac was asleep fires a single catch-up. The
+cached `date +%Y-%m-%d` reflects the **actual run day**. All sources are
+point-in-time snapshots, so nothing is lost; the daily-note section, the
+notification, and the `wiki/_log.md` entry are labeled with the run day. This is
+expected, not an error.
+
+### Per-step deltas (unattended)
+
+- **Step 0 (pre-flight), split gate:**
+  - **Hard gates (still HALT):** Atlassian MCP probe (#3), `gh auth` (#2), and
+    the **open-PR** `gh search prs` query (#4). SOD's core output (JIRA + PR
+    sections) cannot be produced without these. The **merged-PR** query stays
+    best-effort (on failure the "🟢 Potential to close" flag just does not
+    fire) — a merged-query failure degrades, it does not halt. On a hard-gate
+    halt: send the failure notification, write the `wiki/_log.md` halted entry,
+    release the lock, exit.
+  - **Soft gates (degrade, do NOT halt):** Slack MCP (#5) and Zoom MCP (#6)
+    probes. These are needed only by the chained `/daily-standup` (Step 6), not
+    by SOD's own snapshot. On probe failure: record the gap, SKIP Step 6, and
+    mark the run `degraded` with an explicit `standup skipped: <reason>` note in
+    BOTH the notification and the `wiki/_log.md` entry — never imply a partial
+    or successful standup. Continue writing the PR/JIRA/Todoist snapshot.
+  - The `lookup failed` graceful-degrade path for `td`/`obsidian` is unchanged.
+- **Step 1 (`obsidian daily`):** on failure, do NOT use the interactive
+  terminal-fallback (no human to read it). Record a degradation, send the
+  notification + `wiki/_log.md` entry, release the lock, and stop — no daily-note
+  write is possible without the path.
+- **Step 2.5 (work-board, live):** invoke work-board live AND state it is an
+  unattended invocation, so work-board's own step-2 rule takes the
+  best-guess-and-log path instead of `AskUserQuestion`. Invocation line: "Run
+  work-board live, unattended — do not prompt; for any unsure new-card priority
+  use the best guess (or `p3` if no signal) and log each `(ticket -> p?)`."
+  Include the sync summary in the notification.
+- **Step 2.6 (EOD heartbeat):** runs unchanged (already a non-interactive bash
+  check). Carry its warning string, if present, into the notification and the
+  `wiki/_log.md` entry.
+- **Step 3 (render.py):** render degrades a malformed or missing source file to
+  a `_… lookup failed: <error>._` line and still exits 0 — it does NOT halt on
+  bad source JSON. Only a genuine nonzero exit (bad CLI args, unexpected crash)
+  is a halt, and unattended that halt = notify + `wiki/_log.md` entry + release
+  lock, not a silent stderr dump. Separately, if the rendered output contains
+  any `lookup failed:` sentinel, mark the run `degraded` and name the affected
+  source in the notification.
+- **Step 4 (daily-note upsert):** auto-write the rendered section. Re-read the
+  note immediately before writing (see lock rules). The
+  `grep -c '<!-- sod:begin'` post-write check is unchanged and still halts on
+  `0`/`>1` — but unattended halt = notify + log + release lock.
+- **Step 5 (confirmation):** the terminal line still prints but is not
+  load-bearing unattended; the durable record is the `wiki/_log.md` entry.
+- **Step 6 (daily-standup):** invoked as the final step ONLY if the Slack/Zoom
+  soft gates passed. No flag passed; `/daily-standup` is already non-interactive
+  (it infers blockers, never prompts). A standup failure is logged + folded into
+  the notification; it does not undo the already-written `## Start of Day`
+  section.
+
+### Observability (unattended)
+
+- **Durable run record.** Append a `wiki/_log.md` entry
+  (`## [<date>] start-of-day`) every run, mirroring EOD. This is the durable
+  record (a `PushNotification` may silently fail in headless mode) and the
+  future heartbeat hook so a missed SOD run is itself detectable.
+- **End-of-run notification.** Send a `PushNotification` with a one-line status:
+  `start-of-day <date>: ok` / `start-of-day <date>: degraded (<N> failures)` /
+  `start-of-day <date>: halted (<gate>)`. Body carries PR/JIRA/Todoist counts,
+  the work-board sync summary, the EOD-heartbeat warning if present, the
+  `standup skipped` note if a soft gate failed, and any step failures.
+- **Permission self-check (best-effort).** If any tool call returns blocked or
+  times out waiting on a permission decision (symptom of the Desktop auth mode
+  having reverted), mark the run `degraded` and say so. Limitation: a fully
+  wedged run may never reach the notification code; the absence of the
+  `wiki/_log.md` entry is then the backstop signal.
+
+### Kill-switch / rollback
+
+To disable the routine: revert the wrapper
+(`~/.claude/scheduled-tasks/start-of-day/SKILL.md`) body to
+`Run the /start-of-day skill`, or delete the scheduled task. To clear a stuck
+lock after a killed run: `rmdir /tmp/sod.lock`.
+
+### Success checklist (what "ran cleanly" means)
+
+Hard gates passed; soft gates passed or standup cleanly skipped; all four
+sources fetched or rendered an honest `lookup failed`; the daily-note section
+written and the post-write check returned exactly 1; work-board synced with no
+prompt; standup appended its section (or was skipped on a soft-gate miss); a
+`wiki/_log.md` entry written; the notification status is `ok` (or `degraded`
+with the reason named).
+
 ## Pipeline
 
 ```
@@ -73,6 +222,7 @@ The MCP probes (#3, #5, #6 below) are non-negotiable: the snapshot section itsel
 The skill's per-source `lookup failed: <error>` fallback (see Error Handling) applies **only** to `td` and `obsidian`. It does **NOT** generalize to Atlassian, Slack, or Zoom. Those three are pre-flight gates, not graceful-degrade sources. The line is:
 
 - **Gate (halt on failure):** Atlassian MCP, Slack MCP, Zoom MCP, `gh` CLI, `gh search prs` queries.
+  **Exception (unattended only):** under `--unattended`, Slack (#5) and Zoom (#6) are SOFT gates — a probe failure skips the standup chain and marks the run `degraded` rather than halting. See Unattended Mode > Step 0 split gate. Atlassian and `gh`/open-PR stay hard gates in both modes.
 - **Graceful-degrade (render `lookup failed`, continue):** Todoist (`td`), Obsidian write failure (one-time terminal fallback).
 
 If you find yourself reasoning "the skill degrades gracefully elsewhere, so I can let this MCP failure through too" — stop. That reasoning is wrong. The gate exists precisely because downstream consumers (`/what-next`, `/daily-standup`) cannot recover from a poisoned snapshot or a missing standup section the way they can recover from a missing Todoist line.
@@ -286,7 +436,7 @@ The script uses Python 3 stdlib only — no `pip install`, no extra setup. It wo
 
 The captured stdout is opaque to the model — do **not** edit it before Step 4. The byte stream from `python3 render.py …` is exactly what goes into the daily note.
 
-If the script exits non-zero, halt and surface the stderr to the user — that signals a malformed JSON file from Step 2.
+If the script exits non-zero, halt and surface the stderr to the user — that signals bad arguments or an unexpected crash. A malformed or missing source JSON file does NOT exit non-zero: the script renders a `_… lookup failed: <error>._` line for that source and exits 0.
 
 Test fixtures live at `~/.claude/skills/start-of-day/test-fixtures/`. To verify the script standalone:
 
@@ -358,7 +508,7 @@ If `/daily-standup` fails (Slack MCP down, JIRA timeout, etc.), the already-writ
 Failures that **do not** halt:
 
 - **`td` failure:** render the Todoist section as `` _Today + Overdue — `td` unavailable: <error>._ `` and continue. Todoist is a lower-stakes signal — a missing section doesn't poison the rest of the day's downstream synthesis.
-- **`obsidian daily` failure** (most common cause: Obsidian not running): print the error and tell the user `Obsidian doesn't appear to be running — open the app, then re-run /start-of-day. Falling back to terminal output for this run.` Emit the rendered markdown to the terminal as a one-time fallback.
+- **`obsidian daily` failure** (most common cause: Obsidian not running): print the error and tell the user `Obsidian doesn't appear to be running — open the app, then re-run /start-of-day. Falling back to terminal output for this run.` Emit the rendered markdown to the terminal as a one-time fallback. (**Unattended: do NOT use this terminal fallback** — there is no human to read it; send the notification, write the `wiki/_log.md` entry, release the lock, and stop. See Unattended Mode > Step 1.)
 - **Post-write marker count != 1:** print a diagnostic with `$DAILY_NOTE_PATH` and halt — ask the user to inspect the daily note manually before re-running. This is a structural integrity check on the write itself, not a pre-flight check.
 
 ## Related Skills
