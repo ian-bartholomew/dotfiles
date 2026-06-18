@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run one council round: fan a prompt out to codex, gemini, and claude-sonnet in
-# parallel (read-only), collect each member's answer, and print a manifest.
+# Run one council round: fan a prompt out to codex, antigravity (agy), and claude-sonnet
+# in parallel (read-only), collect each member's answer, and print a manifest.
 #
 # All judgment (synthesis, convergence) is the chairman's job, done by the calling
 # skill. This script is deliberately dumb and deterministic.
@@ -17,9 +17,13 @@ set -uo pipefail
 # codex has no stable public model id we pin here; it falls through to the codex CLI
 # default unless COUNCIL_CODEX_MODEL is set.
 CODEX_MODEL="${COUNCIL_CODEX_MODEL:-}"
-# ponytail: this account's gemini default 404s; pin a known-good model. Override with
-# COUNCIL_GEMINI_MODEL=gemini-2.5-pro if the account supports it.
-GEMINI_MODEL="${COUNCIL_GEMINI_MODEL:-gemini-2.5-flash}"
+# Antigravity (agy) is the third seat, replacing the gemini CLI (which was rate-limited
+# and frequently dropped on this account). Let agy use its own default model; override
+# via COUNCIL_ANTIGRAVITY_MODEL.
+ANTIGRAVITY_MODEL="${COUNCIL_ANTIGRAVITY_MODEL:-}"
+# On token/quota exhaustion, the antigravity seat retries once on this model (a separate
+# quota pool). Override via COUNCIL_ANTIGRAVITY_FALLBACK; empty disables the fallback.
+ANTIGRAVITY_FALLBACK="${COUNCIL_ANTIGRAVITY_FALLBACK:-GPT-OSS 120B (Medium)}"
 SONNET_MODEL="${COUNCIL_SONNET_MODEL:-claude-sonnet-4-6}"
 TIMEOUT="${COUNCIL_TIMEOUT:-180}"
 
@@ -30,7 +34,7 @@ esac
 
 prompt_file=""
 out_dir=""
-members_csv="codex,gemini,sonnet"
+members_csv="codex,antigravity,sonnet"
 while [ $# -gt 0 ]; do
   case "$1" in
     --prompt-file) prompt_file="$2"; shift 2 ;;
@@ -41,7 +45,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$prompt_file" ] || [ -z "$out_dir" ]; then
-  echo "usage: council-round.sh --prompt-file <path> --out-dir <dir> [--members codex,gemini,sonnet]" >&2
+  echo "usage: council-round.sh --prompt-file <path> --out-dir <dir> [--members codex,antigravity,sonnet]" >&2
   exit 1
 fi
 
@@ -49,12 +53,12 @@ fi
 # single model per turn while reusing all the member-invocation logic below.
 IFS=',' read -ra MEMBERS <<< "$members_csv"
 [ "${#MEMBERS[@]}" -gt 0 ] || { echo "--members is empty" >&2; exit 1; }
-member_bin() { case "$1" in codex) echo codex ;; gemini) echo gemini ;; sonnet) echo claude ;; *) echo "" ;; esac; }
+member_bin() { case "$1" in codex) echo codex ;; antigravity) echo agy ;; sonnet) echo claude ;; *) echo "" ;; esac; }
 
 missing=""
 for m in "${MEMBERS[@]}"; do
   bin="$(member_bin "$m")"
-  [ -n "$bin" ] || { echo "unknown member: '$m' (valid: codex, gemini, sonnet)" >&2; exit 1; }
+  [ -n "$bin" ] || { echo "unknown member: '$m' (valid: codex, antigravity, sonnet)" >&2; exit 1; }
   command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
 done
 [ -z "$missing" ] || { echo "missing required CLI(s):$missing" >&2; exit 1; }
@@ -126,12 +130,25 @@ run_codex() {
   echo "$?" >"$out_dir/codex.exit"
 }
 
-run_gemini() {
-  local out="$out_dir/gemini.out"
-  local args=(-p "$PROMPT" --approval-mode plan -o text)
-  [ -n "$GEMINI_MODEL" ] && args+=(-m "$GEMINI_MODEL")
-  run_with_timeout "$TIMEOUT" gemini "${args[@]}" >"$out" 2>"$out_dir/gemini.log" </dev/null
-  echo "$?" >"$out_dir/gemini.exit"
+run_antigravity() {
+  local out="$out_dir/antigravity.out" log="$out_dir/antigravity.log"
+  # agy -p prints the answer to stdout; --sandbox restricts terminal use. No
+  # --dangerously-skip-permissions: a council member answers, it does not act.
+  local args=(-p "$PROMPT" --sandbox)
+  [ -n "$ANTIGRAVITY_MODEL" ] && args+=(--model "$ANTIGRAVITY_MODEL")
+  run_with_timeout "$TIMEOUT" agy "${args[@]}" >"$out" 2>"$log" </dev/null
+  local rc=$?
+  # Token/quota fallback: if the primary model is out of capacity, retry once on the
+  # gpt-oss model (separate quota). Gated on an exhaustion signature so timeouts/crashes
+  # (which the fallback can't fix) don't burn a second call.
+  # ponytail: the pattern is a best-effort match for agy's quota error; widen it if a
+  # real exhaustion message slips through. Empty ANTIGRAVITY_FALLBACK disables this.
+  if [ -n "$ANTIGRAVITY_FALLBACK" ] && { [ "$rc" -ne 0 ] || [ ! -s "$out" ]; } && \
+     grep -qiE 'exhaust|quota|capacity|resource.?exhausted|rate.?limit|429|too many requests|out of (tokens|capacity)' "$log" 2>/dev/null; then
+    run_with_timeout "$TIMEOUT" agy -p "$PROMPT" --sandbox --model "$ANTIGRAVITY_FALLBACK" >"$out" 2>>"$log" </dev/null
+    rc=$?
+  fi
+  echo "$rc" >"$out_dir/antigravity.exit"
 }
 
 run_sonnet() {
@@ -143,9 +160,9 @@ run_sonnet() {
 
 for m in "${MEMBERS[@]}"; do
   case "$m" in
-    codex)  run_codex & ;;
-    gemini) run_gemini & ;;
-    sonnet) run_sonnet & ;;
+    codex)       run_codex & ;;
+    antigravity) run_antigravity & ;;
+    sonnet)      run_sonnet & ;;
   esac
 done
 wait

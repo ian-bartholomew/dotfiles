@@ -8,7 +8,7 @@ description: |
   synthesis. Triggers on "consensus", "have two models discuss/debate/review", "get a
   dialog between", "/consensus". For an independent parallel roundtable of three models,
   use /council instead.
-version: 2.0.0
+version: 2.1.0
 argument-hint: "[--with <a>,<b>] <topic>"
 allowed-tools: [Bash, Read, Write, AskUserQuestion]
 ---
@@ -45,7 +45,7 @@ debate over secrets, and transcript dirs are auto-gitignored when inside a repo.
 ### 1. Parse args
 
 `--with <a>,<b>` (optional) chooses the two seats; the rest of the argument is the topic.
-Seat names: `claude` (alias `sonnet`) -> the sonnet member, `codex`, `gemini`. Default
+Seat names: `claude` (alias `sonnet`) -> the sonnet member, `codex`, `antigravity`. Default
 seats are `claude,codex`. The two seats must differ. If the topic is empty, ask the user
 for it. Map seats to council member names and pick a display label for each:
 
@@ -53,7 +53,7 @@ for it. Map seats to council member names and pick a display label for each:
 | --------------- | ----------- | ---------------------- |
 | claude / sonnet | sonnet      | Claude (Sonnet 4.6)    |
 | codex           | codex       | Codex                  |
-| gemini          | gemini      | Gemini                 |
+| antigravity     | antigravity | Antigravity (agy)      |
 
 Call the two seats **A** and **B** in turn order (A speaks first).
 
@@ -85,14 +85,20 @@ must carry the context itself. Every prompt has the same shape:
 3. **The role instruction:**
    - **Turn 1 (A, opener):** "You are <label A>. Give your initial position on this topic,
      with reasoning and a clear bottom line."
-   - **Every later turn (the seat about to speak):** "You are <label>. Respond to <other
-     label>'s latest points: concede what is correct, push back where you disagree with
-     reasons. Do not repeat settled points."
-4. **The output contract** (every turn): "Keep your answer under 400 words. End with three
-   labeled sections: `Concessions:`, `Disagreements:`, `Current bottom line:`." The cap
-   bounds transcript growth (without it you hit the script's ~500 KB / context limits long
-   before the round cap) and the contract makes convergence detection parseable, not
-   vibes-based.
+   - **Every later turn (the seat about to speak):** "You are <label>. First **steelman**
+     <other label>'s strongest point in one line, then respond: concede what is correct,
+     and push back where you disagree with reasons. Do not repeat settled points, and do
+     not concede just to converge — only concede to a better argument." The steelman step
+     stops the two models from agreeing socially instead of on the merits.
+4. **The output contract** (every turn): "Keep your answer under 400 words. End with these
+   labeled sections: `Concessions:`, `Disagreements:`, `Current bottom line:`. For every
+   factual or behavioral claim you rely on, mark its **basis** inline — `[ran-it]`,
+   `[traced-it]`, `[pattern-match]`, or `[guess]` — and if it is a runtime claim, give the
+   exact command that would verify it. Do not state a claim as certain when its basis is
+   pattern-match or guess." The cap bounds transcript growth (without it you hit the
+   script's ~500 KB / context limits before the round cap); the labels make convergence
+   detection parseable; the basis tags let the moderator catch confident-but-unverified
+   claims.
 
 **Recap for long dialogs.** Once the running transcript is large, feed the **last two
 turns verbatim** plus a moderator recap of everything earlier (instead of the full
@@ -131,12 +137,32 @@ After B's round-2 turn, and after each later round, decide:
 
 Tell the user briefly after each round which of these you chose and why.
 
+**Agreement is not truth.** Two models can converge on the same wrong claim, especially a
+shared `[pattern-match]`. When the thing they agreed on is load-bearing, verify it (next
+step) before you call it converged — do not let social convergence end the dialog on a
+falsehood.
+
 ### 4. Closing synthesis (moderator)
 
-Write a neutral closing read: the topic, where each seat landed, the points they agreed
-on, the disagreements left standing (and why), and **your own moderator read** — the
-strongest argument on each unresolved point, a recommended action, and anything both seats
-missed. Analyze the arguments; do not crown a winner.
+**Verify before you adopt.** For any load-bearing conclusion — agreed or contested — that
+would change a decision or a fix, confirm it yourself before presenting it as true. You run
+under the normal permission system and can check what the seats cannot:
+
+- Read the exact cited code/text; confirm the claim matches reality, not a remembered
+  anti-pattern.
+- For a runtime/behavioral claim, run the seat's verification command (the one attached to
+  its basis tag) or a minimal experiment of your own, and observe the result.
+- Tag each load-bearing conclusion **verified** / **refuted** / **unverified**.
+
+A seat's confidence — or both seats agreeing — is not evidence. This session a two-model
+exchange confidently endorsed a bash fix that did nothing in the real structure; a
+ten-second test caught it. That check is your job.
+
+Then write a neutral closing read: the topic, where each seat landed, the points they
+agreed on, the disagreements left standing (and why), each load-bearing point tagged with
+its verification status, and **your own moderator read** — the strongest argument on each
+unresolved point, a recommended action, and anything both seats missed. Analyze the
+arguments; do not crown a winner.
 
 ### 5. Save the transcript
 

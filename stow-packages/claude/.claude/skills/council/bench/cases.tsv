@@ -1,0 +1,9 @@
+# file	expected	reason_regex (for BUG cases; matched against member reason, case-insensitive)
+b1_subshell_counter.sh	BUG	subshell|pipe|pipeline
+b2_local_exitcode_mask.sh	BUG	local|exit|masks?|\$\?
+b3_unquoted_test.sh	BUG	quot|word.?split|unquoted|empty|spaces
+b4_cd_unchecked.sh	BUG	cd|fails?|unchecked|wrong dir
+b5_missing_dollar.sh	BUG	missing|\$|expansion|literal|variable
+c1_procsub_counter.sh	CLEAN	-
+c2_quoted_test.sh	CLEAN	-
+c3_safe_cd.sh	CLEAN	-

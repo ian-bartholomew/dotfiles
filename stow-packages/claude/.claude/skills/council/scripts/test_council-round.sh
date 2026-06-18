@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Self-check for council-round.sh: stub the three member CLIs on PATH (gemini fails)
+# Self-check for council-round.sh: stub the three member CLIs on PATH (antigravity fails)
 # and assert fan-out, degradation, and manifest behavior. No framework.
 set -uo pipefail
 
@@ -21,9 +21,9 @@ done
 exit 0
 EOF
 
-cat >"$WORK/bin/gemini" <<'EOF'
+cat >"$WORK/bin/agy" <<'EOF'
 #!/usr/bin/env bash
-echo "gemini boom" >&2
+echo "agy boom" >&2
 exit 1
 EOF
 
@@ -46,10 +46,10 @@ fail() { echo "FAIL: $1"; echo "--- manifest ---"; echo "$manifest"; exit 1; }
 # at least one member ok -> exit 0
 [ "$rc" = "0" ] || fail "expected exit 0 (2 members ok), got $rc"
 
-# codex + sonnet ok, gemini failed
+# codex + sonnet ok, antigravity failed
 echo "$manifest" | grep -q $'codex\tok' || fail "codex should be ok"
 echo "$manifest" | grep -q $'sonnet\tok' || fail "sonnet should be ok"
-echo "$manifest" | grep -q $'gemini\tfailed' || fail "gemini should be failed"
+echo "$manifest" | grep -q $'antigravity\tfailed' || fail "antigravity should be failed"
 
 # answers actually captured
 grep -q "optimistic locking" "$WORK/out/codex.out" || fail "codex answer not captured"
@@ -61,7 +61,7 @@ echo "PASS: fan-out, degradation, and capture all work"
 # Each stub forks a child that ticks a per-member marker file, then hangs. On timeout the
 # watchdog must reap the child (pkill -P) so the marker stops growing.
 mkdir -p "$WORK/slowbin"
-for c in codex gemini claude; do
+for c in codex agy claude; do
   cat >"$WORK/slowbin/$c" <<EOF
 #!/usr/bin/env bash
 ( while :; do echo tick >>"$WORK/${c}.tick"; sleep 0.2; done ) &
@@ -117,3 +117,35 @@ PATH="$WORK/bin:$PATH" bash "$HERE/council-round.sh" \
   && { echo "FAIL: unknown member should be rejected"; exit 1; }
 
 echo "PASS: --members runs a single model and rejects unknown members"
+
+# --- antigravity token-exhaustion fallback: primary OOM -> retry on the gpt-oss model ---
+mkdir -p "$WORK/aybin"
+cat >"$WORK/aybin/agy" <<'EOF'
+#!/usr/bin/env bash
+# Fallback model present -> answer; otherwise simulate quota/token exhaustion.
+if printf '%s\n' "$@" | grep -q 'GPT-OSS'; then
+  echo "answer from gpt-oss fallback"; exit 0
+fi
+echo "Error: you have exhausted your capacity on this model" >&2
+exit 1
+EOF
+chmod +x "$WORK/aybin/agy"
+
+fb_manifest="$(PATH="$WORK/aybin:$PATH" COUNCIL_TIMEOUT=10 \
+  bash "$HERE/council-round.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/out7" --members antigravity)"
+[ $? = 0 ] || { echo "FAIL: fallback should make the round succeed"; echo "$fb_manifest"; exit 1; }
+echo "$fb_manifest" | grep -q $'antigravity\tok' || { echo "FAIL: antigravity should be ok via fallback"; echo "$fb_manifest"; exit 1; }
+grep -q "gpt-oss fallback" "$WORK/out7/antigravity.out" || { echo "FAIL: fallback answer not captured"; exit 1; }
+echo "PASS: antigravity falls back to gpt-oss on token exhaustion"
+
+# a non-quota failure must NOT trigger the fallback (the gpt-oss retry can't fix a crash)
+cat >"$WORK/aybin/agy" <<'EOF'
+#!/usr/bin/env bash
+echo "panic: runtime error, nil pointer" >&2
+exit 1
+EOF
+chmod +x "$WORK/aybin/agy"
+nofb_manifest="$(PATH="$WORK/aybin:$PATH" COUNCIL_TIMEOUT=10 \
+  bash "$HERE/council-round.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/out8" --members antigravity)"
+echo "$nofb_manifest" | grep -q $'antigravity\tfailed' || { echo "FAIL: non-quota failure should stay failed (no fallback)"; echo "$nofb_manifest"; exit 1; }
+echo "PASS: non-quota failures do not trigger the gpt-oss fallback"
