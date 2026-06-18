@@ -51,8 +51,11 @@ JIRA Medium is usually the untouched default - treat it as no signal and
 infer from summary, due date, and what you know of current project state
 instead. If the signals conflict or there is nothing to go on, ask via
 AskUserQuestion (batch all unsure tickets into one call, options p1-p4 with
-your best guess recommended first). In `--dry-run` mode never ask - use the
-best guess and note it in the report.
+your best guess recommended first). In `--dry-run` mode, OR when the caller
+invokes work-board unattended (it will say so), never ask - use the best guess
+and note it in the report. Unattended differs from `--dry-run` only here: the
+sync still runs live (no `--dry-run` flag on the script); only the prompt is
+suppressed.
 
 Priority is applied on create only; the script never changes priority on
 existing cards, so manual priority edits are always preserved.

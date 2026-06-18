@@ -21,3 +21,4 @@ zsh/config.symlink/configstore/*
 # tracked stow package contents so this repo can manage them.
 !stow-packages/claude/.claude/
 !stow-packages/claude/.claude/**
+.claude/council/
