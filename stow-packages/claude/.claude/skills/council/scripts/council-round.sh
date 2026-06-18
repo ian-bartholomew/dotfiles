@@ -21,6 +21,9 @@ CODEX_MODEL="${COUNCIL_CODEX_MODEL:-}"
 # and frequently dropped on this account). Let agy use its own default model; override
 # via COUNCIL_ANTIGRAVITY_MODEL.
 ANTIGRAVITY_MODEL="${COUNCIL_ANTIGRAVITY_MODEL:-}"
+# On token/quota exhaustion, the antigravity seat retries once on this model (a separate
+# quota pool). Override via COUNCIL_ANTIGRAVITY_FALLBACK; empty disables the fallback.
+ANTIGRAVITY_FALLBACK="${COUNCIL_ANTIGRAVITY_FALLBACK:-GPT-OSS 120B (Medium)}"
 SONNET_MODEL="${COUNCIL_SONNET_MODEL:-claude-sonnet-4-6}"
 TIMEOUT="${COUNCIL_TIMEOUT:-180}"
 
@@ -128,13 +131,24 @@ run_codex() {
 }
 
 run_antigravity() {
-  local out="$out_dir/antigravity.out"
+  local out="$out_dir/antigravity.out" log="$out_dir/antigravity.log"
   # agy -p prints the answer to stdout; --sandbox restricts terminal use. No
   # --dangerously-skip-permissions: a council member answers, it does not act.
   local args=(-p "$PROMPT" --sandbox)
   [ -n "$ANTIGRAVITY_MODEL" ] && args+=(--model "$ANTIGRAVITY_MODEL")
-  run_with_timeout "$TIMEOUT" agy "${args[@]}" >"$out" 2>"$out_dir/antigravity.log" </dev/null
-  echo "$?" >"$out_dir/antigravity.exit"
+  run_with_timeout "$TIMEOUT" agy "${args[@]}" >"$out" 2>"$log" </dev/null
+  local rc=$?
+  # Token/quota fallback: if the primary model is out of capacity, retry once on the
+  # gpt-oss model (separate quota). Gated on an exhaustion signature so timeouts/crashes
+  # (which the fallback can't fix) don't burn a second call.
+  # ponytail: the pattern is a best-effort match for agy's quota error; widen it if a
+  # real exhaustion message slips through. Empty ANTIGRAVITY_FALLBACK disables this.
+  if [ -n "$ANTIGRAVITY_FALLBACK" ] && { [ "$rc" -ne 0 ] || [ ! -s "$out" ]; } && \
+     grep -qiE 'exhaust|quota|capacity|resource.?exhausted|rate.?limit|429|too many requests|out of (tokens|capacity)' "$log" 2>/dev/null; then
+    run_with_timeout "$TIMEOUT" agy -p "$PROMPT" --sandbox --model "$ANTIGRAVITY_FALLBACK" >"$out" 2>>"$log" </dev/null
+    rc=$?
+  fi
+  echo "$rc" >"$out_dir/antigravity.exit"
 }
 
 run_sonnet() {

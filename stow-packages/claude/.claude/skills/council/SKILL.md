@@ -81,7 +81,9 @@ The script prints a manifest (one line per member: `member<TAB>ok|failed|failed(
 and runs all three in parallel with a per-member timeout. It exits 0 if at least one
 member answered, 1 if all failed. Models: sonnet = `claude-sonnet-4-6`; codex and
 antigravity (`agy`) use their CLI defaults. Override with `COUNCIL_CODEX_MODEL` /
-`COUNCIL_ANTIGRAVITY_MODEL` / `COUNCIL_SONNET_MODEL`.
+`COUNCIL_ANTIGRAVITY_MODEL` / `COUNCIL_SONNET_MODEL`. If antigravity's primary model
+hits a token/quota limit, it retries once on `GPT-OSS 120B (Medium)`
+(`COUNCIL_ANTIGRAVITY_FALLBACK`; empty disables).
 
 ### 4. Read the answers
 
