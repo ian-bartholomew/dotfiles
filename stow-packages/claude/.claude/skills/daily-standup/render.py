@@ -6,6 +6,12 @@ JIRA, Todoist, Slack, Obsidian daily note), normalizes everything into the
 three-bucket contract below, writes it to a JSON file, and invokes this
 script. The model never composes the standup markdown by hand.
 
+Within each bucket, bullets are grouped under bold theme sub-headers
+(Tickets, Meetings, Project work, ...) derived from each bullet's `source`
+via SOURCE_TO_THEME. A bucket that resolves to a single theme renders flat
+(no sub-header). The JSON contract is unchanged — theming is purely a render
+concern.
+
 JSON contract (read from --input or stdin):
 
   {
@@ -53,12 +59,36 @@ SOURCE_LABEL = {
     "input": "input",
 }
 
-# Render-order priority for each bucket. Bullets within a bucket are stably
-# grouped by source so the section reads JIRA-first, then project context,
-# then external signals, then inferred items.
-DID_ORDER     = ["jira", "project", "log", "meeting", "slack", "inferred"]
-WILLDO_ORDER  = ["jira", "todoist", "daily-note", "inferred"]
-BLOCKER_ORDER = ["jira", "daily-note", "input", "inferred"]
+# Theme grouping. Each bullet's `source` maps to a theme; bullets within a
+# bucket render under bold theme sub-headers in THEME_ORDER. `inferred` and
+# `daily-note` are provenance, not kind-of-thing, so they land in catch-all
+# themes (Follow-ups / Notes).
+SOURCE_TO_THEME = {
+    "jira": "tickets",
+    "meeting": "meetings",
+    "project": "project",
+    "log": "project",
+    "slack": "comms",
+    "todoist": "todos",
+    "daily-note": "notes",
+    "input": "notes",
+    "inferred": "follow-ups",
+}
+
+THEME_LABEL = {
+    "tickets": "Tickets",
+    "meetings": "Meetings",
+    "project": "Project work",
+    "comms": "Comms",
+    "todos": "Todos",
+    "notes": "Notes",
+    "follow-ups": "Follow-ups",
+    "other": "Other",
+}
+
+# Render order of theme sub-groups within every bucket. A bucket renders only
+# the themes actually present; unknown / missing sources fall through to "other".
+THEME_ORDER = ["tickets", "meetings", "project", "comms", "todos", "notes", "follow-ups", "other"]
 
 
 def render_bullet(b: dict, verbose: bool) -> str:
@@ -87,26 +117,27 @@ def render_bullet(b: dict, verbose: bool) -> str:
     return f"- {head}{anchor}{text}{suffix}".rstrip()
 
 
-def render_bucket(title: str, bullets: list[dict], order: list[str], empty_msg: str, verbose: bool) -> str:
+def render_bucket(title: str, bullets: list[dict], empty_msg: str, verbose: bool) -> str:
     out = [f"### {title}", ""]
     if not bullets:
         out.append(f"_{empty_msg}_")
         return "\n".join(out)
 
-    # Group by source while preserving incoming order inside each group.
-    by_source: dict[str, list[dict]] = {}
+    # Group by derived theme while preserving incoming order inside each group.
+    by_theme: dict[str, list[dict]] = {}
     for b in bullets:
-        by_source.setdefault(b.get("source") or "", []).append(b)
+        theme = SOURCE_TO_THEME.get(b.get("source") or "", "other")
+        by_theme.setdefault(theme, []).append(b)
 
-    seen: set[str] = set()
-    for src in order:
-        for b in by_source.get(src, []):
-            out.append(render_bullet(b, verbose))
-        seen.add(src)
-    # Any bullets with unknown / missing source render last so nothing is dropped.
-    for src, group in by_source.items():
-        if src in seen:
+    # Single-theme bucket renders flat — a lone sub-header is just noise.
+    show_headers = len(by_theme) > 1
+
+    for theme in THEME_ORDER:
+        group = by_theme.get(theme)
+        if not group:
             continue
+        if show_headers:
+            out.append(f"**{THEME_LABEL.get(theme, theme)}**")
         for b in group:
             out.append(render_bullet(b, verbose))
     return "\n".join(out)
@@ -142,7 +173,6 @@ def render(payload: dict, verbose: bool) -> str:
     blocks.append(render_bucket(
         "Yesterday",
         payload.get("did") or [],
-        DID_ORDER,
         "No activity captured for the lookback window.",
         verbose,
     ))
@@ -150,7 +180,6 @@ def render(payload: dict, verbose: bool) -> str:
     blocks.append(render_bucket(
         "Today",
         payload.get("will_do") or [],
-        WILLDO_ORDER,
         "No planned work captured.",
         verbose,
     ))
@@ -158,7 +187,6 @@ def render(payload: dict, verbose: bool) -> str:
     blocks.append(render_bucket(
         "Blockers",
         payload.get("blockers") or [],
-        BLOCKER_ORDER,
         "None.",
         verbose,
     ))

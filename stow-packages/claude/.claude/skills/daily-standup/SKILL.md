@@ -1,7 +1,7 @@
 ---
 name: daily-standup
 description: This skill should be used when the user asks to "daily standup", "standup", "run standup", "make my standup", "generate my standup", or runs "/daily-standup". Synthesizes the classic three-bucket standup (what I did / what I'm going to do / blockers) from the wiki log, project logs, meeting summaries, the Obsidian daily note, JIRA, Todoist (#work), and Slack, then writes it into today's Obsidian daily note. Blockers are inferred from sources — no interactive prompt.
-version: 0.2.0
+version: 0.3.0
 allowed-tools:
   [
     Bash,
@@ -32,6 +32,10 @@ note — the skill never prompts.
 Layout is owned by `render.py` next to this file. The model gathers raw data,
 normalizes it to a JSON contract, and pipes it to `render.py`. The model
 never composes the standup markdown by hand.
+
+Within each bucket, `render.py` groups bullets under bold theme sub-headers
+(Tickets, Meetings, Project work, ...) derived from each bullet's `source` —
+see §Theming. The model only sets `source`; it never assigns themes.
 
 ## When to Use
 
@@ -213,6 +217,24 @@ Bucket assignment rules:
 
 Cap inferred bullets at **3 per bucket** to keep noise down. Mark every
 inferred bullet `source: "inferred"` so the user can prune in Obsidian.
+
+**Theming.** `render.py` sub-groups each bucket under bold theme headers
+derived from `source` — you do not set themes, only `source`. The map:
+
+| source            | theme        |
+|-------------------|--------------|
+| `jira`            | Tickets      |
+| `meeting`         | Meetings     |
+| `project`, `log`  | Project work |
+| `slack`           | Comms        |
+| `todoist`         | Todos        |
+| `daily-note`, `input` | Notes    |
+| `inferred`        | Follow-ups   |
+| anything else     | Other        |
+
+A bucket that resolves to a single theme renders flat (no header). Theme
+order is fixed: Tickets, Meetings, Project work, Comms, Todos, Notes,
+Follow-ups, Other.
 
 **Bullet text must be Slack-brief.** Aim for **≤ 12 words** per `text`.
 Prefer verb-led fragments over full sentences:

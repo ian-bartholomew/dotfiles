@@ -1,7 +1,7 @@
 ---
 name: what-next
 description: This skill should be used when the user asks "what next", "what-next", "what should I work on", "what's next", or otherwise wants a recommendation for the next piece of work to pick up. Synthesizes across active projects, project logs, the wiki log, and today's daily note to surface a single recommended task plus a triage view of overdue work, open follow-ups, and stale projects.
-version: 0.2.0
+version: 0.3.0
 allowed-tools:
   [
     Bash,
@@ -15,7 +15,7 @@ allowed-tools:
 
 # What-Next Skill
 
-Advisory skill that answers the question **"What should I work on next?"** by reading three sources and synthesizing a recommendation in narrative form. Read-only and terminal-only — no file writes, no daily note mutation. Live JIRA status and GitHub PR status are verified for any candidate before it's recommended, to avoid suggesting work that has already been closed, merged, or moved since `/start-of-day` last refreshed the daily note. Cheap to run multiple times a day.
+Advisory skill that answers the question **"What should I work on next?"** by reading three sources and synthesizing a recommendation in narrative form. Read-only and terminal-only — no file writes, no daily note mutation. Live JIRA status and GitHub PR status are verified for any candidate before it's recommended, to avoid suggesting work that has already been closed, merged, or moved since `/start-of-day` last refreshed the daily note. Any disagreement between the cached daily-note snapshot and live state is flagged explicitly in the output rather than silently corrected for. Cheap to run multiple times a day.
 
 ## Purpose
 
@@ -192,6 +192,8 @@ Verify the live status of every JIRA ticket and GitHub PR you plan to name in th
 
 If verification reveals the item is closed/merged/re-assigned, drop it from the recommendation and pick the next candidate — then verify that one too. Do not print an unverified candidate as a fallback.
 
+**Record cached-vs-live discrepancies.** Whenever live state differs from what the cached snapshot showed — the daily-note JIRA/PR section or the Step 2 JQL result — record the difference for the output's discrepancy section (Step 6). A discrepancy is any of: a ticket whose live status differs from the daily-note status, a ticket present in one source but not the other, a PR that has merged/closed since the snapshot, a PR approval state that changed, or a re-assignment. This is in addition to acting on the discrepancy (dropping a stale candidate, etc.) — the point is to make the staleness visible to the user, not just silently correct for it. If the daily note and live state fully agree for every item named, note that too ("daily note matches live state").
+
 **JIRA ticket verification** — if the candidate references a key like `FANDEVX-1234`, `FESFEAT-5678`, or any `[A-Z]+-\d+` pattern:
 
 - Call `mcp__plugin_fbg-core_atlassian__getJiraIssue` with the key.
@@ -246,8 +248,14 @@ Output goes to the terminal only — no file writes. Use this format:
 ### Stale — worth touching
 - **<Project>** — last log entry <date> (<N days ago>)
 
+### Cached vs live discrepancies
+- **KEY** <jira-url> — daily note said <cached status>, live is <live status>
+- **PR #N** <pr-url> — daily note listed as open, live is MERGED <date>
+- **KEY** <jira-url> — re-assigned to <login> since last snapshot
+
 ### Quick context
 - Daily note: <fresh / N days stale / missing>
+- Cached vs live: <N discrepancies / matches live state>
 - Active projects: <count>
 - Open PRs in daily note: <count>
 - In-progress JIRA tickets: <count>
