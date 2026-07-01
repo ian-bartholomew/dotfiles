@@ -1,7 +1,7 @@
 ---
 name: start-of-day
 description: This skill should be used when the user asks to "start of day", "SOD", "run start of day", "kick off the day", "start of day routine", or runs "/start-of-day".
-version: 0.29.0
+version: 0.30.0
 argument-hint: "[--unattended]"
 allowed-tools:
   [
@@ -15,7 +15,7 @@ allowed-tools:
 
 # Start-of-Day Skill
 
-Gather the morning signal — open GitHub PRs, open JIRA tickets assigned to you, and Todoist tasks due today + overdue — and write it as three flat sections into today's Obsidian daily note.
+Gather the morning signal — open GitHub PRs, open JIRA tickets assigned to you, and Todoist #Work tasks due today + overdue — and write it as three flat sections into today's Obsidian daily note.
 
 Layout is owned by a deterministic Python render script (`render.py` next to this file), so the model never composes the markdown by hand. The script:
 
@@ -374,11 +374,13 @@ This call is best-effort: if it fails, write `{"error": "<msg>"}` to `/tmp/sod-m
 
    Write the **merged** map to `/tmp/sod-jira.json` as `{"issues": [...]}` — one entry per ticket (assigned + ancestor), each with `key`, `assignedToMe`, and a `fields` object containing `summary, status, priority, issuetype, updated, parent`. The render script reads this shape and builds the forest itself; no traversal logic in the script.
 
-2. **Bash — Todoist:**
+2. **Bash — Todoist (#Work project only):**
 
    ```bash
-   td today --json
+   td task list --filter "(today | overdue) & #Work" --json
    ```
+
+   Scoped to the #Work project so the daily note shows only work tasks, not personal ones. Output shape matches `td today --json` (`{"results": [...]}`), so `render.py` consumes it unchanged.
 
 After all three fetches return (or fail), persist each result to a temp JSON file for Step 3 to consume:
 
@@ -519,6 +521,6 @@ Failures that **do not** halt:
 
 ## Summary
 
-`/start-of-day` fetches open GitHub PRs, assigned open JIRA tickets, and Todoist due-today + overdue tasks in parallel, then writes three flat bulleted sections into today's Obsidian daily note under a `## Start of Day` heading bracketed by `<!-- sod:begin -->` / `<!-- sod:end -->` markers. The write is idempotent (re-running the same day replaces the section). The skill is one-shot and non-interactive: a single confirmation line prints once the note is written, then the skill invokes `/daily-standup` as its final step to append a `## Daily Standup` section to the same daily note.
+`/start-of-day` fetches open GitHub PRs, assigned open JIRA tickets, and Todoist #Work due-today + overdue tasks in parallel, then writes three flat bulleted sections into today's Obsidian daily note under a `## Start of Day` heading bracketed by `<!-- sod:begin -->` / `<!-- sod:end -->` markers. The write is idempotent (re-running the same day replaces the section). The skill is one-shot and non-interactive: a single confirmation line prints once the note is written, then the skill invokes `/daily-standup` as its final step to append a `## Daily Standup` section to the same daily note.
 
 From v0.19.0 the markdown is emitted by `render.py` (Python 3 stdlib) rather than composed by the model — the model writes the three fetch results to JSON files, invokes the script, and splices the script's stdout into the daily note. JIRA parent traversal, PR↔JIRA cross-linking, Potential-to-close, and emoji prefixes were intentionally left out of this baseline; they will be added to the script in subsequent versions.
