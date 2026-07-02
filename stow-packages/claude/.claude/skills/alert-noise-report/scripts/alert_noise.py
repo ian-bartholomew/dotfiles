@@ -7,12 +7,18 @@ table so trends read down the columns over time. This script only parses Slack
 and computes one week's numbers - no persistent store, the notes are the store.
 
 Subcommands:
-  extract <page-file>...   Slack 'detailed' page dumps -> event TSV (stdout)
-  report  <tsv>            frontmatter metrics block + noise-ranking table (stdout)
+  extract <page-file>...      Slack 'detailed' page dumps -> event TSV (stdout)
+  report  <tsv>               frontmatter metrics block + noise-ranking table (stdout)
+  pending <out-dir> [now]     completed Thu-weeks with no note yet, one per line:
+                              wend  wstart  margin_oldest  window_start  window_end
+                              (epochs; margin = window_start - 24h fetch overlap)
 """
+import os
 import re
 import sys
+import time
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 FLAP_WINDOW_S = 30 * 60
 TRIGGER_STATES = ("Triggered", "Re-Triggered", "No-Data")
@@ -157,13 +163,41 @@ def report(tsv_path):
         print(f"| {monitor} | {env} | {a['trig']} | {a['rec']} | {a['flap']} | {svcs} |")
 
 
+def pending(out_dir, now_epoch):
+    """Completed Thu-weeks (window [Thu 00:00, next Thu 00:00)) that have no note.
+
+    Walks back from the most recently completed week until it hits a week that
+    already has a note (older weeks are assumed present) or a 14-week cap.
+    """
+    now = datetime.fromtimestamp(now_epoch)
+    d = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    while d.weekday() != 3:  # 3 = Thursday; most recent completed week-end
+        d -= timedelta(days=1)
+    rows = []
+    for i in range(14):
+        wend_dt = d - timedelta(days=7 * i)
+        wend = wend_dt.strftime("%Y-%m-%d")
+        if os.path.exists(os.path.join(out_dir, wend + ".md")):
+            break
+        wstart_dt = wend_dt - timedelta(days=7)
+        margin_dt = wstart_dt - timedelta(days=1)
+        rows.append((wend, wstart_dt.strftime("%Y-%m-%d"),
+                     int(margin_dt.timestamp()), int(wstart_dt.timestamp()), int(wend_dt.timestamp())))
+    for r in reversed(rows):  # oldest first
+        print("\t".join(map(str, r)))
+
+
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] not in ("extract", "report"):
-        sys.exit(__doc__)
-    if sys.argv[1] == "extract":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "extract":
         extract(sys.argv[2:])
-    else:
+    elif cmd == "report":
         report(sys.argv[2])
+    elif cmd == "pending":
+        now_epoch = float(sys.argv[3]) if len(sys.argv) > 3 else time.time()
+        pending(sys.argv[2], now_epoch)
+    else:
+        sys.exit(__doc__)
 
 
 if __name__ == "__main__":
