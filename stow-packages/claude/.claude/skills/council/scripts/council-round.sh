@@ -66,7 +66,7 @@ for m in "${MEMBERS[@]}"; do
   command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
 done
 [ -z "$missing" ] || { echo "missing required CLI(s):$missing" >&2; exit 1; }
-command -v pkill >/dev/null 2>&1 || echo "warning: pkill not found; timed-out members may leave orphaned child processes" >&2
+command -v pgrep >/dev/null 2>&1 || echo "warning: pgrep not found; timed-out members may leave orphaned child processes" >&2
 if [ ! -f "$prompt_file" ]; then
   echo "prompt file not found: $prompt_file" >&2
   exit 1

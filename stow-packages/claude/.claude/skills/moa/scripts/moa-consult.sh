@@ -94,7 +94,8 @@ for i in $(seq 1 "$layers"); do
     --members "$members" >"$manifest" 2>"$out_dir/layer$i.log"
   round_rc=$?
 
-  ok_count="$(grep -c $'\tok\t' "$manifest" 2>/dev/null || echo 0)"
+  # grep -c prints "0" and exits 1 on no match, so a `|| echo 0` fallback would double-print.
+  ok_count="$(grep -c $'\tok\t' "$manifest" 2>/dev/null)"; ok_count="${ok_count:-0}"
   layer_summaries+=("layer$i: rc=$round_rc, ok=$ok_count")
 
   if [ "$round_rc" -eq 0 ] && [ "$ok_count" -gt 0 ]; then

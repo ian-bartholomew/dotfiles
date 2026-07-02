@@ -109,6 +109,9 @@ PATH="$WORK/bin4:$PATH" bash "$HERE/moa-consult.sh" \
   --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o4" --layers 2 >/dev/null \
   && fail "all-fail should exit non-zero"
 grep -q "all layers failed" "$WORK/o4/moa-final.md" || fail "moa-final should report total failure"
+# `grep -c` prints "0" AND exits 1 on no match, so a `|| echo 0` fallback double-appends,
+# corrupting the per-layer summary bullet with a stray "0" line.
+grep -qxF '0' "$WORK/o4/moa-final.md" && fail "corrupted ok_count: stray '0' line in summary"
 echo "PASS: total failure exits 1 and is reported"
 
 # --- case 5: bad --layers rejected ---
