@@ -143,4 +143,14 @@ q_el=$((SECONDS - q_start))
 grep -q "codex quick" "$WORK/oq/moa-final.md" || fail "quorum consult missing a fast proposal"
 echo "PASS: default quorum returns without blocking on the slow seat"
 
+# --- case 7 (C6): the real failure cause is surfaced, not hidden in the layer log ---
+# COUNCIL_TIMEOUT=0 makes council-round exit with a specific message; moa must surface it
+# in moa-final.md rather than only reporting a generic "no answers".
+PATH="$WORK/bin:$PATH" COUNCIL_TIMEOUT=0 bash "$HERE/moa-consult.sh" \
+  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o7" >/dev/null 2>&1 \
+  && fail "COUNCIL_TIMEOUT=0 should make the consult fail"
+grep -qi "COUNCIL_TIMEOUT must be" "$WORK/o7/moa-final.md" \
+  || fail "all-failed final should surface council-round's real error, not just 'no answers'"
+echo "PASS: real failure cause is surfaced in moa-final.md"
+
 echo "ALL PASS"

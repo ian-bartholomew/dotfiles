@@ -101,8 +101,11 @@ for i in $(seq 1 "$layers"); do
     last_good_dir="$layer_dir"
     last_good_manifest="$manifest"
   else
-    # Whole layer failed: can't refine further. Keep the last good layer as final.
-    echo "moa: layer $i produced no answers (rc=$round_rc); using layer output up to $((i-1))" >&2
+    # Whole layer failed: can't refine further. Keep the last good layer as final. Surface
+    # the actual cause (missing CLI, bad config, all timed out) that council-round wrote to
+    # the layer log, instead of only a generic "no answers".
+    reason="$(tail -n 3 "$out_dir/layer$i.log" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')"
+    echo "moa: layer $i produced no answers (rc=$round_rc)${reason:+: $reason}; using layer output up to $((i-1))" >&2
     break
   fi
 done
@@ -113,6 +116,13 @@ if [ -z "$last_good_dir" ]; then
     printf '# MoA consult: all layers failed\n\n'
     printf 'No proposer produced an answer. Per-layer status:\n\n'
     printf -- '- %s\n' "${layer_summaries[@]}"
+    printf '\nWhy the layers failed (council-round output):\n\n'
+    for lg in "$out_dir"/layer*.log; do
+      [ -s "$lg" ] || continue
+      printf '### %s\n\n```\n' "$(basename "$lg")"
+      tail -n 10 "$lg"
+      printf '```\n\n'
+    done
   } >"$final"
   echo "$final" # still tell the caller where the (empty) result is
   exit 1
