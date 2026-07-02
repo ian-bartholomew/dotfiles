@@ -18,7 +18,10 @@ COUNCIL_ROUND="${MOA_COUNCIL_ROUND:-$HOME/.claude/skills/council/scripts/council
 
 prompt_file=""
 out_dir=""
-layers=2
+# Default to a single fan-out: layers run serially, so each extra layer ~doubles
+# wall-clock. The aggregator synthesizes fine from one round; opt into 2+ only at a
+# genuinely hard fork.
+layers=1
 members="codex,antigravity,sonnet"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,7 +60,13 @@ proposals_from_manifest() {
   done <"$manifest"
 }
 
-REFINE_INSTRUCTION='Below are candidate responses from other models to the same query. Use the strongest points, correct any errors you find, and produce an improved, self-contained response. Do not merely copy one of them.'
+REFINE_INSTRUCTION='Below are candidate responses from other models to the same query. Use the strongest points, correct any errors you find, and produce an improved, self-contained response. Do not merely copy one of them. Keep it tight: lead with your recommendation and stay under ~250 words, no preamble.'
+
+# Early-return once a quorum of proposers answer, rather than blocking each layer on the
+# slowest CLI. The aggregator synthesizes fine from a quorum and MoA degrades gracefully,
+# so trading the slowest seat for speed is the right default here. Override to wait for all
+# with COUNCIL_QUORUM=0 (or =3).
+export COUNCIL_QUORUM="${COUNCIL_QUORUM:-2}"
 
 last_good_dir=""
 last_good_manifest=""
@@ -85,15 +94,19 @@ for i in $(seq 1 "$layers"); do
     --members "$members" >"$manifest" 2>"$out_dir/layer$i.log"
   round_rc=$?
 
-  ok_count="$(grep -c $'\tok\t' "$manifest" 2>/dev/null || echo 0)"
+  # grep -c prints "0" and exits 1 on no match, so a `|| echo 0` fallback would double-print.
+  ok_count="$(grep -c $'\tok\t' "$manifest" 2>/dev/null)"; ok_count="${ok_count:-0}"
   layer_summaries+=("layer$i: rc=$round_rc, ok=$ok_count")
 
   if [ "$round_rc" -eq 0 ] && [ "$ok_count" -gt 0 ]; then
     last_good_dir="$layer_dir"
     last_good_manifest="$manifest"
   else
-    # Whole layer failed: can't refine further. Keep the last good layer as final.
-    echo "moa: layer $i produced no answers (rc=$round_rc); using layer output up to $((i-1))" >&2
+    # Whole layer failed: can't refine further. Keep the last good layer as final. Surface
+    # the actual cause (missing CLI, bad config, all timed out) that council-round wrote to
+    # the layer log, instead of only a generic "no answers".
+    reason="$(tail -n 3 "$out_dir/layer$i.log" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')"
+    echo "moa: layer $i produced no answers (rc=$round_rc)${reason:+: $reason}; using layer output up to $((i-1))" >&2
     break
   fi
 done
@@ -104,6 +117,13 @@ if [ -z "$last_good_dir" ]; then
     printf '# MoA consult: all layers failed\n\n'
     printf 'No proposer produced an answer. Per-layer status:\n\n'
     printf -- '- %s\n' "${layer_summaries[@]}"
+    printf '\nWhy the layers failed (council-round output):\n\n'
+    for lg in "$out_dir"/layer*.log; do
+      [ -s "$lg" ] || continue
+      printf '### %s\n\n```\n' "$(basename "$lg")"
+      tail -n 10 "$lg"
+      printf '```\n\n'
+    done
   } >"$final"
   echo "$final" # still tell the caller where the (empty) result is
   exit 1

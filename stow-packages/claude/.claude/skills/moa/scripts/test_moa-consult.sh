@@ -52,6 +52,7 @@ grep -q "codex refined" "$WORK/o1/layer2/codex.out"  || fail "layer2 codex shoul
 
 # the refinement prompt must carry the instruction AND layer-1's proposals
 grep -q "candidate responses" "$WORK/o1/layer2.prompt" || fail "layer2 prompt missing refine instruction"
+grep -qi "words"             "$WORK/o1/layer2.prompt" || fail "refine prompt missing conciseness cap (output-size lever)"
 grep -q "codex layer1"        "$WORK/o1/layer2.prompt" || fail "layer2 prompt missing codex layer1 proposal"
 grep -q "sonnet layer1"       "$WORK/o1/layer2.prompt" || fail "layer2 prompt missing sonnet layer1 proposal"
 
@@ -68,6 +69,15 @@ PATH="$WORK/bin:$PATH" bash "$HERE/moa-consult.sh" \
 [ ! -d "$WORK/o2/layer2" ]         || fail "layers=1 should not create layer2"
 grep -q "codex layer1" "$WORK/o2/moa-final.md" || fail "layers=1 moa-final missing codex answer"
 echo "PASS: layers=1 is a single council fan-out"
+
+# --- case 2b: the DEFAULT (no --layers) is a single fan-out ---
+# Serial layers double wall-clock; one fan-out is the fast default and the aggregator
+# synthesizes fine from it. Guards the default against silently regressing back to 2.
+PATH="$WORK/bin:$PATH" bash "$HERE/moa-consult.sh" \
+  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o2b" >/dev/null \
+  || fail "default layers should exit 0"
+[ ! -d "$WORK/o2b/layer2" ] || fail "default should be a single layer (no layer2)"
+echo "PASS: default is a single fan-out (layers=1)"
 
 # --- case 3: a layer that fails after a good one falls back to the last good layer ---
 # codex here fails ONLY on the refinement round; sonnet always fails -> layer2 has no ok.
@@ -99,6 +109,9 @@ PATH="$WORK/bin4:$PATH" bash "$HERE/moa-consult.sh" \
   --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o4" --layers 2 >/dev/null \
   && fail "all-fail should exit non-zero"
 grep -q "all layers failed" "$WORK/o4/moa-final.md" || fail "moa-final should report total failure"
+# `grep -c` prints "0" AND exits 1 on no match, so a `|| echo 0` fallback double-appends,
+# corrupting the per-layer summary bullet with a stray "0" line.
+grep -qxF '0' "$WORK/o4/moa-final.md" && fail "corrupted ok_count: stray '0' line in summary"
 echo "PASS: total failure exits 1 and is reported"
 
 # --- case 5: bad --layers rejected ---
@@ -107,5 +120,40 @@ bash "$HERE/moa-consult.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o5
 bash "$HERE/moa-consult.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o6" --layers abc >/dev/null 2>&1 \
   && fail "--layers abc should be rejected"
 echo "PASS: invalid --layers rejected"
+
+# --- case 6: default quorum makes a layer return without blocking on the slowest seat ---
+# Two fast proposers + one that hangs; moa should not wait out the slow seat's timeout.
+mkdir -p "$WORK/qbin"
+cat >"$WORK/qbin/codex" <<'EOF'
+#!/usr/bin/env bash
+out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+[ -n "$out" ] && echo "codex quick" >"$out"; exit 0
+EOF
+cat >"$WORK/qbin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "sonnet quick"; exit 0
+EOF
+cat >"$WORK/qbin/agy" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$WORK/qbin/"*
+q_start=$SECONDS
+PATH="$WORK/qbin:$PATH" COUNCIL_TIMEOUT=30 bash "$HERE/moa-consult.sh" \
+  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/oq" >/dev/null 2>&1 || fail "quorum consult should exit 0"
+q_el=$((SECONDS - q_start))
+[ "$q_el" -lt 10 ] || fail "moa should return on quorum, not wait the slow seat (took ${q_el}s)"
+grep -q "codex quick" "$WORK/oq/moa-final.md" || fail "quorum consult missing a fast proposal"
+echo "PASS: default quorum returns without blocking on the slow seat"
+
+# --- case 7 (C6): the real failure cause is surfaced, not hidden in the layer log ---
+# COUNCIL_TIMEOUT=0 makes council-round exit with a specific message; moa must surface it
+# in moa-final.md rather than only reporting a generic "no answers".
+PATH="$WORK/bin:$PATH" COUNCIL_TIMEOUT=0 bash "$HERE/moa-consult.sh" \
+  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o7" >/dev/null 2>&1 \
+  && fail "COUNCIL_TIMEOUT=0 should make the consult fail"
+grep -qi "COUNCIL_TIMEOUT must be" "$WORK/o7/moa-final.md" \
+  || fail "all-failed final should surface council-round's real error, not just 'no answers'"
+echo "PASS: real failure cause is surfaced in moa-final.md"
 
 echo "ALL PASS"
