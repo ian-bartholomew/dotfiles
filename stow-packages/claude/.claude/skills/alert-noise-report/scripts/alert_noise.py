@@ -41,10 +41,13 @@ def env_of(block):
     m = re.search(r"env:(inf-dev|dev|test|prod|fanapp-[a-z-]+-1)", block)
     if m:
         return ENV_MAP.get(m.group(1), m.group(1))
-    for tok, env in (("[inf-dev]", "inf-dev"), ("[dev]", "dev"), ("[test]", "test"),
-                     ("[prod]", "prod"), ("DEV", "dev"), ("TEST", "test"), ("PROD", "prod")):
+    for tok, env in (("[inf-dev]", "inf-dev"), ("[dev]", "dev"),
+                     ("[test]", "test"), ("[prod]", "prod")):
         if tok in block:
             return env
+    m = re.search(r"\b(DEV|TEST|PROD)\b", block)  # word-bounded so FANDEVX != dev
+    if m:
+        return {"DEV": "dev", "TEST": "test", "PROD": "prod"}[m.group(1)]
     return "unknown"
 
 
@@ -80,7 +83,8 @@ def monitor_of(title):
 def extract(paths):
     seen, rows = set(), []
     for path in paths:
-        text = open(path).read().replace("\\/", "/")
+        text = (open(path).read().replace("\\/", "/").replace("\\u2014", "-")
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
         parts = MSG_SPLIT.split(text)
         for i in range(1, len(parts) - 2, 3):
             author, block = parts[i], parts[i + 2]
@@ -125,7 +129,8 @@ def aggregate(rows):
         for ts, status in events:
             if status in TRIGGER_STATES:
                 a["trig"] += 1
-                open_trigger = ts
+                if open_trigger is None:  # anchor to the episode's FIRST trigger
+                    open_trigger = ts     # (renotify/re-trigger must not reset it)
             elif status == "Warn":
                 a["warn"] += 1
             elif status == "Recovered":
@@ -187,6 +192,26 @@ def pending(out_dir, now_epoch):
         print("\t".join(map(str, r)))
 
 
+def _selfcheck():
+    """Guard the flap-pairing rule: a flap is a Recovered within 30m of the
+    episode's FIRST trigger, so a renotify mid-incident must not create one."""
+    rows = [
+        ("100", "Triggered", "m1", "test", "s"),      # quick flap
+        ("160", "Recovered", "m1", "test", "s"),      #   +60s  -> flap
+        ("1000", "Triggered", "m2", "test", "s"),     # long incident
+        ("8200", "Re-Triggered", "m2", "test", "s"),  #   +2h renotify
+        ("8600", "Recovered", "m2", "test", "s"),     #   +7600s from first trigger -> NOT a flap
+        ("20000", "Triggered", "m3", "test", "s"),    # slow recovery
+        ("28000", "Recovered", "m3", "test", "s"),    #   +8000s -> NOT a flap
+    ]
+    agg = aggregate(rows)
+    flaps = sum(a["flap"] for a in agg.values())
+    assert flaps == 1, f"expected 1 flap, got {flaps}"
+    assert agg[("m2", "test")]["trig"] == 2, "renotify must still count as 2 triggers"
+    assert agg[("m2", "test")]["flap"] == 0, "long incident must not be a flap"
+    print("selfcheck OK")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "extract":
@@ -196,6 +221,8 @@ def main():
     elif cmd == "pending":
         now_epoch = float(sys.argv[3]) if len(sys.argv) > 3 else time.time()
         pending(sys.argv[2], now_epoch)
+    elif cmd == "selfcheck":
+        _selfcheck()
     else:
         sys.exit(__doc__)
 
