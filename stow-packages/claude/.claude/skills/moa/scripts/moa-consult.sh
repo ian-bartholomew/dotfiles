@@ -18,7 +18,10 @@ COUNCIL_ROUND="${MOA_COUNCIL_ROUND:-$HOME/.claude/skills/council/scripts/council
 
 prompt_file=""
 out_dir=""
-layers=2
+# Default to a single fan-out: layers run serially, so each extra layer ~doubles
+# wall-clock. The aggregator synthesizes fine from one round; opt into 2+ only at a
+# genuinely hard fork.
+layers=1
 members="codex,antigravity,sonnet"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,7 +60,13 @@ proposals_from_manifest() {
   done <"$manifest"
 }
 
-REFINE_INSTRUCTION='Below are candidate responses from other models to the same query. Use the strongest points, correct any errors you find, and produce an improved, self-contained response. Do not merely copy one of them.'
+REFINE_INSTRUCTION='Below are candidate responses from other models to the same query. Use the strongest points, correct any errors you find, and produce an improved, self-contained response. Do not merely copy one of them. Keep it tight: lead with your recommendation and stay under ~250 words, no preamble.'
+
+# Early-return once a quorum of proposers answer, rather than blocking each layer on the
+# slowest CLI. The aggregator synthesizes fine from a quorum and MoA degrades gracefully,
+# so trading the slowest seat for speed is the right default here. Override to wait for all
+# with COUNCIL_QUORUM=0 (or =3).
+export COUNCIL_QUORUM="${COUNCIL_QUORUM:-2}"
 
 last_good_dir=""
 last_good_manifest=""

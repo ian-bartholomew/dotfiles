@@ -51,21 +51,26 @@ directly. Only decision points trigger a consult.
 
 Write the sub-question plus the **minimal** relevant context (paths, constraints, the exact
 choice) to a prompt file with the **Write tool** (never a bash heredoc: arbitrary text and
-terminator collisions). If the sub-question is about repo code, say so and cite the files
-so proposers read them. Then:
+terminator collisions). If the sub-question is about repo code, **inline the relevant
+excerpts** (the specific functions, config, or lines) into the prompt. Do not tell proposers
+to go read the files themselves: the heavyweight CLIs (codex, `claude -p`) turn that into a
+multi-round agentic file crawl that routinely blows the per-member timeout, so only the
+lightweight seat answers and the consult silently degrades. You are already looking at the
+code; paste what matters. End the prompt with a length cap so proposers stay useful to an
+aggregator: "lead with your recommendation, stay under ~250 words, no preamble." Then:
 
 ```bash
 OUT_DIR="$(mktemp -d /tmp/moa-consult.XXXXXX)"
 bash ~/.claude/skills/moa/scripts/moa-consult.sh \
-  --prompt-file "$PROMPT_FILE" --out-dir "$OUT_DIR" --layers 2
+  --prompt-file "$PROMPT_FILE" --out-dir "$OUT_DIR"
 ```
 
 `moa-consult.sh` runs the proposer layers deterministically: layer 1 fans the question out
 to the trio in parallel; each later layer feeds the prior layer's proposals back to the
 proposers to refine (Together-style). It prints the path to `moa-final.md` (last line) and
-handles timeouts, quorum, and degradation. `--layers 2` is the default; use `--layers 1`
-for a cheaper single fan-out, `--layers 3` only for a genuinely hard fork. `--members`
-overrides the trio if you must.
+handles timeouts, quorum, and degradation. A single fan-out (`--layers 1`) is the default and
+the right choice for almost every consult; add `--layers 2` (or `3`) only at a genuinely hard
+fork where cross-refinement earns its serial cost. `--members` overrides the trio if you must.
 
 Read `moa-final.md`: the refined proposals from the last successful layer, labeled per
 member, with a per-layer status summary. If a whole layer failed it falls back to the last
@@ -88,24 +93,35 @@ command, the file. Continue the task to the next step or decision point.
 
 Reuse the council transcript pattern. Replace `SUBQ` with the actual sub-question.
 
+**Shell variables do not survive between separate Bash tool calls here**, so this block
+must `echo` the transcript path and you then use that **literal** path (and the literal
+`OUT_DIR`/prompt-file paths from step 3) in the following Write and cleanup, never a `$VAR`
+from an earlier call. Run this as one block:
+
 ```bash
 SUBQ='...the sub-question...'
 if ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
   DEST="$ROOT/.claude/moa"
   IGN="$ROOT/.gitignore"
-  grep -qxF '.claude/moa/' "$IGN" 2>/dev/null || printf '.claude/moa/\n' >>"$IGN"
+  # Append the ignore rule on its own line even if .gitignore lacks a trailing newline
+  # (otherwise it glues onto the last entry and the grep guard never matches again).
+  if ! grep -qxF '.claude/moa/' "$IGN" 2>/dev/null; then
+    [ -s "$IGN" ] && [ -n "$(tail -c1 "$IGN" 2>/dev/null)" ] && printf '\n' >>"$IGN"
+    printf '.claude/moa/\n' >>"$IGN"
+  fi
 else
   DEST="$HOME/.claude/moa-logs"
 fi
 mkdir -p "$DEST"
 SLUG="$(printf '%s' "$SUBQ" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-50 | sed 's/-$//')"
-TRANSCRIPT="$DEST/$(date +%Y%m%d-%H%M%S)-$$-$SLUG.md"
+echo "$DEST/$(date +%Y%m%d-%H%M%S)-$$-$SLUG.md"   # <- copy this literal path
 ```
 
-Write to `$TRANSCRIPT` (Write tool): the sub-question, the contents of `moa-final.md`, and
-your aggregation + decision. **Only after** confirming it wrote (`[ -s "$TRANSCRIPT" ]`),
-clean up: `rm -rf "$OUT_DIR" "$PROMPT_FILE"`. If the write failed, leave `$OUT_DIR` in place
-(it holds the only copy of the proposals) and tell the user where it is.
+Write to that **literal** path (Write tool): the sub-question, the contents of
+`moa-final.md`, and your aggregation + decision. **Only after** confirming it wrote
+(`[ -s "<that literal path>" ]`), clean up with the **literal** paths from step 3:
+`rm -rf "<the /tmp/moa-consult.XXXX dir>" "<the prompt file>"`. If the write failed, leave the
+`OUT_DIR` in place (it holds the only copy of the proposals) and tell the user where it is.
 
 ### 6. Soft consult budget
 
