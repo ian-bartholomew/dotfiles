@@ -9,15 +9,18 @@ description: |
   is flawed and hunt for failure modes, unexamined assumptions, and weak
   spots. Findings are merged, presented as a numbered list, and the user
   picks which to fold back into the plan file. Loops until verdicts
-  converge or the user stops.
-version: 1.0.0
+  converge or the user stops. Two additional skeptics run on external
+  models (Codex and Antigravity) for cross-model diversity.
+version: 1.1.0
 argument-hint: "[path-to-plan.md]"
 allowed-tools: [Read, Edit, Write, Glob, Bash, Agent, AskUserQuestion]
 ---
 
 # Adversarial Review Skill
 
-Stress-test a plan with three skeptical, role-specific personas running in parallel: **Staff Platform Engineer**, **Staff Software Architect**, **Technical Project Manager**. Personas are instructed to assume the plan is flawed and hunt for failure modes — this is **not** a balanced peer review. Findings are merged, the user picks which to incorporate, the plan file is edited in place, and the loop repeats until verdicts converge or the user stops.
+Stress-test a plan with three skeptical, role-specific personas running in parallel: **Staff Platform Engineer**, **Staff Software Architect**, **Technical Project Manager**. Two more skeptics run on external model families — **Codex** (OpenAI) and **Antigravity** (Google, via the `agy` CLI) — reviewing the whole plan as independent red-teamers, for a total of five reviewers per round. Reviewers are instructed to assume the plan is flawed and hunt for failure modes — this is **not** a balanced peer review. Findings are merged, the user picks which to incorporate, the plan file is edited in place, and the loop repeats until verdicts converge or the user stops.
+
+The three personas run as Claude `Agent` subagents; the two model skeptics are dispatched through the reused `~/.claude/skills/council/scripts/council-round.sh` fan-out script (which owns all CLI plumbing: timeouts, sandboxing, quota fallback). All five run concurrently.
 
 ## When to Use
 
@@ -92,9 +95,29 @@ ROUND=1
 INCORPORATED_LOG=""   # accumulates "Round N: <finding>" lines across the session
 ```
 
-### Step 5 — Parallel persona review
+### Step 5 — Parallel review (three personas + two model skeptics)
 
-Dispatch **three `Agent` calls in a single message** (one tool-use block with three `Agent` calls running concurrently). All three use `subagent_type: "general-purpose"`. Each agent receives:
+**Step 5a — Prepare the model-skeptic prompt file.** The two external CLIs run sandboxed (`codex exec -s read-only`, `agy -p --sandbox`) and cannot reliably read `$PLAN_PATH` at an arbitrary absolute path, so the plan is **inlined** into their prompt. Create a working dir and write the skeptic prompt (skeptic persona block + shared response contract + full plan text) to it:
+
+```bash
+SKEPTIC_DIR=$(mktemp -d)
+echo "$SKEPTIC_DIR"   # capture for the Write and Read calls below
+```
+
+Use `Write` to create `$SKEPTIC_DIR/prompt.txt` containing the **Model skeptic** prompt below (with `<CONTEXT>` and the full plan content substituted in). Both CLIs receive the same file; the `## <ROLE>` heading distinguishes their reports.
+
+**Step 5b — Dispatch all five reviewers concurrently.** In **a single message**, emit **three `Agent` tool calls** (one per persona, `subagent_type: "general-purpose"`) **plus one `Bash` call** that runs the council fan-out for the two model skeptics:
+
+```bash
+COUNCIL_TIMEOUT=300 ~/.claude/skills/council/scripts/council-round.sh \
+  --prompt-file "$SKEPTIC_DIR/prompt.txt" \
+  --out-dir "$SKEPTIC_DIR" \
+  --members codex,antigravity
+```
+
+The script writes `$SKEPTIC_DIR/codex.out` and `$SKEPTIC_DIR/antigravity.out` and prints a tab-separated manifest (`<member>\tok|failed(timeout)|failed\t<path>`). The three `Agent` calls and this `Bash` call run in parallel — do not dispatch sequentially.
+
+Each persona agent receives:
 
 - The absolute plan path (for `Read` access)
 - The extracted `CONTEXT` excerpt (or the "Not provided" placeholder)
@@ -228,11 +251,42 @@ Read the plan in full, then return the response format described below.
 [shared response contract with <ROLE> = "Technical Project Manager"]
 ```
 
-Dispatch all three in **a single message containing three `Agent` tool calls**. Do not dispatch sequentially.
+**Model skeptics — Codex & Antigravity** (written to `$SKEPTIC_DIR/prompt.txt` in Step 5a; both CLIs get this same prompt):
+
+```
+You are an independent senior engineer conducting an adversarial red-team
+review of the plan included below.
+
+ASSUME THE PLAN IS FLAWED. Your job is to find failure modes, unexamined
+assumptions, and weak spots across ANY dimension — technical, operational,
+architectural, delivery, security — not balanced peer review. Do NOT list
+strengths.
+
+Original problem context (if available):
+<CONTEXT>
+
+Review the full plan text below, then return the response format described
+at the end.
+
+--- BEGIN PLAN ---
+<full plan content — inlined verbatim from $PLAN_PATH>
+--- END PLAN ---
+
+[shared response contract — set <ROLE> to your own model name plus
+" — Independent Skeptic", i.e. codex emits "## Codex — Independent Skeptic"
+and antigravity emits "## Antigravity — Independent Skeptic"]
+```
+
+Because both CLIs receive the identical file, the `## <ROLE>` heading is what
+separates the two reports when you read them back. Set the role from the
+output filename: `codex.out` → `Codex — Independent Skeptic`, `antigravity.out`
+→ `Antigravity — Independent Skeptic`.
 
 ### Step 6 — Aggregate and report
 
-Print a round header, then each persona's report verbatim, separated by `---`:
+First, collect the two model-skeptic reports. From the `council-round.sh` manifest, for each member marked `ok` with a non-empty `.out`, `Read` `$SKEPTIC_DIR/codex.out` and `$SKEPTIC_DIR/antigravity.out`. A member marked `failed` or `failed(timeout)` produced no usable report — treat it as an absent reviewer with verdict `unknown` (see failure handling below); do not fabricate its output.
+
+Print a round header, then each report verbatim, separated by `---` (personas first, then the model skeptics that succeeded):
 
 ```
 # Round <ROUND>
@@ -246,28 +300,36 @@ Print a round header, then each persona's report verbatim, separated by `---`:
 ---
 
 [Technical Project Manager report]
+
+---
+
+[Codex — Independent Skeptic report, if ok]
+
+---
+
+[Antigravity — Independent Skeptic report, if ok]
 ```
 
-Then merge the **Suggested changes** sections across all three personas into a single numbered list. Substantively-similar findings are deduplicated and tagged with each source persona's abbreviation: `PE` (Platform Engineer), `ARCH` (Architect), `TPM`. Two findings are "substantively the same" when they target the same plan section AND propose changes that overlap meaningfully — when in doubt, keep them separate.
+Then merge the **Suggested changes** sections across all reporting reviewers into a single numbered list. Substantively-similar findings are deduplicated and tagged with each source's abbreviation: `PE` (Platform Engineer), `ARCH` (Architect), `TPM`, `CODEX`, `AGY` (Antigravity). Two findings are "substantively the same" when they target the same plan section AND propose changes that overlap meaningfully — when in doubt, keep them separate.
 
 ```
 ## Consolidated findings (Round <ROUND>)
 
-1. [PE, ARCH] <plan section>: <merged edit description>
+1. [PE, ARCH, CODEX] <plan section>: <merged edit description>
 2. [TPM] <plan section>: <edit description>
-3. [PE] <plan section>: <edit description>
+3. [AGY] <plan section>: <edit description>
 ...
 ```
 
-Then a one-line verdict summary:
+Then a one-line verdict summary covering all five reviewers (use `unknown` for any that failed, timed out, or returned malformed output):
 
 ```
-Verdicts — PE: accept-with-changes | ARCH: reject | TPM: accept-with-changes
+Verdicts — PE: accept-with-changes | ARCH: reject | TPM: accept-with-changes | CODEX: reject | AGY: unknown
 ```
 
-If any persona's output is malformed (missing `### Verdict:` line, missing `### Suggested changes` section), show the raw output anyway, mark its verdict as `unknown` in the summary, and exclude its suggested-changes section from the consolidated list (you'll have nothing to merge from it).
+If any reviewer's output is malformed (missing `### Verdict:` line, missing `### Suggested changes` section) or a model skeptic failed / timed out, show the raw output where available, mark its verdict as `unknown` in the summary, and exclude it from the consolidated list (you'll have nothing to merge from it). A model-skeptic failure is non-fatal: proceed with whatever reviewers reported.
 
-If ALL three personas return `approve` AND there are no suggested changes, skip Step 7 and jump straight to Step 9 (loop termination — convergence).
+**Convergence** (skip Step 7, jump to Step 9): the three Claude personas must have succeeded and ALL reporting reviewers (the three personas plus any model skeptic that returned `ok`) must return `approve` with no suggested changes. A model skeptic stuck in `unknown` (persistent failure) does not by itself block convergence — but if any reviewer that *did* report wants changes, the loop continues.
 
 ### Step 7 — Incorporation prompt
 
@@ -299,13 +361,13 @@ Round <ROUND>:
   - [TPM] <plan section>: <edit description>
 ```
 
-`Read` the updated plan back (this confirms edits landed and gives fresh content for the next round). Increment `ROUND` and loop to Step 5.
+`Read` the updated plan back (this confirms edits landed and gives fresh content for the next round). Increment `ROUND` and loop to Step 5 — Step 5a rebuilds `$SKEPTIC_DIR/prompt.txt` with the revised plan inlined (a fresh `mktemp -d` per round), so the model skeptics review the current version, not the original.
 
 ### Step 9 — Loop termination
 
 The loop exits when any of:
 
-1. **Convergence** — All three personas returned `approve` with no suggested changes (Step 6).
+1. **Convergence** — The three Claude personas succeeded and all reporting reviewers (personas + any `ok` model skeptic) returned `approve` with no suggested changes (Step 6).
 2. **User stop** — User picked **None / done** at Step 7.
 3. **Round limit** — `ROUND == 3` (and we're about to enter round 4). At this point, ask via `AskUserQuestion`:
 
@@ -379,7 +441,7 @@ Adversarial review complete.
   Plan:               <relative path>
   Rounds:             <N>
   Findings applied:   <count> across <N> rounds
-  Final verdicts:     PE: <v> | ARCH: <v> | TPM: <v>
+  Final verdicts:     PE: <v> | ARCH: <v> | TPM: <v> | CODEX: <v> | AGY: <v>
   Review saved:       <REVIEW_PATH or "skipped">
 ```
 
@@ -392,7 +454,10 @@ Adversarial review complete.
 | No `## Context` / `## Background` / `## Problem` / `## Summary` / `## Overview` section | Pass `"Not provided in plan."` to personas. Do not prompt user. |
 | No candidates for smart default | Exit Step 1 with instructions to pass a path explicitly. |
 | Persona agent returns malformed output | Show raw output, mark verdict as `unknown`, exclude from consolidated list. Does NOT count as `approve` for convergence. |
-| All three personas approve on round 1 with no suggestions | Skip Step 7. Jump to Step 9 → Step 10. |
+| All reporting reviewers approve on round 1 with no suggestions | Skip Step 7. Jump to Step 9 → Step 10. |
+| A model skeptic (`codex` / `antigravity`) fails or times out | Manifest marks it `failed` / `failed(timeout)`. Non-fatal: mark verdict `unknown`, exclude from consolidated list, proceed with the remaining reviewers. Does NOT block convergence on its own. |
+| Both model skeptics fail | Review degrades gracefully to the original three-persona behavior for that round. Note it in the round output. |
+| `agy` hits its quota | `council-round.sh` auto-retries once on its fallback model (`COUNCIL_ANTIGRAVITY_FALLBACK`); no action needed here. |
 | User picks Cherry-pick with unparseable numbers | Re-prompt once; on second failure, treat as None / done. |
 | `Edit` fails on a specific finding (e.g. ambiguous `old_string`) | Warn, skip that finding, continue with the rest. The skipped finding is not added to `INCORPORATED_LOG`. |
 | User picks "Discard and exit" at round 3 | Findings from rounds 1–N are already in `INCORPORATED_LOG`. The "discard" only means no further incorporation — the save artifact (if user opts in) still includes the full session. |
@@ -400,6 +465,8 @@ Adversarial review complete.
 | Plan path contains spaces or special chars | All shell commands quote `$PLAN_PATH`. |
 
 ## Examples
+
+The examples below predate the model skeptics and show only the three persona reports; a live round also includes `CODEX` and `AGY` reports and verdicts (see Step 6). They remain accurate for the persona flow, loop mechanics, and incorporation prompts.
 
 ### Example 1 — Happy path, two rounds, partial cherry-pick
 
@@ -503,9 +570,13 @@ Run /adversarial-review after the plan has substantive content.
 - The skill never modifies anything outside `$PLAN_PATH` and the optional `$REVIEW_PATH`.
 - The persona response contracts are strict on tone (`Do NOT list strengths`) — this is intentional. If the user wants balanced peer review, they should use a different skill (e.g. extend `/one-pager` semantics to plans, or write a new `/peer-review-plan` skill).
 - Subagent dispatch uses `general-purpose` to match the precedent in `one-pager` and `rfc`. If a future dedicated `plan-reviewer` agent is added, swap the `subagent_type`.
+- The model skeptics reuse `council-round.sh` rather than shelling out to `codex` / `agy` directly. That script owns the timeout watchdog (macOS has no `timeout`), sandbox flags, stdin handling under parallel contention, and the Antigravity quota fallback. Do not reimplement CLI invocation here — call the script.
+- The plan is inlined into the skeptic prompt because the CLIs run sandboxed and can't reliably read `$PLAN_PATH` (often outside the repo, e.g. `~/.claude/plans/`). The Claude personas read the file directly via their `Read` tool — that asymmetry is deliberate.
+- Requires the `codex` and `agy` CLIs on `PATH`. If either is absent, that skeptic's `council-round.sh` member fails and is treated as `unknown` — the review still runs on the remaining reviewers.
 
 ## Related
 
+- `~/.claude/skills/council/SKILL.md` — source of `council-round.sh`, the CLI fan-out engine reused here.
 - `~/.claude/skills/one-pager/SKILL.md` — closest structural template (3 personas, parallel dispatch, iterative loop, response contract).
 - `~/.claude/skills/rfc/SKILL.md` — 2-persona variant with verdict-gated approval.
 - `~/.claude/skills/terraform-review/SKILL.md` — confidence-filtered, lens-based parallel dispatch; uses a custom `terraform-reviewer` subagent (intentionally not adopted here).
