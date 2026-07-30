@@ -74,15 +74,20 @@ The exception: a genuinely PR-less branch (Case A on a local-only branch, or Cas
 **Case A — no argument provided:**
 
 - Run `git rev-parse --abbrev-ref HEAD` to get `<branch>`.
-- Extract the ticket key with regex `^[A-Z]+-\d+`. This handles both `FANDEVX-2926/foo` and `FANDEVX-2926-foo` formats.
+- Extract the ticket key with regex `^[A-Za-z]+-\d+`, then **upper-case it**. This handles
+  `FANDEVX-2926/foo`, `FANDEVX-2926-foo`, and `fandevx-2926-foo`.
+- **Match case-insensitively — many repos mandate lowercase branch names.** `fes-loyalty-bonus`
+  `.claude/rules/commits.md` requires them, so a case-sensitive `^[A-Z]+-\d+` aborts on every branch in
+  that repo. The JIRA key itself is always upper-case, so upper-case the captured value before using it in
+  any MCP call or `grep`.
 - If no match, stop with: `Branch '<name>' does not start with a JIRA ticket key. Aborting.`
 - `<branch>` = current branch.
 
 **Case B — argument provided:**
 
 - Verify cwd is inside a git repo: `git rev-parse --is-inside-work-tree`. If not, stop with: `/finish-work <target> must be run from inside a git repository. Aborting.`
-- If `<target>` matches `^[A-Z]+-\d+$`: ticket key = `<target>`. Branch resolution is deferred to Step 3 (resolved from the PR's `headRefName`).
-- If `<target>` matches `^\d+$`: run `gh pr view <target> --json number,state,merged,url,headRefName,title`. Extract the ticket key from `headRefName` via `^[A-Z]+-\d+`. If no match, stop with: `PR #<num> branch '<headRef>' does not start with a JIRA ticket key. Aborting.` Cache the PR JSON for reuse in Step 3.
+- If `<target>` matches `^[A-Za-z]+-\d+$`: ticket key = `<target>` upper-cased. Branch resolution is deferred to Step 3 (resolved from the PR's `headRefName`).
+- If `<target>` matches `^\d+$`: run `gh pr view <target> --json number,state,mergedAt,url,headRefName,title`. Extract the ticket key from `headRefName` via `^[A-Za-z]+-\d+` and upper-case it. If no match, stop with: `PR #<num> branch '<headRef>' does not start with a JIRA ticket key. Aborting.` Cache the PR JSON for reuse in Step 3.
 - Anything else: stop with `Argument '<value>' is neither a JIRA key (e.g. FANDEVX-1234) nor a PR number (e.g. 1234). Aborting.`
 
 ## Step 2: Confirm GitHub identity
@@ -98,12 +103,14 @@ JIRA: use the Atlassian MCP server (`getJiraIssue` and `getTransitionsForJiraIss
 
 PR resolution depends on mode:
 
-- **Case A (no arg):** `gh pr view --json state,merged,url,headRefName` on the current branch. If `gh pr view` exits non-zero, treat it as "no PR".
+- **Case A (no arg):** `gh pr view --json number,state,mergedAt,url,headRefName,title` on the current branch. If `gh pr view` exits non-zero, treat it as "no PR".
 - **Case B, PR-number arg:** reuse the JSON cached in Step 1.
-- **Case B, ticket-key arg:** `gh pr list --search "<ticket-key>" --state all --json number,state,merged,url,headRefName,title --limit 5`. Filter to PRs whose `headRefName` starts with `<ticket-key>`.
+- **Case B, ticket-key arg:** `gh pr list --search "<ticket-key>" --state all --json number,state,mergedAt,url,headRefName,title --limit 5`. Filter to PRs whose `headRefName` starts with `<ticket-key>` (compare case-insensitively).
   - 0 matches → treat as "no PR".
   - 1 match → use it.
-  - 2+ matches → display the list (number, title, state, branch) and ask the user to pick one.
+  - 2+ matches → display the list (number, title, state, branch) and ask the user to pick one. **A single ticket can legitimately have several merged PRs** (an initial PR plus a follow-up fix); treat "merged" as satisfied if any of them merged, and mention all of them in Step 7's log entry.
+
+> **There is no `merged` field.** `gh pr view --json merged` exits non-zero with `Unknown JSON field: "merged"`, which the Step 0 pre-flight would then read as "cannot determine merge state" and halt. Use `mergedAt` (null when unmerged) or `state` (`MERGED` / `OPEN` / `CLOSED`). Verify the field list with `gh pr view --json` on any invalid name before adding a new field to these calls.
 
 Store the resolved `<branch>` = `headRefName` from the PR for use in Steps 6 and 8. In Case B with no PR, prompt the user for the branch name (or accept that branch-dependent steps will be skipped).
 
@@ -120,6 +127,10 @@ Smart default based on PR state:
 | closed (unmerged)  | ask user          |
 | no PR              | ask user          |
 
+- **If the ticket is already in the target status, do nothing and say so.** A ticket closed earlier in the
+  same session, or by someone else, needs no transition; re-firing one is either a no-op or a workflow
+  error. Report "already Done, no transition needed" rather than executing or reporting a transition that
+  did not happen.
 - Show the user the chosen target transition (or the prompt for "closed-unmerged" / "no PR") alongside the available transitions list from JIRA. Confirm before executing.
 - Execute the transition via the Atlassian MCP server (`transitionJiraIssue`).
 - If the transition fails (e.g., required field missing), surface the error and prompt the user — do not silently swallow.
@@ -128,8 +139,13 @@ Smart default based on PR state:
 
 After the JIRA transition, update the ticket's Todoist card directly (no full sync):
 
-- Find it: `td task list --project "Work" --json --all` filtered to content starting with
-  `<TICKET-KEY>`. No card -> skip silently (not all tickets have cards).
+- Find it: `td task list --project "Work" --json --all`, then read the cards from the top-level
+  **`results`** key and filter to content starting with `<TICKET-KEY>`. No card -> skip silently (not all
+  tickets have cards).
+- **The payload is `{"results": [...], "nextCursor": ...}`, not a bare array and not `items`/`tasks`.**
+  Guessing the key yields an empty list, which is indistinguishable from "no card" and silently skips a
+  card that is really there. If the filter returns zero, print the total card count as a sanity check
+  before concluding there is no card: a total of `0` means the parse is wrong, not that the board is empty.
 - Transitioned to Done (or any done-category status): `td task complete id:<card_id>`.
 - Transitioned to In Code Review: `td task move id:<card_id> --section "In Review"`, then
   `td task update id:<card_id> --description "<existing description with the sync: line's
@@ -205,6 +221,23 @@ Then act based on the combination:
 | none | no | any | Skip silently — nothing to clean up. |
 
 Uncommitted-changes check (`git status --porcelain` against the worktree path) only applies when a worktree exists. If non-empty, warn the user and ask whether to abort cleanup or discard changes before proceeding.
+
+**Do not use `git log <base>..<branch>` or `git branch --merged` to judge whether the work is safely in the
+base branch.** These repos squash-merge, so the commit on `main` is a new object and the branch commit is
+never its ancestor. Every squash-merged branch reports unmerged commits and `--merged` omits it, so that
+signal cannot distinguish "already merged" from "about to lose work" — and this step runs `git branch -D`,
+which does not second-guess you. Verify **content** per file instead:
+
+```bash
+git show --name-only --format= "$BRANCH" | grep -v '^$' | while read -r f; do
+  git diff --quiet "origin/$DEFAULT_BRANCH" "$BRANCH" -- "$f" \
+    && echo "  IN BASE:  $f" || echo "  DIFFERS:  $f"
+done
+```
+
+A `DIFFERS` line is not automatically a blocker — a later PR may have superseded that file, which is the
+expected result when a ticket shipped a fix on top of its own earlier PR. Read each one and say which case
+it is before deleting.
 
 ## Step 9: Final summary
 
