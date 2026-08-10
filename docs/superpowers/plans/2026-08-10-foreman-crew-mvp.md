@@ -387,8 +387,8 @@ def assert_snapshot_shape(snap, defs):
 
 
 def ensure_crew_dir():
-    if not os.path.isdir(CREW_DIR):
-        os.makedirs(CREW_DIR, mode=0o700)
+    # exist_ok because many crew call this concurrently on a fresh install.
+    os.makedirs(CREW_DIR, mode=0o700, exist_ok=True)
     os.chmod(CREW_DIR, 0o700)
 
 
@@ -469,6 +469,22 @@ def main(argv):
     if not args:
         print("usage: crew <doctor|ls|dispatch|peek|nudge|mail> [args]", file=sys.stderr)
         return 2
+    try:
+        return _run(args)
+    except CrewError as exc:
+        print("crew: %s" % exc, file=sys.stderr)
+        return 3
+    except HerdrError as exc:
+        print("crew: herdr: %s" % exc, file=sys.stderr)
+        return 3
+    except ValueError as exc:
+        print("crew: bad argument: %s" % exc, file=sys.stderr)
+        return 2
+
+
+def _run(args):
+    """Verb dispatch. Errors are handled centrally in main, so a verb that
+    forgets its own try/except cannot dump a traceback at a crew member."""
     verb = args[0]
     if verb == "doctor":
         return doctor()
@@ -837,11 +853,7 @@ Wire it into `main`, and make `CrewError` fail closed rather than printing zeros
     if verb == "doctor":
         return doctor()
     if verb == "ls":
-        try:
-            return cmd_ls("--json" in args)
-        except (CrewError, HerdrError) as exc:
-            print("SNAPSHOT UNPARSED: %s" % exc, file=sys.stderr)
-            return 3
+        return cmd_ls("--json" in args)
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
@@ -925,7 +937,7 @@ crew ls; echo "exit=$?"
 rm -rf /tmp/fakeherdr
 ```
 
-Expected: prints `SNAPSHOT UNPARSED: ... agent missing agent_status, workspace_id` and `exit=3`. It must not print a zeroed load report.
+Expected: a message containing `UNPARSED` on stderr, prefixed `crew: `, and `exit=3`. It must not print a zeroed load report. The exact layer that trips (schema parse or snapshot shape) depends on the stub, and either is a pass.
 
 - [ ] **Step 8: Commit**
 
@@ -1035,6 +1047,26 @@ class TestSelectUnread(unittest.TestCase):
         self.assertEqual(fresh, [])
         self.assertEqual(cursor, 5)
         self.assertEqual(missing, 0)
+
+
+class TestMainNeverTracebacks(unittest.TestCase):
+    """Crew members invoke `crew mail send` from their own sessions. A
+    traceback there is unreadable to them and loses the message."""
+
+    def test_mail_send_without_a_key_is_a_clean_error(self):
+        with mock.patch.object(crew, "_pane_tokens", return_value={}):
+            self.assertEqual(crew.main(["mail", "send", "done", "x"]), 3)
+
+    def test_herdr_failure_during_send_is_a_clean_error(self):
+        with mock.patch.object(crew, "_pane_tokens",
+                               side_effect=HerdrError("socket gone")):
+            self.assertEqual(crew.main(["mail", "send", "done", "x"]), 3)
+
+    def test_non_integer_ack_seq_is_a_clean_error(self):
+        self.assertEqual(crew.main(["mail", "ack", "twelve"]), 2)
+
+    def test_unknown_verb_returns_two(self):
+        self.assertEqual(crew.main(["teleport"]), 2)
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1138,6 +1170,7 @@ def mail_unread():
     ensure_crew_dir()
     if not os.path.exists(MAILBOX):
         print("no mail")
+        print("ack with: crew mail ack 0")
         return 0
     with _locked(MAILBOX, "r") as handle:
         entries, unreadable = read_entries(handle.readlines())
@@ -1212,7 +1245,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 47 tests.
+Expected: PASS, 51 tests.
 
 - [ ] **Step 5: Verify concurrent writers do not interleave**
 
@@ -1687,7 +1720,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 52 tests.
+Expected: PASS, 56 tests.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -1874,7 +1907,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 56 tests.
+Expected: PASS, 60 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 
