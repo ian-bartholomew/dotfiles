@@ -27,10 +27,13 @@ BUCKETS = {
     "unknown": "recover",
 }
 
-# Snapshot fields crew depends on. doctor and ls assert these exist rather
-# than silently filtering to nothing when herdr renames one.
-REQUIRED_AGENT_FIELDS = ("agent_status", "pane_id", "workspace_id")
-REQUIRED_PANE_FIELDS = ("pane_id", "cwd", "foreground_cwd", "tokens")
+# Fields crew reads that herdr's schema declares OPTIONAL. A pane that has
+# never been tagged genuinely has no tokens key, so requiring one in data is
+# wrong; but a rename would make every lookup return None and the fleet read
+# as empty. Assert the declaration, not the value.
+SCHEMA_OPTIONAL_PANE_FIELDS = ("tokens", "cwd", "foreground_cwd")
+SCHEMA_OPTIONAL_AGENT_FIELDS = ("name", "terminal_title_stripped",
+                                "state_change_seq")
 
 
 class HerdrError(Exception):
@@ -69,9 +72,10 @@ def bucket(agent_status):
 
 def herdr(*args, **kwargs):
     capture = kwargs.pop("capture", True)
+    read_only = kwargs.pop("read_only", False)
     if kwargs:
         raise TypeError("unexpected kwargs: %s" % sorted(kwargs))
-    if DRY_RUN:
+    if DRY_RUN and not read_only:
         print("herdr " + " ".join(shlex.quote(a) for a in args))
         return None
     proc = subprocess.run(
@@ -92,7 +96,7 @@ def herdr(*args, **kwargs):
 
 
 def snapshot():
-    payload = herdr("api", "snapshot")
+    payload = herdr("api", "snapshot", read_only=True)
     if payload is None:
         raise CrewError("no snapshot (dry-run?)")
     try:
@@ -102,23 +106,44 @@ def snapshot():
     return snap
 
 
-def assert_snapshot_shape(snap):
-    """Fail closed. A renamed field must not read as an empty fleet."""
+def schema_defs():
+    payload = herdr("api", "schema", "--json", read_only=True)
+    if payload is None:
+        raise CrewError("no schema returned")
+    try:
+        return payload["schemas"]["success_response"]["$defs"]
+    except (KeyError, TypeError):
+        raise CrewError("SCHEMA UNPARSED: no schemas.success_response.$defs")
+
+
+def assert_schema_declares(defs):
+    """Catch a renamed optional field at the declaration layer."""
+    for type_name, fields in (("PaneInfo", SCHEMA_OPTIONAL_PANE_FIELDS),
+                              ("AgentInfo", SCHEMA_OPTIONAL_AGENT_FIELDS)):
+        props = (defs.get(type_name) or {}).get("properties")
+        if not props:
+            raise CrewError("SCHEMA UNPARSED: no %s.properties" % type_name)
+        missing = [f for f in fields if f not in props]
+        if missing:
+            raise CrewError("SCHEMA DRIFT: %s no longer declares %s"
+                            % (type_name, ", ".join(missing)))
+
+
+def assert_snapshot_shape(snap, defs):
+    """Fail closed against herdr's own required lists, not a hand-written
+    one. A shape change must not read as an empty fleet."""
     for name in ("agents", "panes"):
         if not isinstance(snap.get(name), list):
             raise CrewError("SNAPSHOT UNPARSED: %s is not a list" % name)
-    for agent in snap["agents"]:
-        missing = [f for f in REQUIRED_AGENT_FIELDS if f not in agent]
-        if missing:
-            raise CrewError(
-                "SNAPSHOT UNPARSED: agent missing %s" % ", ".join(missing)
-            )
-    for pane in snap["panes"]:
-        missing = [f for f in REQUIRED_PANE_FIELDS if f not in pane]
-        if missing:
-            raise CrewError(
-                "SNAPSHOT UNPARSED: pane missing %s" % ", ".join(missing)
-            )
+    for type_name, name in (("AgentInfo", "agents"), ("PaneInfo", "panes")):
+        required = (defs.get(type_name) or {}).get("required")
+        if not required:
+            raise CrewError("SCHEMA UNPARSED: no %s.required" % type_name)
+        for item in snap[name]:
+            missing = [f for f in required if f not in item]
+            if missing:
+                raise CrewError("SNAPSHOT UNPARSED: %s missing %s"
+                                % (type_name, ", ".join(missing)))
 
 
 def ensure_crew_dir():
@@ -156,8 +181,10 @@ def doctor():
         problems.append("could not run herdr api schema")
 
     try:
+        defs = schema_defs()
+        assert_schema_declares(defs)
         snap = snapshot()
-        assert_snapshot_shape(snap)
+        assert_snapshot_shape(snap, defs)
         print("snapshot: %d agents, %d panes" % (len(snap["agents"]), len(snap["panes"])))
     except (CrewError, HerdrError) as exc:
         problems.append(str(exc))
