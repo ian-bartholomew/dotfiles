@@ -267,10 +267,13 @@ BUCKETS = {
     "unknown": "recover",
 }
 
-# Snapshot fields crew depends on. doctor and ls assert these exist rather
-# than silently filtering to nothing when herdr renames one.
-REQUIRED_AGENT_FIELDS = ("agent_status", "pane_id", "workspace_id")
-REQUIRED_PANE_FIELDS = ("pane_id", "cwd", "foreground_cwd", "tokens")
+# Fields crew reads that herdr's schema declares OPTIONAL. A pane that has
+# never been tagged genuinely has no tokens key, so requiring one in data is
+# wrong; but a rename would make every lookup return None and the fleet read
+# as empty. Assert the declaration, not the value.
+SCHEMA_OPTIONAL_PANE_FIELDS = ("tokens", "cwd", "foreground_cwd")
+SCHEMA_OPTIONAL_AGENT_FIELDS = ("name", "terminal_title_stripped",
+                                "state_change_seq")
 
 
 class HerdrError(Exception):
@@ -309,9 +312,10 @@ def bucket(agent_status):
 
 def herdr(*args, **kwargs):
     capture = kwargs.pop("capture", True)
+    read_only = kwargs.pop("read_only", False)
     if kwargs:
         raise TypeError("unexpected kwargs: %s" % sorted(kwargs))
-    if DRY_RUN:
+    if DRY_RUN and not read_only:
         print("herdr " + " ".join(shlex.quote(a) for a in args))
         return None
     proc = subprocess.run(
@@ -332,7 +336,7 @@ def herdr(*args, **kwargs):
 
 
 def snapshot():
-    payload = herdr("api", "snapshot")
+    payload = herdr("api", "snapshot", read_only=True)
     if payload is None:
         raise CrewError("no snapshot (dry-run?)")
     try:
@@ -342,23 +346,44 @@ def snapshot():
     return snap
 
 
-def assert_snapshot_shape(snap):
-    """Fail closed. A renamed field must not read as an empty fleet."""
+def schema_defs():
+    payload = herdr("api", "schema", "--json", read_only=True)
+    if payload is None:
+        raise CrewError("no schema returned")
+    try:
+        return payload["schemas"]["success_response"]["$defs"]
+    except (KeyError, TypeError):
+        raise CrewError("SCHEMA UNPARSED: no schemas.success_response.$defs")
+
+
+def assert_schema_declares(defs):
+    """Catch a renamed optional field at the declaration layer."""
+    for type_name, fields in (("PaneInfo", SCHEMA_OPTIONAL_PANE_FIELDS),
+                              ("AgentInfo", SCHEMA_OPTIONAL_AGENT_FIELDS)):
+        props = (defs.get(type_name) or {}).get("properties")
+        if not props:
+            raise CrewError("SCHEMA UNPARSED: no %s.properties" % type_name)
+        missing = [f for f in fields if f not in props]
+        if missing:
+            raise CrewError("SCHEMA DRIFT: %s no longer declares %s"
+                            % (type_name, ", ".join(missing)))
+
+
+def assert_snapshot_shape(snap, defs):
+    """Fail closed against herdr's own required lists, not a hand-written
+    one. A shape change must not read as an empty fleet."""
     for name in ("agents", "panes"):
         if not isinstance(snap.get(name), list):
             raise CrewError("SNAPSHOT UNPARSED: %s is not a list" % name)
-    for agent in snap["agents"]:
-        missing = [f for f in REQUIRED_AGENT_FIELDS if f not in agent]
-        if missing:
-            raise CrewError(
-                "SNAPSHOT UNPARSED: agent missing %s" % ", ".join(missing)
-            )
-    for pane in snap["panes"]:
-        missing = [f for f in REQUIRED_PANE_FIELDS if f not in pane]
-        if missing:
-            raise CrewError(
-                "SNAPSHOT UNPARSED: pane missing %s" % ", ".join(missing)
-            )
+    for type_name, name in (("AgentInfo", "agents"), ("PaneInfo", "panes")):
+        required = (defs.get(type_name) or {}).get("required")
+        if not required:
+            raise CrewError("SCHEMA UNPARSED: no %s.required" % type_name)
+        for item in snap[name]:
+            missing = [f for f in required if f not in item]
+            if missing:
+                raise CrewError("SNAPSHOT UNPARSED: %s missing %s"
+                                % (type_name, ", ".join(missing)))
 
 
 def ensure_crew_dir():
@@ -396,8 +421,10 @@ def doctor():
         problems.append("could not run herdr api schema")
 
     try:
+        defs = schema_defs()
+        assert_schema_declares(defs)
         snap = snapshot()
-        assert_snapshot_shape(snap)
+        assert_snapshot_shape(snap, defs)
         print("snapshot: %d agents, %d panes" % (len(snap["agents"]), len(snap["panes"])))
     except (CrewError, HerdrError) as exc:
         problems.append(str(exc))
@@ -516,7 +543,7 @@ The primary UI. It must never print counts it did not measure: a renamed herdr f
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `test_crew.py`, and extend the import at the top of the file to include `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `CrewError`:
+Append to `test_crew.py`, and extend the import at the top of the file to include `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`:
 
 ```python
 def _snap(agents, panes):
@@ -577,20 +604,57 @@ class TestCrewMembers(unittest.TestCase):
         self.assertEqual(crew_members(snap)[0]["type"], "unknown-v99")
 
 
+# Mirrors herdr 0.7.5 protocol 17. tokens, cwd and foreground_cwd are
+# declared but NOT required, which is why they are asserted at the schema
+# layer instead of demanded on every pane.
+DEFS = {
+    "AgentInfo": {
+        "required": ["agent_status", "pane_id", "workspace_id"],
+        "properties": {"name": {}, "terminal_title_stripped": {},
+                       "state_change_seq": {}, "tokens": {}},
+    },
+    "PaneInfo": {
+        "required": ["pane_id"],
+        "properties": {"tokens": {}, "cwd": {}, "foreground_cwd": {}},
+    },
+}
+
+
 class TestAssertSnapshotShape(unittest.TestCase):
-    def test_missing_agent_field_raises(self):
+    def test_missing_required_agent_field_raises(self):
         snap = _snap([{"pane_id": "wQ:p1", "workspace_id": "wQ"}], [])
         with self.assertRaises(CrewError):
-            assert_snapshot_shape(snap)
+            assert_snapshot_shape(snap, DEFS)
 
     def test_agents_not_a_list_raises(self):
         with self.assertRaises(CrewError):
-            assert_snapshot_shape({"agents": {}, "panes": []})
+            assert_snapshot_shape({"agents": {}, "panes": []}, DEFS)
 
-    def test_missing_pane_field_raises(self):
+    def test_untagged_pane_without_tokens_is_valid(self):
+        # An untagged pane genuinely has no tokens key. This must not raise.
         snap = _snap([], [{"pane_id": "wQ:p1"}])
+        assert_snapshot_shape(snap, DEFS)
+
+    def test_empty_schema_required_raises_rather_than_passing_vacuously(self):
         with self.assertRaises(CrewError):
-            assert_snapshot_shape(snap)
+            assert_snapshot_shape(_snap([], []), {"AgentInfo": {}, "PaneInfo": {}})
+
+
+class TestAssertSchemaDeclares(unittest.TestCase):
+    def test_declared_optional_fields_pass(self):
+        assert_schema_declares(DEFS)
+
+    def test_renamed_tokens_field_is_caught(self):
+        defs = {"AgentInfo": DEFS["AgentInfo"],
+                "PaneInfo": {"required": ["pane_id"],
+                             "properties": {"metadata": {}, "cwd": {},
+                                            "foreground_cwd": {}}}}
+        with self.assertRaises(CrewError):
+            assert_schema_declares(defs)
+
+    def test_missing_properties_raises(self):
+        with self.assertRaises(CrewError):
+            assert_schema_declares({"PaneInfo": {}, "AgentInfo": {}})
 
 
 class TestRenderLs(unittest.TestCase):
@@ -694,8 +758,10 @@ def render_ls(members, untagged):
 
 
 def cmd_ls(as_json):
+    defs = schema_defs()
+    assert_schema_declares(defs)
     snap = snapshot()
-    assert_snapshot_shape(snap)
+    assert_snapshot_shape(snap, defs)
     members = crew_members(snap)
     if as_json:
         print(json.dumps(members, indent=2, sort_keys=True))
@@ -723,7 +789,7 @@ Wire it into `main`, and make `CrewError` fail closed rather than printing zeros
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 25 tests.
+Expected: PASS, 29 tests.
 
 - [ ] **Step 5: Verify against the live fleet**
 
@@ -1032,7 +1098,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 36 tests.
+Expected: PASS, 40 tests.
 
 - [ ] **Step 5: Verify concurrent writers do not interleave**
 
@@ -1421,7 +1487,7 @@ def cmd_dispatch(key, ctype, repo, model):
     lock_path = os.path.join(CREW_DIR, "dispatch-%s.lock" % sanitize_name(key))
     with _locked(lock_path, "w"):
         snap = snapshot()
-        assert_snapshot_shape(snap)
+        assert_snapshot_shape(snap, schema_defs())
 
         existing = find_member(snap, repo, key)
         if existing:
@@ -1507,7 +1573,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 41 tests.
+Expected: PASS, 45 tests.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -1694,7 +1760,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 45 tests.
+Expected: PASS, 49 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 

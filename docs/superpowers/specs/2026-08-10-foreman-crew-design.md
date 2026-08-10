@@ -73,7 +73,7 @@ herdr 0.7.5, protocol 17, server running. Confirmed against the live socket API 
 | Block until settled | `agent.wait --until idle,done,blocked` | |
 | Peek | `agent.read --source detection\|recent-unwrapped --lines N` | CLI reads do **not** mark a pane seen |
 | Roster and status | `herdr api snapshot` | per-agent `agent_status`, `name`, `cwd`, `foreground_cwd`, `terminal_title_stripped`, `pane_id`, `tab_id`, `workspace_id`, `state_change_seq` |
-| Assignment record | `pane report-metadata <pane> --source crew --token k=v` | persists with `ttl_ms` omitted; round-trips as `tokens`; cleared with `--token k=`; 16 keys max, key pattern `^[A-Za-z0-9_-]{1,32}$`, **values are unconstrained strings** |
+| Assignment record | `pane report-metadata <pane> --source crew --token k=v` | persists with `ttl_ms` omitted; round-trips as `tokens`; cleared with `--token k=`; 32 keys max per pane (a single `report-metadata` call carries at most 16), key pattern `^[A-Za-z0-9_-]{1,32}$`, **values are unconstrained strings** |
 | State-change events | `events.wait --match pane.agent_status_changed` | the watchdog's only input |
 | Notify the human | `notification.show --title --body --sound` | |
 | Run a plain command in a pane | `pane.run`, `pane.wait-output --match\|--regex` | |
@@ -164,7 +164,7 @@ Stateless by derivation, with one exception, and the record is complete.
 | What | Where | Why |
 | --- | --- | --- |
 | Roster, live status | `herdr api snapshot`, recomputed per query | cannot go stale |
-| Assignment: `crew`, `v`, `key`, `repo`, `type`, `worktree`, `dispatched` | herdr pane `tokens` (7 of 16 keys) | authoritative and complete; dies with the pane, so the substrate enforces the lifetime |
+| Assignment: `crew`, `v`, `key`, `repo`, `type`, `worktree`, `dispatched` | herdr pane `tokens` (7 of 32 keys) | authoritative and complete; dies with the pane, so the substrate enforces the lifetime |
 | Mailbox and cursor | `~/.crew/mailbox.jsonl`, `~/.crew/cursor` | the only files; the only genuinely non-derivable state |
 
 **Pane tokens are the authoritative record. Path derivation is not used to decide anything.** An earlier draft had this backwards.
