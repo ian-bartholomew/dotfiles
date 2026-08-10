@@ -148,8 +148,7 @@ def assert_snapshot_shape(snap, defs):
 
 
 def ensure_crew_dir():
-    if not os.path.isdir(CREW_DIR):
-        os.makedirs(CREW_DIR, mode=0o700)
+    os.makedirs(CREW_DIR, mode=0o700, exist_ok=True)
     os.chmod(CREW_DIR, 0o700)
 
 
@@ -407,6 +406,7 @@ def mail_unread():
     ensure_crew_dir()
     if not os.path.exists(MAILBOX):
         print("no mail")
+        print("ack with: crew mail ack 0")
         return 0
     with _locked(MAILBOX, "r") as handle:
         entries, unreadable = read_entries(handle.readlines())
@@ -445,12 +445,7 @@ def mail_ack(seq):
     return 0
 
 
-def main(argv):
-    global DRY_RUN
-    args = list(argv)
-    if "--dry-run" in args:
-        DRY_RUN = True
-        args.remove("--dry-run")
+def _run(args):
     if not args:
         print("usage: crew <doctor|ls|dispatch|peek|nudge|mail> [args]", file=sys.stderr)
         return 2
@@ -458,11 +453,7 @@ def main(argv):
     if verb == "doctor":
         return doctor()
     if verb == "ls":
-        try:
-            return cmd_ls("--json" in args)
-        except (CrewError, HerdrError) as exc:
-            print("SNAPSHOT UNPARSED: %s" % exc, file=sys.stderr)
-            return 3
+        return cmd_ls("--json" in args)
     if verb == "mail":
         sub = args[1] if len(args) > 1 else ""
         if sub == "send":
@@ -490,6 +481,22 @@ def main(argv):
         return 2
     print("unknown verb: %s" % verb, file=sys.stderr)
     return 2
+
+
+def main(argv):
+    global DRY_RUN
+    args = list(argv)
+    if "--dry-run" in args:
+        DRY_RUN = True
+        args.remove("--dry-run")
+    try:
+        return _run(args)
+    except (CrewError, HerdrError) as exc:
+        print("crew: %s" % exc, file=sys.stderr)
+        return 3
+    except ValueError as exc:
+        print("crew: %s" % exc, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

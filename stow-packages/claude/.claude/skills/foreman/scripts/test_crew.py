@@ -317,5 +317,25 @@ class TestSelectUnread(unittest.TestCase):
         self.assertEqual(missing, 0)
 
 
+class TestMainNeverTracebacks(unittest.TestCase):
+    """Crew members invoke `crew mail send` from their own sessions. A
+    traceback there is unreadable to them and loses the message."""
+
+    def test_mail_send_without_a_key_is_a_clean_error(self):
+        with mock.patch.object(crew, "_pane_tokens", return_value={}):
+            self.assertEqual(crew.main(["mail", "send", "done", "x"]), 3)
+
+    def test_herdr_failure_during_send_is_a_clean_error(self):
+        with mock.patch.object(crew, "_pane_tokens",
+                               side_effect=HerdrError("socket gone")):
+            self.assertEqual(crew.main(["mail", "send", "done", "x"]), 3)
+
+    def test_non_integer_ack_seq_is_a_clean_error(self):
+        self.assertEqual(crew.main(["mail", "ack", "twelve"]), 2)
+
+    def test_unknown_verb_returns_two(self):
+        self.assertEqual(crew.main(["teleport"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
