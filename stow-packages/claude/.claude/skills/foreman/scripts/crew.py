@@ -155,18 +155,16 @@ def ensure_crew_dir():
 def doctor():
     problems = []
 
-    try:
-        version = subprocess.run(
-            ["herdr", "--version"], capture_output=True, text=True
-        ).stdout.strip()
+    ok, version = _probe(["herdr", "--version"])
+    if ok:
         print("herdr: %s" % version)
-    except OSError:
-        problems.append("herdr not on PATH")
+    else:
+        problems.append(version)
 
-    try:
-        schema = subprocess.run(
-            ["herdr", "api", "schema"], capture_output=True, text=True
-        ).stdout
+    ok, schema = _probe(["herdr", "api", "schema"])
+    if not ok:
+        problems.append(schema)
+    else:
         found = re.search(r"protocol:\s*(\d+)", schema)
         if not found:
             problems.append("could not read protocol from herdr api schema")
@@ -177,8 +175,6 @@ def doctor():
             )
         else:
             print("protocol: %d" % HERDR_PROTOCOL)
-    except OSError:
-        problems.append("could not run herdr api schema")
 
     try:
         defs = schema_defs()
@@ -189,12 +185,14 @@ def doctor():
     except (CrewError, HerdrError) as exc:
         problems.append(str(exc))
 
-    help_text = subprocess.run(
-        ["claude", "--help"], capture_output=True, text=True
-    ).stdout
-    for flag in ("--append-system-prompt", "--continue", "--model", "--permission-mode"):
-        if flag not in help_text:
-            problems.append("claude CLI is missing %s" % flag)
+    ok, help_text = _probe(["claude", "--help"])
+    if not ok:
+        problems.append(help_text)
+    else:
+        for flag in ("--append-system-prompt", "--continue", "--model",
+                     "--permission-mode"):
+            if flag not in help_text:
+                problems.append("claude CLI is missing %s" % flag)
 
     link = os.path.expanduser("~/.local/bin/crew")
     if not os.path.exists(link):
@@ -222,6 +220,101 @@ def doctor():
     return 0
 
 
+TOKEN_VERSION = "1"
+
+
+def _probe(argv):
+    """Run a read-only external command for doctor. A preflight that crashes
+    cannot report, so every failure mode returns instead of raising."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        return False, "%s not runnable: %s" % (argv[0], exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:120]
+        return False, "%s exited %d: %s" % (argv[0], proc.returncode, detail)
+    text = proc.stdout.strip()
+    if not text:
+        return False, "%s produced no output" % argv[0]
+    return True, text
+
+
+def crew_members(snap):
+    agents_by_pane = dict((a["pane_id"], a) for a in snap["agents"])
+    members = []
+    for pane in snap["panes"]:
+        tokens = pane.get("tokens") or {}
+        if tokens.get("crew") != "true":
+            continue
+        agent = agents_by_pane.get(pane["pane_id"], {})
+        ctype = tokens.get("type", "unknown")
+        if tokens.get("v") != TOKEN_VERSION:
+            ctype = "unknown-v%s" % tokens.get("v", "none")
+        status = agent.get("agent_status", "unknown")
+        members.append({
+            "name": agent.get("name") or "(unnamed)",
+            "key": tokens.get("key", "(no key)"),
+            "repo": tokens.get("repo", "(no repo)"),
+            "type": ctype,
+            "worktree": tokens.get("worktree", ""),
+            "pane": pane["pane_id"],
+            "status": status,
+            "bucket": bucket(status),
+        })
+    members.sort(key=lambda m: (m["repo"], m["key"]))
+    return members
+
+
+def untagged_agents(snap):
+    tagged = set(
+        p["pane_id"] for p in snap["panes"]
+        if (p.get("tokens") or {}).get("crew") == "true"
+    )
+    out = []
+    for agent in snap["agents"]:
+        if agent["pane_id"] in tagged:
+            continue
+        out.append({
+            "pane": agent["pane_id"],
+            "title": agent.get("terminal_title_stripped", ""),
+            "status": agent["agent_status"],
+        })
+    return out
+
+
+def render_ls(members, untagged):
+    counts = {"working": 0, "awaiting": 0, "blocked": 0, "recover": 0}
+    for m in members:
+        counts[m["bucket"]] += 1
+    lines = ["%d working / %d awaiting you / %d blocked" % (
+        counts["working"], counts["awaiting"], counts["blocked"])]
+    if counts["recover"]:
+        lines[0] += " / %d need recovery" % counts["recover"]
+    lines.append("")
+    for m in members:
+        lines.append("  %-10s %-22s %-18s %-12s %s" % (
+            m["bucket"], m["repo"], m["key"], m["type"], m["pane"]))
+    if untagged:
+        lines.append("")
+        lines.append("%d untagged (not crew):" % len(untagged))
+        for u in untagged:
+            lines.append("  %-8s %-10s %s" % (u["status"], u["pane"], u["title"]))
+    return "\n".join(lines)
+
+
+def cmd_ls(as_json):
+    defs = schema_defs()
+    assert_schema_declares(defs)
+    snap = snapshot()
+    assert_snapshot_shape(snap, defs)
+    members = crew_members(snap)
+    if as_json:
+        print(json.dumps(members, indent=2, sort_keys=True))
+    else:
+        print(render_ls(members, untagged_agents(snap)))
+    return 0
+
+
 def main(argv):
     global DRY_RUN
     args = list(argv)
@@ -234,6 +327,12 @@ def main(argv):
     verb = args[0]
     if verb == "doctor":
         return doctor()
+    if verb == "ls":
+        try:
+            return cmd_ls("--json" in args)
+        except (CrewError, HerdrError) as exc:
+            print("SNAPSHOT UNPARSED: %s" % exc, file=sys.stderr)
+            return 3
     print("unknown verb: %s" % verb, file=sys.stderr)
     return 2
 
