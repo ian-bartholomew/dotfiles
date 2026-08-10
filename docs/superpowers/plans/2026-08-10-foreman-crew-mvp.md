@@ -395,18 +395,16 @@ def ensure_crew_dir():
 def doctor():
     problems = []
 
-    try:
-        version = subprocess.run(
-            ["herdr", "--version"], capture_output=True, text=True
-        ).stdout.strip()
+    ok, version = _probe(["herdr", "--version"])
+    if ok:
         print("herdr: %s" % version)
-    except OSError:
-        problems.append("herdr not on PATH")
+    else:
+        problems.append(version)
 
-    try:
-        schema = subprocess.run(
-            ["herdr", "api", "schema"], capture_output=True, text=True
-        ).stdout
+    ok, schema = _probe(["herdr", "api", "schema"])
+    if not ok:
+        problems.append(schema)
+    else:
         found = re.search(r"protocol:\s*(\d+)", schema)
         if not found:
             problems.append("could not read protocol from herdr api schema")
@@ -417,8 +415,6 @@ def doctor():
             )
         else:
             print("protocol: %d" % HERDR_PROTOCOL)
-    except OSError:
-        problems.append("could not run herdr api schema")
 
     try:
         defs = schema_defs()
@@ -429,12 +425,14 @@ def doctor():
     except (CrewError, HerdrError) as exc:
         problems.append(str(exc))
 
-    help_text = subprocess.run(
-        ["claude", "--help"], capture_output=True, text=True
-    ).stdout
-    for flag in ("--append-system-prompt", "--continue", "--model", "--permission-mode"):
-        if flag not in help_text:
-            problems.append("claude CLI is missing %s" % flag)
+    ok, help_text = _probe(["claude", "--help"])
+    if not ok:
+        problems.append(help_text)
+    else:
+        for flag in ("--append-system-prompt", "--continue", "--model",
+                     "--permission-mode"):
+            if flag not in help_text:
+                problems.append("claude CLI is missing %s" % flag)
 
     link = os.path.expanduser("~/.local/bin/crew")
     if not os.path.exists(link):
@@ -536,6 +534,7 @@ The primary UI. It must never print counts it did not measure: a renamed herdr f
 
 - Consumes: `snapshot()`, `assert_snapshot_shape()`, `bucket()`, `CrewError` from Task 2.
 - Produces:
+  - `_probe(argv) -> (bool, str)` running a read-only external command for `doctor`, failing on OSError, a nonzero exit, or empty output
   - `crew_members(snap) -> list` of dicts with keys `name`, `key`, `repo`, `type`, `worktree`, `pane`, `status`, `bucket`
   - `untagged_agents(snap) -> list` of dicts with keys `pane`, `title`, `status`
   - `render_ls(members, untagged) -> str`
@@ -543,7 +542,7 @@ The primary UI. It must never print counts it did not measure: a renamed herdr f
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `test_crew.py`, and extend the import at the top of the file to include `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`:
+Append to `test_crew.py`, and extend the import at the top of the file to include `_probe`, `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`:
 
 ```python
 def _snap(agents, panes):
@@ -657,6 +656,28 @@ class TestAssertSchemaDeclares(unittest.TestCase):
             assert_schema_declares({"PaneInfo": {}, "AgentInfo": {}})
 
 
+class TestProbe(unittest.TestCase):
+    def test_success_returns_output(self):
+        ok, text = _probe(["echo", "hello"])
+        self.assertTrue(ok)
+        self.assertEqual(text, "hello")
+
+    def test_nonzero_exit_fails(self):
+        ok, text = _probe(["false"])
+        self.assertFalse(ok)
+        self.assertIn("exited", text)
+
+    def test_empty_output_fails_rather_than_passing_blank(self):
+        ok, text = _probe(["true"])
+        self.assertFalse(ok)
+        self.assertIn("no output", text)
+
+    def test_missing_binary_fails_without_raising(self):
+        ok, text = _probe(["crew-no-such-binary-xyz"])
+        self.assertFalse(ok)
+        self.assertIn("not runnable", text)
+
+
 class TestRenderLs(unittest.TestCase):
     def test_leads_with_counts(self):
         snap = _snap([_agent("wQ:p1", "working", "fandevx-3511")],
@@ -692,6 +713,22 @@ Add to `crew.py` above `main`:
 
 ```python
 TOKEN_VERSION = "1"
+
+
+def _probe(argv):
+    """Run a read-only external command for doctor. A preflight that crashes
+    cannot report, so every failure mode returns instead of raising."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        return False, "%s not runnable: %s" % (argv[0], exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:120]
+        return False, "%s exited %d: %s" % (argv[0], proc.returncode, detail)
+    text = proc.stdout.strip()
+    if not text:
+        return False, "%s produced no output" % argv[0]
+    return True, text
 
 
 def crew_members(snap):
@@ -789,9 +826,62 @@ Wire it into `main`, and make `CrewError` fail closed rather than printing zeros
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 29 tests.
+Expected: PASS, 33 tests.
 
-- [ ] **Step 5: Verify against the live fleet**
+- [ ] **Step 5: Harden doctor to use `_probe`**
+
+`doctor` currently calls three external commands with ad hoc error handling. Two of them fail badly: `herdr --version` prints an empty version and adds no problem when the binary is on PATH but exits nonzero, and the `claude --help` call has no guard at all, so a missing `claude` crashes `doctor` with a traceback instead of listing problems. A preflight that cannot report is worse than no preflight.
+
+Replace the three call sites in `doctor()` with `_probe`, exactly as shown:
+
+```python
+    ok, version = _probe(["herdr", "--version"])
+    if ok:
+        print("herdr: %s" % version)
+    else:
+        problems.append(version)
+
+    ok, schema = _probe(["herdr", "api", "schema"])
+    if not ok:
+        problems.append(schema)
+    else:
+        found = re.search(r"protocol:\s*(\d+)", schema)
+        if not found:
+            problems.append("could not read protocol from herdr api schema")
+        elif int(found.group(1)) != HERDR_PROTOCOL:
+            problems.append(
+                "herdr protocol is %s, crew expects %d"
+                % (found.group(1), HERDR_PROTOCOL)
+            )
+        else:
+            print("protocol: %d" % HERDR_PROTOCOL)
+```
+
+and
+
+```python
+    ok, help_text = _probe(["claude", "--help"])
+    if not ok:
+        problems.append(help_text)
+    else:
+        for flag in ("--append-system-prompt", "--continue", "--model",
+                     "--permission-mode"):
+            if flag not in help_text:
+                problems.append("claude CLI is missing %s" % flag)
+```
+
+Then prove the crash is gone. Create a stub `herdr` that exits nonzero in a scratch directory and run `doctor` with a PATH that has neither a working herdr nor claude:
+
+```bash
+SCRATCH=$(mktemp -d)
+printf '#!/bin/sh\nexit 1\n' > "$SCRATCH/herdr" && chmod +x "$SCRATCH/herdr"
+PATH="$SCRATCH:/usr/bin:/bin" python3 crew.py doctor; echo "exit=$?"
+rm -rf "$SCRATCH"
+```
+
+Expected: no traceback. A `FAIL` block listing `herdr exited 1: ...` and `claude not runnable: ...`, and `exit=1`.
+
+- [ ] **Step 6: Verify against the live fleet**
 
 ```bash
 crew ls
@@ -800,7 +890,7 @@ crew ls --json | python3 -c "import json,sys; print(len(json.load(sys.stdin)))"
 
 Expected: `0 working / 0 awaiting you / 0 blocked`, then an untagged section listing the currently live agent panes with their titles. `--json` prints `0`. Nothing is tagged yet, which is correct: greenfield only.
 
-- [ ] **Step 6: Verify it fails closed**
+- [ ] **Step 7: Verify it fails closed**
 
 ```bash
 PATH="/tmp/fakeherdr:$PATH"
@@ -813,7 +903,7 @@ rm -rf /tmp/fakeherdr
 
 Expected: prints `SNAPSHOT UNPARSED: ... agent missing agent_status, workspace_id` and `exit=3`. It must not print a zeroed load report.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add stow-packages/claude/.claude/skills/foreman/scripts/
@@ -1098,7 +1188,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 40 tests.
+Expected: PASS, 44 tests.
 
 - [ ] **Step 5: Verify concurrent writers do not interleave**
 
@@ -1573,7 +1663,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 45 tests.
+Expected: PASS, 49 tests.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -1760,7 +1850,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 49 tests.
+Expected: PASS, 53 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 
