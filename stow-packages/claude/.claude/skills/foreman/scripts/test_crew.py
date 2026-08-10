@@ -5,7 +5,8 @@ from unittest import mock
 import crew
 from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
-                   assert_schema_declares, CrewError, HerdrError)
+                   assert_schema_declares, CrewError, HerdrError,
+                   read_entries, next_seq, select_unread)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -244,6 +245,76 @@ class TestRenderLs(unittest.TestCase):
         out = render_ls(crew_members(snap), untagged_agents(snap))
         self.assertIn("1 untagged", out)
         self.assertIn("Align inf-dev", out)
+
+
+class TestReadEntries(unittest.TestCase):
+    def test_parses_valid_lines(self):
+        lines = ['{"seq": 1, "state": "done"}', '{"seq": 2, "state": "done"}']
+        entries, unreadable = read_entries(lines)
+        self.assertEqual([e["seq"] for e in entries], [1, 2])
+        self.assertEqual(unreadable, 0)
+
+    def test_blank_lines_ignored(self):
+        entries, unreadable = read_entries(["", "  ", '{"seq": 1}'])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(unreadable, 0)
+
+    def test_truncated_line_counted_not_fatal(self):
+        lines = ['{"seq": 1}', '{"seq": 2, "msg": "half', '{"seq": 3}']
+        entries, unreadable = read_entries(lines)
+        self.assertEqual([e["seq"] for e in entries], [1, 3])
+        self.assertEqual(unreadable, 1)
+
+    def test_line_without_seq_counted_unreadable(self):
+        entries, unreadable = read_entries(['{"state": "done"}'])
+        self.assertEqual(entries, [])
+        self.assertEqual(unreadable, 1)
+
+
+class TestNextSeq(unittest.TestCase):
+    def test_empty_starts_at_one(self):
+        self.assertEqual(next_seq([]), 1)
+
+    def test_one_past_highest(self):
+        self.assertEqual(next_seq([{"seq": 4}, {"seq": 9}, {"seq": 2}]), 10)
+
+
+class TestSelectUnread(unittest.TestCase):
+    def test_returns_only_records_past_the_cursor(self):
+        entries = [{"seq": 1}, {"seq": 2}, {"seq": 3}]
+        fresh, cursor, missing = select_unread(entries, 1)
+        self.assertEqual([e["seq"] for e in fresh], [2, 3])
+        self.assertEqual(cursor, 3)
+        self.assertEqual(missing, 0)
+
+    def test_gap_advances_the_cursor_and_is_counted(self):
+        # A writer killed mid-append leaves 10 then 12. A contiguous cursor
+        # would stick at 10 forever; this must move past it.
+        entries = [{"seq": 10}, {"seq": 12}]
+        fresh, cursor, missing = select_unread(entries, 9)
+        self.assertEqual([e["seq"] for e in fresh], [10, 12])
+        self.assertEqual(cursor, 12)
+        self.assertEqual(missing, 1)
+
+    def test_gap_does_not_redeliver_on_the_next_call(self):
+        entries = [{"seq": 10}, {"seq": 12}]
+        _, cursor, _ = select_unread(entries, 9)
+        fresh, cursor2, missing = select_unread(entries, cursor)
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor2, 12)
+        self.assertEqual(missing, 0)
+
+    def test_out_of_order_records_sorted(self):
+        entries = [{"seq": 3}, {"seq": 1}, {"seq": 2}]
+        fresh, cursor, _ = select_unread(entries, 0)
+        self.assertEqual([e["seq"] for e in fresh], [1, 2, 3])
+        self.assertEqual(cursor, 3)
+
+    def test_nothing_fresh_leaves_cursor_alone(self):
+        fresh, cursor, missing = select_unread([{"seq": 1}], 5)
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor, 5)
+        self.assertEqual(missing, 0)
 
 
 if __name__ == "__main__":

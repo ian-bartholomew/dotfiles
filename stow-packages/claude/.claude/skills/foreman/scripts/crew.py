@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 HERDR_PROTOCOL = 17
 CREW_DIR = os.path.expanduser("~/.crew")
@@ -318,6 +319,132 @@ def cmd_ls(as_json):
     return 0
 
 
+def _locked(path, mode):
+    handle = open(path, mode)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def read_entries(lines):
+    entries = []
+    unreadable = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+            record["seq"] = int(record["seq"])
+        except (ValueError, KeyError, TypeError):
+            unreadable += 1
+            continue
+        entries.append(record)
+    return entries, unreadable
+
+
+def next_seq(entries):
+    if not entries:
+        return 1
+    return max(e["seq"] for e in entries) + 1
+
+
+def select_unread(entries, cursor):
+    fresh = sorted(
+        [e for e in entries if e["seq"] > cursor], key=lambda e: e["seq"]
+    )
+    if not fresh:
+        return [], cursor, 0
+    top = fresh[-1]["seq"]
+    present = set(e["seq"] for e in fresh)
+    missing = sum(1 for s in range(cursor + 1, top + 1) if s not in present)
+    return fresh, top, missing
+
+
+def _pane_tokens(pane_id):
+    snap = snapshot()
+    for pane in snap["panes"]:
+        if pane["pane_id"] == pane_id:
+            return pane.get("tokens") or {}
+    return {}
+
+
+def mail_send(key, repo, state, msg):
+    ensure_crew_dir()
+    pane_id = os.environ.get("HERDR_PANE_ID", "")
+    tokens = _pane_tokens(pane_id) if pane_id else {}
+    record = {
+        "v": 1,
+        "ts": int(time.time()),
+        "key": key or tokens.get("key", ""),
+        "repo": repo or tokens.get("repo", ""),
+        "pane": pane_id,
+        "worktree": tokens.get("worktree", ""),
+        "state": state,
+        "msg": msg,
+    }
+    if not record["key"]:
+        raise CrewError("mail send needs --key, or a pane carrying a key token")
+    with _locked(MAILBOX, "a+") as handle:
+        handle.seek(0)
+        entries, _ = read_entries(handle.readlines())
+        record["seq"] = next_seq(entries)
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(MAILBOX, 0o600)
+    return 0
+
+
+def _read_cursor():
+    try:
+        with open(CURSOR) as handle:
+            return int(handle.read().strip() or 0)
+    except (IOError, OSError, ValueError):
+        return 0
+
+
+def mail_unread():
+    ensure_crew_dir()
+    if not os.path.exists(MAILBOX):
+        print("no mail")
+        return 0
+    with _locked(MAILBOX, "r") as handle:
+        entries, unreadable = read_entries(handle.readlines())
+    fresh, new_cursor, missing = select_unread(entries, _read_cursor())
+    for record in fresh:
+        print("%s  %-12s %-22s %-12s %s" % (
+            record["seq"], record["state"], record.get("repo", ""),
+            record.get("key", ""), record.get("msg", "")))
+    if not fresh:
+        print("no new mail")
+    if unreadable or missing:
+        print("%d unreadable, %d missing" % (unreadable, missing))
+    print("ack with: crew mail ack %d" % new_cursor)
+    return 0
+
+
+def is_foreman_pane():
+    me = os.environ.get("HERDR_PANE_ID")
+    if not me:
+        return False
+    for agent in snapshot()["agents"]:
+        if agent.get("name") == "foreman":
+            return agent.get("pane_id") == me
+    return False
+
+
+def mail_ack(seq):
+    if not is_foreman_pane():
+        print(
+            "refusing: crew mail ack is foreman-only, and this pane does not "
+            "host the agent named foreman", file=sys.stderr)
+        return 4
+    ensure_crew_dir()
+    with _locked(CURSOR, "w") as handle:
+        handle.write("%d\n" % seq)
+    return 0
+
+
 def main(argv):
     global DRY_RUN
     args = list(argv)
@@ -336,6 +463,31 @@ def main(argv):
         except (CrewError, HerdrError) as exc:
             print("SNAPSHOT UNPARSED: %s" % exc, file=sys.stderr)
             return 3
+    if verb == "mail":
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "send":
+            key = repo = None
+            rest = args[2:]
+            while rest and rest[0] in ("--key", "--repo"):
+                if rest[0] == "--key":
+                    key = rest[1]
+                else:
+                    repo = rest[1]
+                rest = rest[2:]
+            if len(rest) < 2:
+                print("usage: crew mail send [--key K] [--repo R] <state> <msg>",
+                      file=sys.stderr)
+                return 2
+            return mail_send(key, repo, rest[0], " ".join(rest[1:]))
+        if sub == "unread":
+            return mail_unread()
+        if sub == "ack":
+            if len(args) < 3:
+                print("usage: crew mail ack <seq>", file=sys.stderr)
+                return 2
+            return mail_ack(int(args[2]))
+        print("usage: crew mail <send|unread|ack>", file=sys.stderr)
+        return 2
     print("unknown verb: %s" % verb, file=sys.stderr)
     return 2
 
