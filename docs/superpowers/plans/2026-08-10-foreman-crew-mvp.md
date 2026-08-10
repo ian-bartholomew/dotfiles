@@ -94,13 +94,10 @@ git add stow-packages/claude/.claude/skills/herdr/SKILL.md
 
 - [ ] **Step 4: Stow and assert the result**
 
-Stow from the repo root that owns the live symlinks, not from the worktree, because `~/.claude/skills` points into `~/.dotfiles/stow-packages`. Copy the file into the main checkout's stow package as well so the live symlink resolves before the branch merges:
+Claude Code loads skills only from `~/.claude/skills/<name>/SKILL.md`, so a file written in the worktree is invisible until it is linked in. Point the dev symlink at the **worktree**, not the main checkout: nothing outside this worktree is written, and stow repoints it after merge.
 
 ```bash
-mkdir -p ~/.dotfiles/stow-packages/claude/.claude/skills/herdr
-cp stow-packages/claude/.claude/skills/herdr/SKILL.md \
-   ~/.dotfiles/stow-packages/claude/.claude/skills/herdr/SKILL.md
-ln -sfn ../../.dotfiles/stow-packages/claude/.claude/skills/herdr ~/.claude/skills/herdr
+ln -sfn /Users/ian.bartholomew/.dotfiles/.claude/worktrees/foreman-crew-mvp/stow-packages/claude/.claude/skills/herdr ~/.claude/skills/herdr
 
 test ! -e ~/.claude/skills/herdr.md   && echo "OK: flat file gone"
 test -f ~/.claude/skills/herdr/SKILL.md && echo "OK: skill resolves"
@@ -471,10 +468,7 @@ Expected: PASS, 15 tests.
 ```bash
 chmod +x crew.py
 mkdir -p ~/.local/bin
-ln -sfn ~/.dotfiles/stow-packages/claude/.claude/skills/foreman/scripts/crew.py ~/.local/bin/crew
-mkdir -p ~/.dotfiles/stow-packages/claude/.claude/skills/foreman/scripts
-cp crew.py ~/.dotfiles/stow-packages/claude/.claude/skills/foreman/scripts/crew.py
-chmod +x ~/.dotfiles/stow-packages/claude/.claude/skills/foreman/scripts/crew.py
+ln -sfn /Users/ian.bartholomew/.dotfiles/.claude/worktrees/foreman-crew-mvp/stow-packages/claude/.claude/skills/foreman/scripts/crew.py ~/.local/bin/crew
 crew doctor
 ```
 
@@ -1198,11 +1192,7 @@ then `commit-commands:commit-push-pr` and `pr-gate`.
 - [ ] **Step 2: Verify it resolves at the path dispatch will reference**
 
 ```bash
-mkdir -p ~/.dotfiles/stow-packages/claude/.claude/skills/crew-member
-cp stow-packages/claude/.claude/skills/crew-member/SKILL.md \
-   ~/.dotfiles/stow-packages/claude/.claude/skills/crew-member/SKILL.md
-ln -sfn ../../.dotfiles/stow-packages/claude/.claude/skills/crew-member \
-        ~/.claude/skills/crew-member
+ln -sfn /Users/ian.bartholomew/.dotfiles/.claude/worktrees/foreman-crew-mvp/stow-packages/claude/.claude/skills/crew-member ~/.claude/skills/crew-member
 test -f ~/.claude/skills/crew-member/SKILL.md && echo "OK: contract resolves"
 ```
 
@@ -1864,11 +1854,7 @@ is different.
 - [ ] **Step 2: Install and verify it resolves**
 
 ```bash
-mkdir -p ~/.dotfiles/stow-packages/claude/.claude/skills/foreman
-cp stow-packages/claude/.claude/skills/foreman/SKILL.md \
-   ~/.dotfiles/stow-packages/claude/.claude/skills/foreman/SKILL.md
-ln -sfn ../../.dotfiles/stow-packages/claude/.claude/skills/foreman \
-        ~/.claude/skills/foreman
+ln -sfn /Users/ian.bartholomew/.dotfiles/.claude/worktrees/foreman-crew-mvp/stow-packages/claude/.claude/skills/foreman ~/.claude/skills/foreman
 test -f ~/.claude/skills/foreman/SKILL.md && echo "OK: foreman resolves"
 test -x ~/.claude/skills/foreman/scripts/crew.py && echo "OK: script ships with it"
 ```
