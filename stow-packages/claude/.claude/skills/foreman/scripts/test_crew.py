@@ -1,9 +1,11 @@
 """Tests for the pure decision logic in crew.py."""
 import unittest
+from unittest import mock
 
+import crew
 from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
-                   assert_schema_declares, CrewError)
+                   assert_schema_declares, CrewError, HerdrError)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -200,6 +202,27 @@ class TestProbe(unittest.TestCase):
         ok, text = _probe(["crew-no-such-binary-xyz"])
         self.assertFalse(ok)
         self.assertIn("not runnable", text)
+
+    def test_message_names_the_whole_command_not_just_the_binary(self):
+        # doctor probes both `herdr --version` and `herdr api schema`. Labelling
+        # by argv[0] makes two failures byte-identical.
+        ok, text = _probe(["sh", "-c", "exit 3"])
+        self.assertFalse(ok)
+        self.assertIn("sh -c exit 3", text)
+
+
+class TestLsFailsClosed(unittest.TestCase):
+    def test_ls_verb_exits_3_rather_than_reporting_zeros(self):
+        with mock.patch.object(crew, "schema_defs",
+                               side_effect=CrewError("boom")):
+            self.assertEqual(crew.main(["ls"]), 3)
+
+    def test_ls_verb_exits_3_on_a_herdr_error(self):
+        with mock.patch.object(crew, "snapshot",
+                               side_effect=HerdrError("socket gone")), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "assert_schema_declares"):
+            self.assertEqual(crew.main(["ls"]), 3)
 
 
 class TestRenderLs(unittest.TestCase):

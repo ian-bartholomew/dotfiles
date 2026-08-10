@@ -225,17 +225,20 @@ TOKEN_VERSION = "1"
 
 def _probe(argv):
     """Run a read-only external command for doctor. A preflight that crashes
-    cannot report, so every failure mode returns instead of raising."""
+    cannot report, so every failure mode returns instead of raising. The
+    message names the whole command: doctor runs two different herdr probes
+    and argv[0] alone cannot tell them apart."""
+    label = " ".join(argv)
     try:
         proc = subprocess.run(argv, capture_output=True, text=True)
     except OSError as exc:
-        return False, "%s not runnable: %s" % (argv[0], exc)
+        return False, "%s not runnable: %s" % (label, exc)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()[:120]
-        return False, "%s exited %d: %s" % (argv[0], proc.returncode, detail)
+        return False, "%s exited %d: %s" % (label, proc.returncode, detail)
     text = proc.stdout.strip()
     if not text:
-        return False, "%s produced no output" % argv[0]
+        return False, "%s produced no output" % label
     return True, text
 
 
