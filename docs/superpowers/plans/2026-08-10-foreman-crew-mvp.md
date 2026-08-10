@@ -542,7 +542,7 @@ The primary UI. It must never print counts it did not measure: a renamed herdr f
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `test_crew.py`, and extend the import at the top of the file to include `_probe`, `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`:
+Append to `test_crew.py`, and extend the import at the top of the file to include `_probe`, `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`, `HerdrError`. Also add `import crew` and `from unittest import mock` so the CLI wiring can be exercised without a live herdr:
 
 ```python
 def _snap(agents, panes):
@@ -677,6 +677,27 @@ class TestProbe(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("not runnable", text)
 
+    def test_message_names_the_whole_command_not_just_the_binary(self):
+        # doctor probes both `herdr --version` and `herdr api schema`. Labelling
+        # by argv[0] makes two failures byte-identical.
+        ok, text = _probe(["sh", "-c", "exit 3"])
+        self.assertFalse(ok)
+        self.assertIn("sh -c exit 3", text)
+
+
+class TestLsFailsClosed(unittest.TestCase):
+    def test_ls_verb_exits_3_rather_than_reporting_zeros(self):
+        with mock.patch.object(crew, "schema_defs",
+                               side_effect=CrewError("boom")):
+            self.assertEqual(crew.main(["ls"]), 3)
+
+    def test_ls_verb_exits_3_on_a_herdr_error(self):
+        with mock.patch.object(crew, "snapshot",
+                               side_effect=HerdrError("socket gone")), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "assert_schema_declares"):
+            self.assertEqual(crew.main(["ls"]), 3)
+
 
 class TestRenderLs(unittest.TestCase):
     def test_leads_with_counts(self):
@@ -717,17 +738,20 @@ TOKEN_VERSION = "1"
 
 def _probe(argv):
     """Run a read-only external command for doctor. A preflight that crashes
-    cannot report, so every failure mode returns instead of raising."""
+    cannot report, so every failure mode returns instead of raising. The
+    message names the whole command: doctor runs two different herdr probes
+    and argv[0] alone cannot tell them apart."""
+    label = " ".join(argv)
     try:
         proc = subprocess.run(argv, capture_output=True, text=True)
     except OSError as exc:
-        return False, "%s not runnable: %s" % (argv[0], exc)
+        return False, "%s not runnable: %s" % (label, exc)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()[:120]
-        return False, "%s exited %d: %s" % (argv[0], proc.returncode, detail)
+        return False, "%s exited %d: %s" % (label, proc.returncode, detail)
     text = proc.stdout.strip()
     if not text:
-        return False, "%s produced no output" % argv[0]
+        return False, "%s produced no output" % label
     return True, text
 
 
@@ -826,7 +850,7 @@ Wire it into `main`, and make `CrewError` fail closed rather than printing zeros
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 33 tests.
+Expected: PASS, 36 tests.
 
 - [ ] **Step 5: Harden doctor to use `_probe`**
 
@@ -1188,7 +1212,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 44 tests.
+Expected: PASS, 47 tests.
 
 - [ ] **Step 5: Verify concurrent writers do not interleave**
 
@@ -1663,7 +1687,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 49 tests.
+Expected: PASS, 52 tests.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -1850,7 +1874,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 53 tests.
+Expected: PASS, 56 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 
