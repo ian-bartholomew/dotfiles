@@ -564,7 +564,7 @@ The primary UI. It must never print counts it did not measure: a renamed herdr f
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `test_crew.py`, and extend the import at the top of the file to include `_probe`, `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`, `HerdrError`. Also add `import crew` and `from unittest import mock` so the CLI wiring can be exercised without a live herdr:
+Append to `test_crew.py`, and extend the import at the top of the file to include `require_positional`, `worktree_for`, `_probe`, `crew_members`, `untagged_agents`, `render_ls`, `assert_snapshot_shape`, `assert_schema_declares`, `CrewError`, `HerdrError`. Also add `import crew` and `from unittest import mock` so the CLI wiring can be exercised without a live herdr:
 
 ```python
 def _snap(agents, panes):
@@ -794,7 +794,9 @@ def crew_members(snap):
             "key": tokens.get("key", "(no key)"),
             "repo": tokens.get("repo", "(no repo)"),
             "type": ctype,
-            "worktree": tokens.get("worktree", ""),
+            "branch": tokens.get("branch", ""),
+            "worktree": worktree_for(tokens.get("root", ""),
+                                     tokens.get("branch", "")),
             "pane": pane["pane_id"],
             "status": status,
             "bucket": bucket(status),
@@ -1466,7 +1468,8 @@ The largest task. Creates the worktree via an ephemeral setup pane that hands of
 - Consumes: `pick_name()`, `snapshot()`, `crew_members()`, `_locked()`, `herdr()`, `CREW_DIR` from Tasks 2 to 4.
 - Produces:
   - `contract_pointer(name, ctype, key, repo, worktree) -> str`
-  - `tag_pane(pane_id, key, repo, ctype, worktree) -> None`
+  - `tag_pane(pane_id, key, repo, ctype, branch, root) -> None`
+  - `worktree_for(root, branch) -> str`
   - `find_member(snap, repo, key) -> dict or None`
   - `is_ticket(key) -> bool`
   - `plain_worktree(key, repo_root) -> str`
@@ -1516,6 +1519,71 @@ class TestContractPointer(unittest.TestCase):
     def test_no_em_dashes(self):
         out = contract_pointer("a", "implementer", "K", "r", "/w")
         self.assertNotIn("—", out)
+
+
+class TestTokenTruncationIsRefused(unittest.TestCase):
+    """herdr silently truncates a token value at 80 characters. Tokens are the
+    authoritative record, so a truncated value is a record that lies. This was
+    found live: a real worktree path stored as a token pointed at a directory
+    that did not exist."""
+
+    def test_an_over_length_value_raises_rather_than_being_written(self):
+        with mock.patch.object(crew, "herdr") as fake:
+            with self.assertRaises(CrewError):
+                crew.tag_pane("w:p1", "K", "repo", "implementer",
+                              "b" * 81, "/root")
+            fake.assert_not_called()
+
+    def test_a_value_at_the_limit_is_allowed(self):
+        with mock.patch.object(crew, "herdr") as fake:
+            crew.tag_pane("w:p1", "K", "repo", "implementer", "b" * 80, "/root")
+            fake.assert_called_once()
+
+    def test_the_error_names_the_offending_token(self):
+        with mock.patch.object(crew, "herdr"):
+            try:
+                crew.tag_pane("w:p1", "K", "repo", "implementer",
+                              "b" * 100, "/root")
+            except CrewError as exc:
+                self.assertIn("branch", str(exc))
+            else:
+                self.fail("expected CrewError")
+
+
+class TestWorktreeFor(unittest.TestCase):
+    def test_derives_from_root_and_branch(self):
+        self.assertEqual(
+            worktree_for("/repo", "FANDEVX-1-x"),
+            "/repo/.claude/worktrees/FANDEVX-1-x")
+
+    def test_empty_when_either_is_missing(self):
+        self.assertEqual(worktree_for("", "b"), "")
+        self.assertEqual(worktree_for("/repo", ""), "")
+
+    def test_a_real_ticket_path_would_have_been_truncated_if_stored(self):
+        # The reason the path is derived rather than stored.
+        path = worktree_for(
+            "/Users/someone/Dev/fanapp-terraform",
+            "FANDEVX-3511-github-oidc-repository-claim-trust-policies")
+        self.assertGreater(len(path), crew.TOKEN_VALUE_MAX)
+        self.assertLessEqual(len("FANDEVX-3511-github-oidc-repository-claim-"
+                                 "trust-policies"), crew.TOKEN_VALUE_MAX)
+
+
+class TestRequirePositional(unittest.TestCase):
+    """`crew dispatch --help` dispatched a live Opus session named "help"
+    because a flag was accepted where a positional key belongs."""
+
+    def test_a_flag_is_rejected(self):
+        with self.assertRaises(CrewError):
+            require_positional("--help", "key")
+
+    def test_none_is_rejected(self):
+        with self.assertRaises(CrewError):
+            require_positional(None, "key")
+
+    def test_a_real_value_passes_through(self):
+        self.assertEqual(require_positional("FANDEVX-1", "key"), "FANDEVX-1")
 
 
 class TestKeyCaseIsConsistent(unittest.TestCase):
@@ -1643,6 +1711,15 @@ SETUP_PROMPT = (
 )
 
 
+def require_positional(value, what):
+    """A --flag where a positional belongs is a typo, not a value. Accepting
+    one cost a live Opus session when `crew dispatch --help` dispatched a crew
+    member named "help"."""
+    if value is None or value.startswith("-"):
+        raise CrewError("%s must be a value, not a flag: got %r" % (what, value))
+    return value
+
+
 def take_flag(rest, names):
     """Pull `--flag value` off the front of rest. Reports a missing value
     rather than raising IndexError at a crew member."""
@@ -1663,7 +1740,24 @@ def contract_pointer(name, ctype, key, repo, worktree):
     )
 
 
-def tag_pane(pane_id, key, repo, ctype, worktree):
+TOKEN_VALUE_MAX = 80
+
+
+def worktree_for(root, branch):
+    """Derive the worktree path from two short tokens rather than storing the
+    path itself. herdr truncates a token VALUE at 80 characters and a real
+    worktree path exceeds that, so storing the path produced an authoritative
+    record pointing at a directory that does not exist.
+
+    The repo ROOT is stored rather than resolved from the repo name, because a
+    repo is not necessarily under ~/Dev: this project is itself built inside a
+    worktree of the dotfiles repo."""
+    if not root or not branch:
+        return ""
+    return os.path.join(root, ".claude", "worktrees", branch)
+
+
+def tag_pane(pane_id, key, repo, ctype, branch, root):
     args = [
         "pane", "report-metadata", pane_id, "--source", "crew",
         "--token", "crew=true",
@@ -1673,8 +1767,22 @@ def tag_pane(pane_id, key, repo, ctype, worktree):
         "--token", "type=%s" % ctype,
         "--token", "dispatched=%d" % int(time.time()),
     ]
-    if worktree:
-        args += ["--token", "worktree=%s" % worktree]
+    if branch:
+        args += ["--token", "branch=%s" % branch]
+    if root:
+        args += ["--token", "root=%s" % root]
+
+    # herdr silently truncates a token VALUE at 80 characters. Tokens are the
+    # authoritative record here, so a truncated value is a record that lies.
+    # Refuse to write one rather than discover it later.
+    for i in range(0, len(args)):
+        if args[i] == "--token":
+            name, _, value = args[i + 1].partition("=")
+            if len(value) > TOKEN_VALUE_MAX:
+                raise CrewError(
+                    "token %s is %d chars, over herdr's %d limit, and would be "
+                    "silently truncated: %r"
+                    % (name, len(value), TOKEN_VALUE_MAX, value))
     herdr(*args)
 
 
@@ -1754,7 +1862,7 @@ def setup_worktree(key, repo, repo_root):
     split = herdr("pane", "split", "--current", "--direction", "down",
                   "--cwd", repo_root, "--no-focus")
     setup_pane = DRY_PANE if split is None else split["result"]["pane"]["pane_id"]
-    tag_pane(setup_pane, key, repo, "setup", "")
+    tag_pane(setup_pane, key, repo, "setup", "", repo_root)
 
     setup_name = ("setup-" + sanitize_name(key))[:32]
     herdr("agent", "start", setup_name, "--kind", "claude",
@@ -1825,7 +1933,8 @@ def cmd_dispatch(key, ctype, repo, model):
         # Tag before agent.start. Tokens are authoritative, so an untagged
         # pane is invisible to ls; a tag that failed afterwards would leave a
         # live session unowned and burning shared quota.
-        tag_pane(pane, key, repo, ctype, worktree)
+        tag_pane(pane, key, repo, ctype, os.path.basename(worktree),
+                 repo_root)
 
         live = set(a.get("name") for a in snap["agents"] if a.get("name"))
         name = pick_name(key, live)
@@ -1873,7 +1982,7 @@ Wire into `main`:
             print("usage: crew dispatch <key> --type T [--repo R] [--model M]",
                   file=sys.stderr)
             return 2
-        key = args[1]
+        key = require_positional(args[1], "dispatch key")
         opts = {"--type": "implementer", "--repo": None, "--model": None}
         rest = args[2:]
         while rest:
