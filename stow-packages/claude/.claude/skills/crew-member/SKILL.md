@@ -32,8 +32,13 @@ never arrived.
 This is your only obligation to the fleet. Silence is a bug.
 
 You cannot report `blocked` yourself. If you are stopped at a permission
-prompt you are mid-turn and cannot run anything; a watchdog reports that
-from outside. Do not try to pre-announce it.
+prompt you are mid-turn and cannot run anything, and nothing reports that
+state from outside yet: there is no watchdog. Do not try to pre-announce it.
+
+The same is true if your process dies outright (OOM, a signal, a crash): that
+does not read as idle forever. Your pane loses its agent, and `crew ls`
+buckets an agent-less pane to `recover`, not `awaiting`, so the foreman can
+tell the difference.
 
 Never put command output, credentials, ARNs, account ids, tokens, hostnames,
 IP addresses, stack traces or file contents in a mail line. State plus one

@@ -18,6 +18,14 @@ Arguments are the tickets to work, space separated:
 /start-crew spike-cassandra-tombstones
 ```
 
+Parse these strictly: a token that does not start with `-` is a key, and
+`--type X` applies to every key given, not just the one before it. In the
+second example above, `planner` is the VALUE of `--type`, not a second key;
+dispatching it as one starts a paid session on a branch named `planner`,
+because `planner` is otherwise a perfectly valid slug. A token that looks
+like a flag but is not recognised is an error worth stopping on, not
+something to guess your way past.
+
 **One ticket per crew member. Never an epic, never a subtask.** Subtasks are a
 crew member's own to-do list. An epic is the container you pick stories from,
 and decomposing it is `/decompose-ticket`, which runs BEFORE this skill and not
@@ -68,22 +76,32 @@ session. The parts that matter most, so they are not lost:
 
 ## Step 4: Dispatch, one per ticket
 
+`crew dispatch` defaults `--repo` to the repo you are running in, which is the
+foreman's own. A key for any other repository needs `--repo` explicitly, or
+the dispatch lands in the wrong repository and its tokens disagree with the
+worktree `/start-ticket` actually made, so `find_member` cannot see the
+result and a retry spends a second paid session. If the user did not say
+which repo a key belongs to, ask before dispatching it.
+
 For each key given, in order:
 
 ```bash
-crew dispatch <KEY> --type implementer
+crew dispatch <KEY> --type implementer --repo <repo-name>
 ```
 
 Use `--type planner` for a ticket the user says is underspecified, and
 `--type reviewer` for a finished chunk that needs review. Default to
 `implementer` when the user did not say.
 
-For a JIRA key this opens a short-lived setup pane where `/start-ticket` runs
-interactively. **Tell the user to answer it in that pane.** Do not answer it for
-them, and do not run `/start-ticket` yourself: it pulls a whole ticket payload
-into your context, once per dispatch, which is the accumulation you exist to
-avoid. A free-form slug has no ticket to fetch, so no setup pane appears and
-nothing needs answering.
+For a JIRA key this returns immediately with exit 7 and opens a short-lived
+setup pane where `/start-ticket` runs interactively. **Tell the user to answer
+it in that pane.** Do not answer it for them, and do not run `/start-ticket`
+yourself: it pulls a whole ticket payload into your context, once per
+dispatch, which is the accumulation you exist to avoid. Once they have
+answered it, re-run the exact same `crew dispatch` command to finish: it
+picks up the artifact `/start-ticket` wrote and completes without opening a
+second setup pane. A free-form slug has no ticket to fetch, so no setup pane
+appears, nothing needs answering, and dispatch completes in this one call.
 
 Handle these exit codes rather than retrying blindly:
 
@@ -91,7 +109,8 @@ Handle these exit codes rather than retrying blindly:
 | --- | --- | --- |
 | 0 | dispatched | continue to the next key |
 | 5 | a live session already holds this key | report the resume command it printed; do NOT dispatch again |
-| 6 | started but never reacted, delivery unconfirmed | the pane is tagged and visible; suggest `crew nudge <name>` |
+| 6 | started but never reacted, delivery unconfirmed | the pane is tagged and visible; suggest `crew nudge <name> "<text>"` |
+| 7 | setup is pending on a JIRA key | tell the user to answer the prompt in the named pane, then re-run the exact same dispatch command |
 | 3 | a herdr, crew or filesystem error | report the message and stop |
 
 ## Step 5: Report and hand back
@@ -125,8 +144,10 @@ Suggest `/decompose-ticket` first.
 Say these only if relevant, and only once per session:
 
 - **Nothing pings them.** There is no watchdog yet, so a crew member stopped at
-  a permission prompt sits silently and a crew member killed by the OS reads as
-  idle forever. Status has to be asked for.
+  a permission prompt sits silently, and status has to be asked for. A crew
+  member killed by the OS does not read as idle forever: its pane loses its
+  agent, `crew ls` buckets it to `recover`, and the report shows "need
+  recovery".
 - **The guard hook needs a fresh session to take effect.** If `crew-guard` was
   installed during this session, it is not live until `/hooks` is opened or
   Claude restarts. Until then nothing stops a crew member dispatching more paid
