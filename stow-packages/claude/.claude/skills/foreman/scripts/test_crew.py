@@ -1,4 +1,5 @@
 """Tests for the pure decision logic in crew.py."""
+import io
 import os
 import unittest
 from unittest import mock
@@ -577,6 +578,27 @@ class TestMainErrorMapping(unittest.TestCase):
     def test_os_error_from_a_verb_exits_three_not_a_traceback(self):
         with mock.patch.object(crew, "_run", side_effect=OSError("boom")):
             self.assertEqual(crew.main(["peek", "x"]), 3)
+
+
+class TestMainErrorPrefixesAreDistinct(unittest.TestCase):
+    """Four exception classes used to collapse onto the same `crew: `
+    prefix, so a herdr failure, a crew error, a bad argument and a
+    filesystem error were indistinguishable in output. Exit codes already
+    cover the classification; this asserts on the message itself."""
+
+    def _stderr_for(self, side_effect):
+        buf = io.StringIO()
+        with mock.patch.object(crew, "_run", side_effect=side_effect), \
+             mock.patch.object(crew.sys, "stderr", buf):
+            crew.main(["peek", "x"])
+        return buf.getvalue()
+
+    def test_herdr_and_bad_argument_prefixes_differ(self):
+        herdr_msg = self._stderr_for(HerdrError("boom"))
+        arg_msg = self._stderr_for(ValueError("boom"))
+        self.assertIn("herdr:", herdr_msg)
+        self.assertIn("bad arguments:", arg_msg)
+        self.assertNotEqual(herdr_msg, arg_msg)
 
 
 if __name__ == "__main__":

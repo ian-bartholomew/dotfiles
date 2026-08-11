@@ -811,12 +811,18 @@ def main(argv):
         args.remove("--dry-run")
     try:
         return _run(args)
-    except (CrewError, HerdrError, OSError) as exc:
+    except HerdrError as exc:
+        print("crew: herdr: %s" % exc, file=sys.stderr)
+        return 3
+    except CrewError as exc:
         print("crew: %s" % exc, file=sys.stderr)
         return 3
     except (ValueError, IndexError) as exc:
-        print("crew: %s" % exc, file=sys.stderr)
+        print("crew: bad arguments: %s" % exc, file=sys.stderr)
         return 2
+    except OSError as exc:
+        print("crew: filesystem: %s" % exc, file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
