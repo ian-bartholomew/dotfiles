@@ -1,4 +1,5 @@
 """Tests for the pure decision logic in crew.py."""
+import os
 import unittest
 from unittest import mock
 
@@ -8,7 +9,7 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    assert_schema_declares, CrewError, HerdrError,
                    read_entries, next_seq, select_unread,
                    contract_pointer, find_member, is_ticket, take_flag,
-                   _start_agent)
+                   _start_agent, resolve_repo, repo_root_for)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -356,6 +357,34 @@ class TestContractPointer(unittest.TestCase):
         self.assertNotIn("—", out)
 
 
+class TestKeyCaseIsConsistent(unittest.TestCase):
+    """One dispatch must not tell a crew member two different keys."""
+
+    def test_contract_pointer_uses_the_sanitised_key(self):
+        out = contract_pointer("fandevx-3511", "implementer", "FANDEVX-3511",
+                               "r", "/w")
+        self.assertIn("--key fandevx-3511", out)
+        self.assertNotIn("--key FANDEVX-3511", out)
+
+
+class TestResolveRepo(unittest.TestCase):
+    def test_no_argument_uses_the_cwd_repo(self):
+        root, name = resolve_repo(None)
+        self.assertTrue(os.path.isdir(root))
+        self.assertEqual(name, os.path.basename(root))
+
+    def test_unresolvable_name_is_an_error_not_a_relabel(self):
+        with mock.patch.object(crew, "DEV_ROOT", "/no-such-dev-root"):
+            with self.assertRaises(CrewError):
+                resolve_repo("not-a-real-repo")
+
+    def test_name_comes_from_the_directory_not_the_argument(self):
+        root = repo_root_for(os.getcwd())
+        with mock.patch.object(crew, "DEV_ROOT", os.path.dirname(root)):
+            _, name = resolve_repo(os.path.basename(root))
+        self.assertEqual(name, os.path.basename(root))
+
+
 class TestIsTicket(unittest.TestCase):
     def test_jira_key(self):
         self.assertTrue(is_ticket("FANDEVX-3511"))
@@ -473,8 +502,8 @@ class TestDispatchConfirmsDelivery(unittest.TestCase):
         return fake
 
     def _dispatch(self, wait_error=None):
-        with mock.patch.object(crew, "repo_root_for",
-                               return_value="/fake/repo"), \
+        with mock.patch.object(crew, "resolve_repo",
+                               return_value=("/fake/repo", "dispatch-test")), \
              mock.patch.object(crew, "plain_worktree",
                                return_value="/fake/repo/.claude/worktrees/x"), \
              mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \

@@ -374,7 +374,7 @@ def mail_send(key, repo, state, msg):
     record = {
         "v": 1,
         "ts": int(time.time()),
-        "key": key or tokens.get("key", ""),
+        "key": sanitize_name(key) if key else tokens.get("key", ""),
         "repo": repo or tokens.get("repo", ""),
         "pane": pane_id,
         "worktree": tokens.get("worktree", ""),
@@ -531,7 +531,7 @@ def contract_pointer(name, ctype, key, repo, worktree):
         "You are crew member `%s`, type %s, on %s in repo %s, worktree %s. "
         "Read %s now and follow it for the rest of this session. "
         "Report state changes with `crew mail send --key %s`."
-        % (name, ctype, key, repo, worktree, CONTRACT_PATH, key)
+        % (name, ctype, key, repo, worktree, CONTRACT_PATH, sanitize_name(key))
     )
 
 
@@ -556,6 +556,26 @@ def find_member(snap, repo, key):
         if member["repo"] == repo and member["key"] == wanted:
             return member
     return None
+
+
+DEV_ROOT = os.path.expanduser("~/Dev")
+
+
+def resolve_repo(repo_arg):
+    """--repo names a LOCATION, not just a label. The repo token is
+    authoritative, so it must never be able to disagree with the worktree it
+    describes. The name always comes from the resolved directory."""
+    if not repo_arg:
+        root = repo_root_for(os.getcwd())
+        return root, os.path.basename(root)
+    candidate = repo_arg
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(DEV_ROOT, repo_arg)
+    if not os.path.isdir(candidate):
+        raise CrewError("--repo %s does not resolve to a directory (tried %s)"
+                        % (repo_arg, candidate))
+    root = repo_root_for(candidate)
+    return root, os.path.basename(root)
 
 
 def repo_root_for(path):
@@ -659,8 +679,7 @@ def cmd_dispatch(key, ctype, repo, model):
     if not workspace:
         raise CrewError("dispatch must run inside a herdr pane")
 
-    repo_root = repo_root_for(os.getcwd())
-    repo = repo or os.path.basename(repo_root)
+    repo_root, repo = resolve_repo(repo)
     model = model or MODEL_BY_TYPE[ctype]
 
     ensure_crew_dir()
