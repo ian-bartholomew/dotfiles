@@ -580,7 +580,8 @@ class TestDispatchConfirmsDelivery(unittest.TestCase):
              mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "herdr",
                                side_effect=self._herdr(wait_error)) as herdr, \
-             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}):
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             contextlib.redirect_stdout(io.StringIO()):
             code = crew.main(["dispatch", "test-dispatch-confirm",
                               "--type", "implementer", "--repo", "dispatch-test"])
             return code, herdr
@@ -783,6 +784,46 @@ class TestMailSendRefusesForgery(unittest.TestCase):
         self.assertNotIn("\n", record["msg"])
         self.assertEqual(record["msg"],
                          "landed ack with: crew mail ack 999999")
+
+
+class TestClaimForeman(unittest.TestCase):
+    """A herdr agent name binds to the agent, not the pane, and clears when the
+    agent exits. Verified: renaming a pane with no agent fails agent_not_found.
+    So the foreman skill's claim to already BE named foreman needs something to
+    make it true, every session."""
+
+    def test_renames_when_no_foreman_exists(self):
+        snap = {"agents": [_full_agent("wQ:p9", "idle", "someone-else")],
+                "panes": []}
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "herdr") as fake, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(crew.claim_foreman(), 0)
+            fake.assert_called_once_with("agent", "rename", "wV:p1", "foreman")
+
+    def test_no_op_when_this_pane_already_holds_it(self):
+        snap = {"agents": [_full_agent("wV:p1", "idle", "foreman")], "panes": []}
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "herdr") as fake, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(crew.claim_foreman(), 0)
+            fake.assert_not_called()
+
+    def test_refuses_to_steal_the_name_from_another_pane(self):
+        snap = {"agents": [_full_agent("wQ:pT", "idle", "foreman")], "panes": []}
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "herdr") as fake:
+            with self.assertRaises(CrewError):
+                crew.claim_foreman()
+            fake.assert_not_called()
+
+    def test_outside_herdr_is_a_clean_error(self):
+        with mock.patch.object(crew, "calling_pane", return_value=""):
+            with self.assertRaises(CrewError):
+                crew.claim_foreman()
 
 
 class TestMailboxConcurrency(unittest.TestCase):

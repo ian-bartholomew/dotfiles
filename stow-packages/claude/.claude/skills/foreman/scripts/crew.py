@@ -492,6 +492,37 @@ def is_foreman_pane():
     return False
 
 
+def claim_foreman():
+    """Make this pane the foreman, or explain why it cannot be.
+
+    Needed because a herdr agent name binds to the AGENT occupying a pane, not
+    to the pane, and is cleared when that agent exits. Verified: renaming a pane
+    that holds no agent fails with agent_not_found. So the name cannot be set
+    before the session starts, and it evaporates on /clear or a restart.
+
+    Without this, the foreman skill's claim that "you are the agent named
+    foreman" is simply false, and `crew mail ack` refuses with exit 4 while the
+    same mail is reported over and over."""
+    me = calling_pane()
+    if not me:
+        raise CrewError("not running inside a herdr pane, so there is no pane "
+                        "to name. Start the foreman inside herdr.")
+    for agent in snapshot()["agents"]:
+        if agent.get("name") != "foreman":
+            continue
+        if agent.get("pane_id") == me:
+            print("already the foreman (%s)" % me)
+            return 0
+        raise CrewError(
+            "pane %s is already the foreman. herdr allows one live agent per "
+            "name, and this design allows one foreman. Use that pane, or rename "
+            "it first." % agent.get("pane_id"))
+    herdr("agent", "rename", me, "foreman")
+    print("claimed foreman on %s. The name is cleared if this agent exits, so "
+          "re-run this after a /clear or restart." % me)
+    return 0
+
+
 def mail_ack(seq):
     if not is_foreman_pane():
         print(
@@ -510,11 +541,13 @@ def mail_ack(seq):
 
 def _run(args):
     if not args:
-        print("usage: crew <doctor|ls|dispatch|peek|nudge|mail> [args]", file=sys.stderr)
+        print("usage: crew <doctor|claim-foreman|ls|dispatch|peek|nudge|mail> [args]", file=sys.stderr)
         return 2
     verb = args[0]
     if verb == "doctor":
         return doctor()
+    if verb == "claim-foreman":
+        return claim_foreman()
     if verb == "ls":
         return cmd_ls("--json" in args)
     if verb == "dispatch":

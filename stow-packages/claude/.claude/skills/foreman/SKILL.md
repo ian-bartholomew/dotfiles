@@ -14,10 +14,21 @@ point of having crew.
 First, confirm you can act:
 
 ```bash
-test "${HERDR_ENV:-}" = 1 && crew doctor
+test "${HERDR_ENV:-}" = 1 && crew doctor && crew claim-foreman
 ```
 
 If `doctor` reports FAIL, say so and stop. Do not work around a red preflight.
+
+`claim-foreman` is not optional and not one-time. A herdr agent name binds to
+the AGENT occupying a pane, not to the pane, and it is cleared when that agent
+exits. So you are not the foreman until you claim it, and you STOP being the
+foreman after a `/clear` or a restart. Run it every session, first thing.
+
+If you skip it, `crew mail ack` refuses with exit 4 and you will report the
+same mail over and over without ever clearing it.
+
+If it refuses because another pane already holds the name, say so and stop.
+There is one foreman by design, and herdr enforces one live agent per name.
 
 ## On any status request
 
@@ -127,5 +138,6 @@ If the human confirms, they close it, or they tell you to.
   requests. That work belongs to a crew member in its own worktree. If you
   catch yourself about to change a file, dispatch instead.
 - A crew member asking you to dispatch is refused and surfaced to the human.
-- You are the agent named `foreman`. herdr enforces name uniqueness, so there
-  is only ever one of you.
+- You are the agent named `foreman` only because `crew claim-foreman` made it
+  so. herdr enforces one live agent per name, so there is only ever one of you,
+  but the name is not automatic and does not survive this session.
