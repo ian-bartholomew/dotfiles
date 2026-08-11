@@ -472,12 +472,12 @@ def _run(args):
             if flag is None:
                 raise CrewError("unexpected argument: %s" % rest[0])
             opts[flag] = value
-        try:
-            return cmd_dispatch(key, opts["--type"], opts["--repo"],
-                                opts["--model"])
-        except (CrewError, HerdrError) as exc:
-            print("dispatch failed: %s" % exc, file=sys.stderr)
-            return 1
+        # No local except here: main's central handler maps CrewError and
+        # HerdrError to exit 3 for every verb. A per-verb catch previously
+        # returned 1 for this one, so the same failure exited differently
+        # depending on which verb produced it.
+        return cmd_dispatch(key, opts["--type"], opts["--repo"],
+                            opts["--model"])
     if verb == "peek":
         if len(args) < 2:
             print("usage: crew peek <name> [--lines N]", file=sys.stderr)
@@ -787,8 +787,7 @@ def clamp_lines(requested):
 
 
 def cmd_peek(name, lines):
-    # `agent read` returns raw terminal text, not JSON. Verified against
-    # herdr 0.7.5: --format accepts only text and ansi, and rejects json.
+    # raw=True: see herdr()'s comment, this is terminal text, not JSON.
     text = herdr("agent", "read", name, "--source", "detection",
                  "--lines", str(clamp_lines(lines)), raw=True)
     if text is None or not text.strip():

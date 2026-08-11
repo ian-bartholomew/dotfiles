@@ -521,6 +521,18 @@ class TestDispatchConfirmsDelivery(unittest.TestCase):
             self._dispatch(wait_error=HerdrError("timeout")), 6)
 
 
+class TestDispatchExitCodeMatchesOtherVerbs(unittest.TestCase):
+    """dispatch used to catch CrewError/HerdrError itself and return 1,
+    while every other verb relies on main's central handler and returns 3
+    for the same exception classes. Same failure, different exit code
+    depending on which verb produced it."""
+
+    def test_crew_error_from_dispatch_exits_three_like_every_other_verb(self):
+        with mock.patch.object(crew, "cmd_dispatch",
+                               side_effect=CrewError("boom")):
+            self.assertEqual(crew.main(["dispatch", "k"]), 3)
+
+
 class TestHerdrRawMode(unittest.TestCase):
     """`agent read` returns terminal text, not JSON. Without raw mode the
     JSON parse raises and every peek fails."""
