@@ -30,6 +30,8 @@ The claim being tested is that naming and tracking sessions changes behaviour. I
 
 Baseline, 2026-08-10: six live agent sessions, five carrying no name, spread over three workspaces. Zero are attributable to a ticket without opening them.
 
+Second measurement, 2026-08-11, taken from the finished tool: `0 working / 0 awaiting you / 0 blocked`, with three untagged sessions and zero tagged crew. Note what that comparison shows: the untagged count fell from five to three purely through ordinary work, with none of it attributable to this tooling. **A point-in-time count is therefore a weak metric.** The signal that actually matters is the first row of the table below, whether NEW sessions arrive dispatched-and-tagged or started by hand, and it must be read as a rate rather than a level.
+
 Review on 2026-08-24. Measured from the mailbox (never pruned) and a `crew ls` snapshot:
 
 | Signal | Source | Success | Falsified |
