@@ -13,7 +13,11 @@ import subprocess
 import sys
 import time
 
-HERDR_PROTOCOL = 17
+# Protocols whose behaviour has been MEASURED, not assumed. herdr self-updates,
+# so this will go stale: 0.7.5 shipped 17 and 0.8.0 shipped 19 mid-build. Do not
+# add a number without re-running the drift checks in the spec, because the
+# design rests on five measured behaviours, not on documented ones.
+HERDR_VERIFIED_PROTOCOLS = (17, 19)
 CREW_DIR = os.path.expanduser("~/.crew")
 MAILBOX = os.path.join(CREW_DIR, "mailbox.jsonl")
 CURSOR = os.path.join(CREW_DIR, "cursor")
@@ -175,13 +179,19 @@ def doctor():
         found = re.search(r"protocol:\s*(\d+)", schema)
         if not found:
             problems.append("could not read protocol from herdr api schema")
-        elif int(found.group(1)) != HERDR_PROTOCOL:
+        elif int(found.group(1)) not in HERDR_VERIFIED_PROTOCOLS:
             problems.append(
-                "herdr protocol is %s, crew expects %d"
-                % (found.group(1), HERDR_PROTOCOL)
+                "herdr protocol %s has not been verified against crew "
+                "(verified: %s). herdr self-updates, so this is expected "
+                "eventually. Re-run the drift checks in the spec's Verified "
+                "substrate section, then add %s to HERDR_VERIFIED_PROTOCOLS. "
+                "Do not just add the number."
+                % (found.group(1), ", ".join(str(n) for n in
+                                             HERDR_VERIFIED_PROTOCOLS),
+                   found.group(1))
             )
         else:
-            print("protocol: %d" % HERDR_PROTOCOL)
+            print("protocol: %s (verified)" % found.group(1))
 
     try:
         defs = schema_defs()

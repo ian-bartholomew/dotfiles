@@ -99,6 +99,44 @@ Constraints that matter:
 
 Claude Code CLI flags available for passthrough, confirmed via `claude --help`: `--append-system-prompt`, `--model`, `--permission-mode`, `--session-id`, `--resume`, `--fallback-model`.
 
+### Drift check: what to re-measure when herdr updates
+
+herdr self-updates. It went from 0.7.5 (protocol 17) to 0.8.0 (protocol 19)
+during this build, and `crew doctor` failed closed on the mismatch, which is
+what it is for.
+
+`HERDR_VERIFIED_PROTOCOLS` in `crew.py` is a set of protocols whose behaviour
+has been MEASURED. Adding a number without re-measuring defeats the point,
+because this design rests on five behaviours that are not documented anywhere
+except here. Re-run all five, then add the number:
+
+1. **Token value truncation.** Write an 80 character token value and a 100
+   character one, read both back from `api snapshot`, compare lengths. Expect
+   80 intact and 100 stored as 80.
+2. **`agent read` returns text, not JSON.** Read a live pane and confirm the
+   output is terminal text. Confirm `--format json` is rejected with
+   `invalid read format: json`.
+3. **`--until` is repeated, not comma joined.** `agent wait <t> --until
+   working,idle` must be rejected with `invalid agent status`.
+4. **Required snapshot fields.** Compare `AgentInfo.required` and
+   `PaneInfo.required` from `api schema --json` against what
+   `assert_snapshot_shape` expects, and confirm `tokens` is still declared but
+   still NOT required.
+5. **Caller identity.** Confirm the caller's pane comes from `HERDR_PANE_ID`,
+   and that stripping it makes herdr report the UI-FOCUSED pane instead. This
+   check is only meaningful when the focused pane is NOT the caller. If they
+   happen to be the same pane the result is inconclusive, and saying so is the
+   correct outcome: reading a coincidence as a pass is how the original
+   caller-identity defect was introduced.
+
+Also confirm every verb `crew` calls still exists, by reading `herdr agent`,
+`herdr pane` and `herdr tab` with no subcommand.
+
+Measured on 2026-08-11 against protocol 19: checks 1 to 4 identical to 17, the
+full verb surface intact, and check 5 inconclusive because the focused pane was
+the caller. So 19 is verified for everything the code depends on, with that one
+gap recorded rather than papered over.
+
 ### Agent status vocabulary
 
 herdr reports five states, and one distinction is load-bearing:
