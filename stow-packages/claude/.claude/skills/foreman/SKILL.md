@@ -14,10 +14,18 @@ point of having crew.
 First, confirm you can act:
 
 ```bash
-test "${HERDR_ENV:-}" = 1 && crew doctor && crew claim-foreman
+test "${HERDR_ENV:-}" = 1 || echo "not inside a herdr pane"
+crew doctor
+crew claim-foreman
 ```
 
-If `doctor` reports FAIL, say so and stop. Do not work around a red preflight.
+Run these as separate commands, not chained with `&&`: a chain prints nothing
+and simply exits when the first link fails, which reads as nothing happening
+rather than as a stop-worthy failure.
+
+If not inside herdr, stop: there is no pane to name and no fleet to dispatch
+into. If `doctor` reports FAIL, say so and stop. Do not work around a red
+preflight.
 
 `claim-foreman` is not optional and not one-time. A herdr agent name binds to
 the AGENT occupying a pane, not to the pane, and it is cleared when that agent
@@ -27,8 +35,10 @@ foreman after a `/clear` or a restart. Run it every session, first thing.
 If you skip it, `crew mail ack` refuses with exit 4 and you will report the
 same mail over and over without ever clearing it.
 
-If it refuses because another pane already holds the name, say so and stop.
-There is one foreman by design, and herdr enforces one live agent per name.
+If `claim-foreman` fails for any reason, report the message and stop rather
+than guessing at a workaround. The most common cause is another pane already
+holding the name: there is one foreman by design, and herdr enforces one live
+agent per name.
 
 ## On any status request
 
@@ -79,14 +89,17 @@ crew dispatch <KEY> --type implementer
 crew dispatch <KEY> --type reviewer
 ```
 
-For a JIRA key, dispatch opens a short-lived setup pane where `/start-ticket`
-runs interactively. Tell the human to answer it in that pane. Do not answer it
-for them and do not run `/start-ticket` yourself: it would pull the whole
-ticket payload into your context, once per dispatch, which is exactly the
-accumulation you exist to avoid.
+For a JIRA key, dispatch returns immediately with exit 7 and opens a
+short-lived setup pane where `/start-ticket` runs interactively. Tell the
+human to answer it in that pane. Do not answer it for them and do not run
+`/start-ticket` yourself: it would pull the whole ticket payload into your
+context, once per dispatch, which is exactly the accumulation you exist to
+avoid. Once they have answered it, re-run the exact same `crew dispatch`
+command: it picks up the artifact `/start-ticket` wrote and completes without
+opening a second setup pane.
 
-For a ticketless slug there is no ticket to fetch, so no setup pane appears and
-nothing needs answering. Do not tell the human to go and look for one.
+For a ticketless slug there is no ticket to fetch, so no setup pane appears,
+nothing needs answering, and dispatch completes in this one call.
 
 Exit codes are the same for every verb, so you can rely on them:
 
@@ -100,7 +113,9 @@ Exit codes are the same for every verb, so you can rely on them:
   foreman pane: say so rather than working around it
 - 6 the crew member was started but never reacted to its assignment, so
   delivery is unconfirmed. The pane is tagged and visible in `crew ls`.
-  Resend with `crew nudge`
+  Resend with `crew nudge <name> "<text>"`
+- 7 setup is pending on a JIRA key. Tell the human to answer the prompt in the
+  named pane, then re-run the exact same dispatch command to finish
 
 There is no cap on crew. Report load every time and let the human decide.
 The bottleneck is their review capacity, not tokens.
