@@ -196,8 +196,12 @@ def doctor():
     if not ok:
         problems.append(help_text)
     else:
-        for flag in ("--append-system-prompt", "--continue", "--model",
-                     "--permission-mode"):
+        # No --permission-mode: the planner type deliberately does not run in
+        # plan mode, because plan mode blocks bash and a planner could then
+        # never send its own report. Requiring a flag nothing passes would fail
+        # the preflight for a reason unrelated to anything crew does, and the
+        # foreman skill says to stop on a red doctor.
+        for flag in ("--append-system-prompt", "--continue", "--model"):
             if flag not in help_text:
                 problems.append("claude CLI is missing %s" % flag)
 
@@ -833,8 +837,15 @@ def cmd_dispatch(key, ctype, repo, model):
     ensure_crew_dir()
     lock_path = os.path.join(CREW_DIR, "dispatch-%s.lock" % sanitize_name(key))
     with _locked(lock_path, "w"):
+        # Both checks, as cmd_ls does. assert_snapshot_shape only validates
+        # herdr's REQUIRED fields, and tokens is not one, so without the
+        # declaration check a renamed tokens field makes crew_members return
+        # nothing, find_member find nothing, and this dispatch spend a second
+        # paid session on top of a live one.
+        defs = schema_defs()
+        assert_schema_declares(defs)
         snap = snapshot()
-        assert_snapshot_shape(snap, schema_defs())
+        assert_snapshot_shape(snap, defs)
 
         existing = find_member(snap, repo_root, key)
         if existing:
