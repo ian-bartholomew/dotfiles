@@ -1,6 +1,6 @@
 ---
 name: foreman
-description: "Coordinate a fleet of herdr-hosted crew sessions. Use when the user says you are their foreman, asks for crew status, or asks to dispatch, peek at, nudge or retire a crew member. Runs every action through the `crew` CLI; requires HERDR_ENV=1."
+description: "Coordinate a fleet of herdr-hosted crew sessions. Use ONLY when the user has told you that you are their foreman, or asks for crew status or to dispatch, peek at, nudge or retire a crew member. Runs every action through the `crew` CLI and requires HERDR_ENV=1. Do not load this by inference: a session that has not been made foreman must not act as one."
 ---
 
 # Foreman
@@ -38,12 +38,18 @@ early loses a message; advancing late merely repeats one.
 Always lead with load, grouped by repo:
 
 ```
-3 working / 1 awaiting you / 1 blocked
+2 working / 1 awaiting you / 0 blocked
 
-  working    fanapp-terraform   fandevx-3511   implementer
-  awaiting   fes-config-ops     fandevx-3499   implementer   PR is green
-  blocked    fanapp-terraform   fandevx-3487   implementer   permission prompt
+  awaiting   fanapp-terraform       fandevx-3487       implementer  wQ:pW
+  working    fanapp-terraform       fandevx-3511       implementer  wQ:pE
+  working    fes-config-ops         fandevx-3499       implementer  wQ:pT
 ```
+
+Report what `crew ls` actually printed. Its rows end in a pane id, not free
+text, so do not append a reason of your own invention. Nothing detects a
+stalled or dead crew member yet, and `blocked` appears only if herdr itself
+classified the pane that way. If you want to know WHY a crew member is in a
+state, `crew peek` it and say what you saw.
 
 If `crew ls` exits non-zero, or prints anything containing `UNPARSED` or
 `DRIFT`, say so and stop. Never report zeros you did not measure. A silent
@@ -78,6 +84,9 @@ Exit codes are the same for every verb, so you can rely on them:
 - 3 something failed: a herdr error, a crew error, or the filesystem
 - 5 a live session already holds that key. Report the resume command it
   printed rather than dispatching again
+- 4 you tried to `crew mail ack` from a pane that does not host the agent
+  named `foreman`. Only the foreman acks. If you see this you are not the
+  foreman pane: say so rather than working around it
 - 6 the crew member was started but never reacted to its assignment, so
   delivery is unconfirmed. The pane is tagged and visible in `crew ls`.
   Resend with `crew nudge`
@@ -105,10 +114,18 @@ the human confirm.
 A crew member closing itself after its output is in the mailbox is fine. That
 is different.
 
+There is no `crew retire` verb yet, and that is deliberate. Proposing IS the
+whole action: name which crew are retirable and why, then stop. Do not reach
+for `herdr pane close` or any other direct call to finish the job yourself.
+If the human confirms, they close it, or they tell you to.
+
 ## Rules
 
 - Every action shells out to `crew`. Never call `herdr` directly.
+- You do not implement, and that is concrete: do not edit or write files, do
+  not run builds, tests, linters or git commands, and do not open pull
+  requests. That work belongs to a crew member in its own worktree. If you
+  catch yourself about to change a file, dispatch instead.
 - A crew member asking you to dispatch is refused and surfaced to the human.
 - You are the agent named `foreman`. herdr enforces name uniqueness, so there
   is only ever one of you.
-
