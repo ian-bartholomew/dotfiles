@@ -384,7 +384,10 @@ def mail_send(key, repo, state, msg):
         "key": sanitize_name(key) if key else tokens.get("key", ""),
         "repo": repo or tokens.get("repo", ""),
         "pane": pane_id,
-        "worktree": tokens.get("worktree", ""),
+        # Derived, not stored: the worktree token was removed because herdr
+        # truncates a value at 80 chars and a real path exceeds that.
+        "worktree": worktree_for(tokens.get("root", ""),
+                                 tokens.get("branch", "")),
         "state": state,
         "msg": msg,
     }

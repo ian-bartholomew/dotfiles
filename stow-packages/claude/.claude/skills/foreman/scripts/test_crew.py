@@ -1,6 +1,8 @@
 """Tests for the pure decision logic in crew.py."""
 import io
+import json
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -653,6 +655,25 @@ class TestWorktreeFor(unittest.TestCase):
         self.assertGreater(len(path), crew.TOKEN_VALUE_MAX)
         self.assertLessEqual(len("FANDEVX-3511-github-oidc-repository-claim-"
                                  "trust-policies"), crew.TOKEN_VALUE_MAX)
+
+
+class TestMailSendDerivesWorktree(unittest.TestCase):
+    """mail_send used to read a `worktree` token that the truncation fix
+    removed, so every mail line silently lost its worktree. It must derive
+    the path the same way crew_members does, from root and branch."""
+
+    def test_worktree_is_derived_from_root_and_branch_tokens(self):
+        tokens = {"root": "/repo", "branch": "FANDEVX-1-x"}
+        with tempfile.TemporaryDirectory() as tmp:
+            mailbox = os.path.join(tmp, "mailbox.jsonl")
+            with mock.patch.object(crew, "_pane_tokens", return_value=tokens), \
+                 mock.patch.object(crew, "MAILBOX", mailbox), \
+                 mock.patch.dict(os.environ, {"HERDR_PANE_ID": "wQ:p1"}):
+                crew.mail_send("probe", "scratch", "done", "landed")
+            with open(mailbox) as handle:
+                record = json.loads(handle.readline())
+        self.assertEqual(
+            record["worktree"], worktree_for("/repo", "FANDEVX-1-x"))
 
 
 class TestRequirePositional(unittest.TestCase):
