@@ -508,7 +508,7 @@ if __name__ == "__main__":
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 15 tests.
+Expected: PASS. The suite must be green and the count must rise by exactly the number of tests this task adds. Do not assert an absolute total.
 
 - [ ] **Step 5: Install the symlink and run doctor**
 
@@ -868,7 +868,7 @@ Wire it into `main`, and make `CrewError` fail closed rather than printing zeros
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 36 tests.
+Expected: PASS. The suite must be green and the count must rise by exactly the number of tests this task adds. Do not assert an absolute total.
 
 - [ ] **Step 5: Harden doctor to use `_probe`**
 
@@ -1144,7 +1144,9 @@ def mail_send(key, repo, state, msg):
     record = {
         "v": 1,
         "ts": int(time.time()),
-        "key": key or tokens.get("key", ""),
+        # Sanitise so a caller passing the raw ticket case cannot write a
+        # record that fails to match the roster or a crew log filter.
+        "key": sanitize_name(key) if key else tokens.get("key", ""),
         "repo": repo or tokens.get("repo", ""),
         "pane": pane_id,
         "worktree": tokens.get("worktree", ""),
@@ -1253,7 +1255,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 51 tests.
+Expected: PASS. The suite must be green and the count must rise by exactly the number of tests this task adds. Do not assert an absolute total.
 
 - [ ] **Step 5: Verify concurrent writers do not interleave**
 
@@ -1516,6 +1518,34 @@ class TestContractPointer(unittest.TestCase):
         self.assertNotIn("—", out)
 
 
+class TestKeyCaseIsConsistent(unittest.TestCase):
+    """One dispatch must not tell a crew member two different keys."""
+
+    def test_contract_pointer_uses_the_sanitised_key(self):
+        out = contract_pointer("fandevx-3511", "implementer", "FANDEVX-3511",
+                               "r", "/w")
+        self.assertIn("--key fandevx-3511", out)
+        self.assertNotIn("--key FANDEVX-3511", out)
+
+
+class TestResolveRepo(unittest.TestCase):
+    def test_no_argument_uses_the_cwd_repo(self):
+        root, name = resolve_repo(None)
+        self.assertTrue(os.path.isdir(root))
+        self.assertEqual(name, os.path.basename(root))
+
+    def test_unresolvable_name_is_an_error_not_a_relabel(self):
+        with mock.patch.object(crew, "DEV_ROOT", "/no-such-dev-root"):
+            with self.assertRaises(CrewError):
+                resolve_repo("not-a-real-repo")
+
+    def test_name_comes_from_the_directory_not_the_argument(self):
+        root = repo_root_for(os.getcwd())
+        with mock.patch.object(crew, "DEV_ROOT", os.path.dirname(root)):
+            _, name = resolve_repo(os.path.basename(root))
+        self.assertEqual(name, os.path.basename(root))
+
+
 class TestIsTicket(unittest.TestCase):
     def test_jira_key(self):
         self.assertTrue(is_ticket("FANDEVX-3511"))
@@ -1629,7 +1659,7 @@ def contract_pointer(name, ctype, key, repo, worktree):
         "You are crew member `%s`, type %s, on %s in repo %s, worktree %s. "
         "Read %s now and follow it for the rest of this session. "
         "Report state changes with `crew mail send --key %s`."
-        % (name, ctype, key, repo, worktree, CONTRACT_PATH, key)
+        % (name, ctype, key, repo, worktree, CONTRACT_PATH, sanitize_name(key))
     )
 
 
@@ -1654,6 +1684,26 @@ def find_member(snap, repo, key):
         if member["repo"] == repo and member["key"] == wanted:
             return member
     return None
+
+
+DEV_ROOT = os.path.expanduser("~/Dev")
+
+
+def resolve_repo(repo_arg):
+    """--repo names a LOCATION, not just a label. The repo token is
+    authoritative, so it must never be able to disagree with the worktree it
+    describes. The name always comes from the resolved directory."""
+    if not repo_arg:
+        root = repo_root_for(os.getcwd())
+        return root, os.path.basename(root)
+    candidate = repo_arg
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(DEV_ROOT, repo_arg)
+    if not os.path.isdir(candidate):
+        raise CrewError("--repo %s does not resolve to a directory (tried %s)"
+                        % (repo_arg, candidate))
+    root = repo_root_for(candidate)
+    return root, os.path.basename(root)
 
 
 def repo_root_for(path):
@@ -1743,8 +1793,7 @@ def cmd_dispatch(key, ctype, repo, model):
     if not workspace:
         raise CrewError("dispatch must run inside a herdr pane")
 
-    repo_root = repo_root_for(os.getcwd())
-    repo = repo or os.path.basename(repo_root)
+    repo_root, repo = resolve_repo(repo)
     model = model or MODEL_BY_TYPE[ctype]
 
     ensure_crew_dir()
@@ -1846,7 +1895,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 67 tests.
+Expected: PASS. The suite must be green and the count must rise by exactly the number of tests this task adds. Do not assert an absolute total.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -2063,7 +2112,7 @@ Expected: the first prints terminal text, the second prints `invalid read format
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 75 tests.
+Expected: PASS. The suite must be green and the count must rise by exactly the number of tests this task adds. Do not assert an absolute total.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 
