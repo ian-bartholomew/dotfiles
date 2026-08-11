@@ -462,26 +462,20 @@ def mail_unread():
 
 
 def calling_pane():
-    """Ask herdr which pane is calling, with HERDR_PANE_ID stripped.
+    """The calling pane, from the environment herdr injects into it.
 
-    Measured against herdr 0.7.5: `pane current --current` HONOURS a spoofed
-    HERDR_PANE_ID when the named pane is valid, and falls back to genuine
-    caller detection when the variable is absent. Stripping it means a crew
-    member cannot claim to be the foreman by setting one variable.
+    This IS spoofable: a crew member can set HERDR_PANE_ID and claim to be
+    the foreman. It is kept anyway because the alternative is worse.
+    Stripping the variable and asking herdr does NOT yield the caller: herdr
+    falls back to the UI-FOCUSED pane. Measured: with the variable stripped
+    herdr returned wX:p1, the focused pane in another workspace, while the
+    caller was wV:p1.
 
-    This raises the bar against a confused or prompt-injected agent, which is
-    the realistic threat. It does not stop a determined process, which can
-    bypass this script and call herdr directly. Only a PreToolUse hook can."""
-    env = dict(os.environ)
-    env.pop("HERDR_PANE_ID", None)
-    proc = subprocess.run(["herdr", "pane", "current", "--current"],
-                          capture_output=True, text=True, env=env)
-    if proc.returncode != 0:
-        return ""
-    try:
-        return json.loads(proc.stdout)["result"]["pane"]["pane_id"]
-    except (ValueError, KeyError, TypeError):
-        return ""
+    A focus-based check would authorise a crew member whenever the human
+    happened to be looking at the foreman, and refuse the real foreman
+    whenever they were not. Wrong beats spoofable, so the spoofable check
+    stands and the real control is the PreToolUse hook outside this script."""
+    return os.environ.get("HERDR_PANE_ID", "")
 
 
 def is_foreman_pane():

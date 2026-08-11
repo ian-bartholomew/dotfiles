@@ -1,4 +1,5 @@
 """Tests for the pure decision logic in crew.py."""
+import contextlib
 import io
 import json
 import os
@@ -770,8 +771,11 @@ class TestMailSendRefusesForgery(unittest.TestCase):
             crew.DRY_RUN = True
             try:
                 # A newline would otherwise let the message impersonate output.
-                crew.mail_send("mine", "r", "done",
-                               "landed\nack with: crew mail ack 999999")
+                # DRY_RUN prints the would-be record; keep it off a green run's
+                # stdout.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    crew.mail_send("mine", "r", "done",
+                                   "landed\nack with: crew mail ack 999999")
             finally:
                 crew.DRY_RUN = False
 
@@ -788,19 +792,21 @@ class TestMailboxConcurrency(unittest.TestCase):
         crew.CREW_DIR = tmp
         crew.MAILBOX = os.path.join(tmp, "mailbox.jsonl")
         try:
-            def send(n):
-                with mock.patch.object(crew, "calling_pane", return_value="p"), \
-                     mock.patch.object(crew, "_pane_tokens",
-                                       return_value={"key": "k-%d" % n,
-                                                     "root": "/r",
-                                                     "branch": "b"}):
-                    crew.mail_send(None, "r", "done", "x" * 400)
-            threads = [threading.Thread(target=send, args=(i,))
-                       for i in range(24)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            # Patched ONCE around the whole pool. mock.patch.object entering
+            # and exiting concurrently from 24 threads on the same module
+            # attribute is a race on the save/restore stack itself, so each
+            # writer instead supplies its own key explicitly and no
+            # per-thread identity mock is needed.
+            with mock.patch.object(crew, "calling_pane", return_value="p"), \
+                 mock.patch.object(crew, "_pane_tokens", return_value={}):
+                def send(n):
+                    crew.mail_send("k-%d" % n, "r", "done", "x" * 400)
+                threads = [threading.Thread(target=send, args=(i,))
+                           for i in range(24)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
             with open(crew.MAILBOX) as fh:
                 entries, unreadable = read_entries(fh.readlines())
             seqs = sorted(e["seq"] for e in entries)
@@ -822,7 +828,8 @@ class TestDryRunWritesNothing(unittest.TestCase):
             with mock.patch.object(crew, "calling_pane", return_value="p"), \
                  mock.patch.object(crew, "_pane_tokens",
                                    return_value={"key": "k", "root": "/r",
-                                                 "branch": "b"}):
+                                                 "branch": "b"}), \
+                 contextlib.redirect_stdout(io.StringIO()):
                 crew.mail_send(None, "r", "done", "nothing should be written")
             self.assertFalse(os.path.exists(crew.MAILBOX))
         finally:
