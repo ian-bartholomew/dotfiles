@@ -7,7 +7,8 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
                    assert_schema_declares, CrewError, HerdrError,
                    read_entries, next_seq, select_unread,
-                   contract_pointer, find_member, is_ticket, take_flag)
+                   contract_pointer, find_member, is_ticket, take_flag,
+                   _start_agent)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -420,6 +421,40 @@ class TestFindMember(unittest.TestCase):
                      [_pane("wQ:p1", CREW_TOKENS)])
         self.assertIsNotNone(
             find_member(snap, "fanapp-terraform", "FANDEVX-3511"))
+
+
+class TestStartAgent(unittest.TestCase):
+    # Observed live: agent start immediately after tab create can reject a
+    # pane that has not yet settled into an interactive shell.
+    def test_succeeds_without_retry_when_not_busy(self):
+        with mock.patch.object(crew, "herdr", return_value={"ok": True}) as h:
+            self.assertEqual(_start_agent(["agent", "start"]), {"ok": True})
+        self.assertEqual(h.call_count, 1)
+
+    def test_retries_past_a_busy_pane_then_succeeds(self):
+        busy = HerdrError('{"error":{"code":"agent_pane_busy"}}')
+        with mock.patch.object(crew, "herdr",
+                               side_effect=[busy, busy, {"ok": True}]), \
+             mock.patch.object(crew, "time") as mock_time:
+            self.assertEqual(
+                _start_agent(["agent", "start"], tries=5, delay=0),
+                {"ok": True})
+        self.assertEqual(mock_time.sleep.call_count, 2)
+
+    def test_gives_up_after_exhausting_retries(self):
+        busy = HerdrError('{"error":{"code":"agent_pane_busy"}}')
+        with mock.patch.object(crew, "herdr", side_effect=busy), \
+             mock.patch.object(crew, "time"):
+            with self.assertRaises(HerdrError):
+                _start_agent(["agent", "start"], tries=3, delay=0)
+
+    def test_a_different_herdr_error_is_not_retried(self):
+        other = HerdrError("socket gone")
+        with mock.patch.object(crew, "herdr", side_effect=other) as h, \
+             mock.patch.object(crew, "time"):
+            with self.assertRaises(HerdrError):
+                _start_agent(["agent", "start"], tries=5, delay=0)
+        self.assertEqual(h.call_count, 1)
 
 
 if __name__ == "__main__":

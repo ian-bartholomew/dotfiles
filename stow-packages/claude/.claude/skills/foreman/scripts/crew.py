@@ -590,6 +590,20 @@ def plain_worktree(key, repo_root):
     return path
 
 
+def _start_agent(args, tries=8, delay=3):
+    """A pane created moments earlier can reject agent start with
+    agent_pane_busy: its shell has not yet settled into an interactive
+    prompt. Observed live: tab create immediately followed by agent start
+    fails every time; retrying a few seconds later succeeds."""
+    for attempt in range(tries):
+        try:
+            return herdr(*args)
+        except HerdrError as exc:
+            if "agent_pane_busy" not in str(exc) or attempt == tries - 1:
+                raise
+            time.sleep(delay)
+
+
 def setup_worktree(key, repo, repo_root):
     """Run /start-ticket in an ephemeral pane. Handoff is a JSON artifact,
     not scraped terminal output: an interactive REPL renders ANSI and does
@@ -607,8 +621,8 @@ def setup_worktree(key, repo, repo_root):
     tag_pane(setup_pane, key, repo, "setup", "")
 
     setup_name = ("setup-" + sanitize_name(key))[:32]
-    herdr("agent", "start", setup_name, "--kind", "claude",
-          "--pane", setup_pane, "--", "--model", "opus")
+    _start_agent(["agent", "start", setup_name, "--kind", "claude",
+                 "--pane", setup_pane, "--", "--model", "opus"])
     herdr("agent", "prompt", setup_name,
           SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo))
 
@@ -683,7 +697,7 @@ def cmd_dispatch(key, ctype, repo, model):
                  contract_pointer(name, ctype, key, repo, worktree)]
         if ctype == "planner":
             start += ["--permission-mode", "plan"]
-        herdr(*start)
+        _start_agent(start)
 
         assignment = (
             "You are dispatched on %s in %s. Your worktree is %s and the plan "
