@@ -10,7 +10,8 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    assert_schema_declares, CrewError, HerdrError,
                    read_entries, next_seq, select_unread,
                    contract_pointer, find_member, is_ticket, take_flag,
-                   _start_agent, resolve_repo, repo_root_for, clamp_lines)
+                   _start_agent, resolve_repo, repo_root_for, clamp_lines,
+                   require_positional, worktree_for)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -95,7 +96,7 @@ def _pane(pane, tokens=None, cwd="/repo", fg=None):
 
 CREW_TOKENS = {"crew": "true", "v": "1", "key": "fandevx-3511",
                "repo": "fanapp-terraform", "type": "implementer",
-               "worktree": "/repo/.claude/worktrees/FANDEVX-3511-x",
+               "branch": "FANDEVX-3511-x", "root": "/repo",
                "dispatched": "1786000000"}
 
 
@@ -109,7 +110,10 @@ class TestCrewMembers(unittest.TestCase):
         self.assertEqual(m["key"], "fandevx-3511")
         self.assertEqual(m["repo"], "fanapp-terraform")
         self.assertEqual(m["bucket"], "working")
-        self.assertEqual(m["worktree"], CREW_TOKENS["worktree"])
+        self.assertEqual(m["branch"], CREW_TOKENS["branch"])
+        self.assertEqual(
+            m["worktree"],
+            worktree_for(CREW_TOKENS["root"], CREW_TOKENS["branch"]))
 
     def test_untagged_pane_is_not_crew_even_in_a_worktree(self):
         snap = _snap([_agent("wQ:p1", "idle")],
@@ -123,8 +127,9 @@ class TestCrewMembers(unittest.TestCase):
         snap = _snap([_agent("wQ:p1", "working", "fandevx-3511")],
                      [_pane("wQ:p1", CREW_TOKENS, cwd="/somewhere/else",
                             fg="/tmp")])
-        self.assertEqual(crew_members(snap)[0]["worktree"],
-                         CREW_TOKENS["worktree"])
+        self.assertEqual(
+            crew_members(snap)[0]["worktree"],
+            worktree_for(CREW_TOKENS["root"], CREW_TOKENS["branch"]))
 
     def test_unknown_token_version_is_reported_not_guessed(self):
         tokens = dict(CREW_TOKENS)
@@ -599,6 +604,86 @@ class TestMainErrorPrefixesAreDistinct(unittest.TestCase):
         self.assertIn("herdr:", herdr_msg)
         self.assertIn("bad arguments:", arg_msg)
         self.assertNotEqual(herdr_msg, arg_msg)
+
+
+class TestTokenTruncationIsRefused(unittest.TestCase):
+    """herdr silently truncates a token value at 80 characters. Tokens are the
+    authoritative record, so a truncated value is a record that lies. This was
+    found live: a real worktree path stored as a token pointed at a directory
+    that did not exist."""
+
+    def test_an_over_length_value_raises_rather_than_being_written(self):
+        with mock.patch.object(crew, "herdr") as fake:
+            with self.assertRaises(CrewError):
+                crew.tag_pane("w:p1", "K", "repo", "implementer",
+                              "b" * 81, "/root")
+            fake.assert_not_called()
+
+    def test_a_value_at_the_limit_is_allowed(self):
+        with mock.patch.object(crew, "herdr") as fake:
+            crew.tag_pane("w:p1", "K", "repo", "implementer", "b" * 80, "/root")
+            fake.assert_called_once()
+
+    def test_the_error_names_the_offending_token(self):
+        with mock.patch.object(crew, "herdr"):
+            try:
+                crew.tag_pane("w:p1", "K", "repo", "implementer",
+                              "b" * 100, "/root")
+            except CrewError as exc:
+                self.assertIn("branch", str(exc))
+            else:
+                self.fail("expected CrewError")
+
+
+class TestWorktreeFor(unittest.TestCase):
+    def test_derives_from_root_and_branch(self):
+        self.assertEqual(
+            worktree_for("/repo", "FANDEVX-1-x"),
+            "/repo/.claude/worktrees/FANDEVX-1-x")
+
+    def test_empty_when_either_is_missing(self):
+        self.assertEqual(worktree_for("", "b"), "")
+        self.assertEqual(worktree_for("/repo", ""), "")
+
+    def test_a_real_ticket_path_would_have_been_truncated_if_stored(self):
+        # The reason the path is derived rather than stored.
+        path = worktree_for(
+            "/Users/someone/Dev/fanapp-terraform",
+            "FANDEVX-3511-github-oidc-repository-claim-trust-policies")
+        self.assertGreater(len(path), crew.TOKEN_VALUE_MAX)
+        self.assertLessEqual(len("FANDEVX-3511-github-oidc-repository-claim-"
+                                 "trust-policies"), crew.TOKEN_VALUE_MAX)
+
+
+class TestRequirePositional(unittest.TestCase):
+    """`crew dispatch --help` dispatched a live Opus session named "help"
+    because a flag was accepted where a positional key belongs."""
+
+    def test_a_flag_is_rejected(self):
+        with self.assertRaises(CrewError):
+            require_positional("--help", "key")
+
+    def test_none_is_rejected(self):
+        with self.assertRaises(CrewError):
+            require_positional(None, "key")
+
+    def test_a_real_value_passes_through(self):
+        self.assertEqual(require_positional("FANDEVX-1", "key"), "FANDEVX-1")
+
+
+class TestPeekAndNudgeRejectFlagAsName(unittest.TestCase):
+    """The same mistake Finding 2 fixed for dispatch (a flag accepted where a
+    positional key belongs) is a smaller but real risk here too: a
+    flag-shaped value in the name position would reach herdr's own argument
+    parser instead of naming an agent. No real agent name can start with
+    "-" (names match ^[a-z][a-z0-9_-]{0,31}$), so this never rejects a
+    legitimate one."""
+
+    def test_peek_help_is_refused(self):
+        self.assertEqual(crew.main(["peek", "--help"]), 3)
+
+    def test_nudge_help_is_refused(self):
+        self.assertEqual(crew.main(["nudge", "--help", "text"]), 3)
 
 
 if __name__ == "__main__":

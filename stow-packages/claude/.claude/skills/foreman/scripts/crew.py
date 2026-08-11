@@ -264,7 +264,9 @@ def crew_members(snap):
             "key": tokens.get("key", "(no key)"),
             "repo": tokens.get("repo", "(no repo)"),
             "type": ctype,
-            "worktree": tokens.get("worktree", ""),
+            "branch": tokens.get("branch", ""),
+            "worktree": worktree_for(tokens.get("root", ""),
+                                     tokens.get("branch", "")),
             "pane": pane["pane_id"],
             "status": status,
             "bucket": bucket(status),
@@ -464,7 +466,7 @@ def _run(args):
             print("usage: crew dispatch <key> --type T [--repo R] [--model M]",
                   file=sys.stderr)
             return 2
-        key = args[1]
+        key = require_positional(args[1], "dispatch key")
         opts = {"--type": "implementer", "--repo": None, "--model": None}
         rest = args[2:]
         while rest:
@@ -482,7 +484,7 @@ def _run(args):
         if len(args) < 2:
             print("usage: crew peek <name> [--lines N]", file=sys.stderr)
             return 2
-        name = args[1]
+        name = require_positional(args[1], "peek name")
         opts = {"--lines": None}
         rest = args[2:]
         while rest:
@@ -495,7 +497,8 @@ def _run(args):
         if len(args) < 3:
             print("usage: crew nudge <name> \"<text>\"", file=sys.stderr)
             return 2
-        return cmd_nudge(args[1], " ".join(args[2:]))
+        name = require_positional(args[1], "nudge name")
+        return cmd_nudge(name, " ".join(args[2:]))
     if verb == "mail":
         sub = args[1] if len(args) > 1 else ""
         if sub == "send":
@@ -538,6 +541,15 @@ SETUP_PROMPT = (
 )
 
 
+def require_positional(value, what):
+    """A --flag where a positional belongs is a typo, not a value. Accepting
+    one cost a live Opus session when `crew dispatch --help` dispatched a crew
+    member named "help"."""
+    if value is None or value.startswith("-"):
+        raise CrewError("%s must be a value, not a flag: got %r" % (what, value))
+    return value
+
+
 def take_flag(rest, names):
     """Pull `--flag value` off the front of rest. Reports a missing value
     rather than raising IndexError at a crew member."""
@@ -558,7 +570,24 @@ def contract_pointer(name, ctype, key, repo, worktree):
     )
 
 
-def tag_pane(pane_id, key, repo, ctype, worktree):
+TOKEN_VALUE_MAX = 80
+
+
+def worktree_for(root, branch):
+    """Derive the worktree path from two short tokens rather than storing the
+    path itself. herdr truncates a token VALUE at 80 characters and a real
+    worktree path exceeds that, so storing the path produced an authoritative
+    record pointing at a directory that does not exist.
+
+    The repo ROOT is stored rather than resolved from the repo name, because a
+    repo is not necessarily under ~/Dev: this project is itself built inside a
+    worktree of the dotfiles repo."""
+    if not root or not branch:
+        return ""
+    return os.path.join(root, ".claude", "worktrees", branch)
+
+
+def tag_pane(pane_id, key, repo, ctype, branch, root):
     args = [
         "pane", "report-metadata", pane_id, "--source", "crew",
         "--token", "crew=true",
@@ -568,8 +597,22 @@ def tag_pane(pane_id, key, repo, ctype, worktree):
         "--token", "type=%s" % ctype,
         "--token", "dispatched=%d" % int(time.time()),
     ]
-    if worktree:
-        args += ["--token", "worktree=%s" % worktree]
+    if branch:
+        args += ["--token", "branch=%s" % branch]
+    if root:
+        args += ["--token", "root=%s" % root]
+
+    # herdr silently truncates a token VALUE at 80 characters. Tokens are the
+    # authoritative record here, so a truncated value is a record that lies.
+    # Refuse to write one rather than discover it later.
+    for i in range(0, len(args)):
+        if args[i] == "--token":
+            name, _, value = args[i + 1].partition("=")
+            if len(value) > TOKEN_VALUE_MAX:
+                raise CrewError(
+                    "token %s is %d chars, over herdr's %d limit, and would be "
+                    "silently truncated: %r"
+                    % (name, len(value), TOKEN_VALUE_MAX, value))
     herdr(*args)
 
 
@@ -663,7 +706,7 @@ def setup_worktree(key, repo, repo_root):
     split = herdr("pane", "split", "--current", "--direction", "down",
                   "--cwd", repo_root, "--no-focus")
     setup_pane = DRY_PANE if split is None else split["result"]["pane"]["pane_id"]
-    tag_pane(setup_pane, key, repo, "setup", "")
+    tag_pane(setup_pane, key, repo, "setup", "", repo_root)
 
     setup_name = ("setup-" + sanitize_name(key))[:32]
     _start_agent(["agent", "start", setup_name, "--kind", "claude",
@@ -734,7 +777,7 @@ def cmd_dispatch(key, ctype, repo, model):
         # Tag before agent.start. Tokens are authoritative, so an untagged
         # pane is invisible to ls; a tag that failed afterwards would leave a
         # live session unowned and burning shared quota.
-        tag_pane(pane, key, repo, ctype, worktree)
+        tag_pane(pane, key, repo, ctype, os.path.basename(worktree), repo_root)
 
         live = set(a.get("name") for a in snap["agents"] if a.get("name"))
         name = pick_name(key, live)
