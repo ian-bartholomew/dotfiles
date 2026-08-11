@@ -2284,8 +2284,9 @@ The spec's success criteria need a baseline captured before the tooling changes 
 - [ ] **Step 1: Capture the baseline**
 
 ```bash
-crew ls > /tmp/crew-baseline.txt
-cat /tmp/crew-baseline.txt
+BASELINE=$(mktemp)
+crew ls > "$BASELINE"
+cat "$BASELINE"
 ```
 
 - [ ] **Step 2: Record it in the spec's Success criteria section**
@@ -2312,6 +2313,26 @@ Per the user's git conventions, run the `feature-dev:code-reviewer` agent over t
 git add docs/superpowers/specs/2026-08-10-foreman-crew-design.md
 git commit -m "docs(crew): record the measured baseline for the review date"
 git push -u origin foreman-crew-mvp
+```
+
+`git push` is unaffected by GitHub CLI identity: the remote is `git@github.com:ian-bartholomew/dotfiles.git`, a bare `github.com` host, which is the personal SSH identity per the user's own convention.
+
+`gh pr create` IS affected. Check and, if needed, switch, then restore afterwards so nothing global is left changed:
+
+```bash
+gh auth status 2>&1 | grep -E 'account|Active'
+PREV=$(gh api user -q .login)          # whoever is active now
+gh auth switch --user ian-bartholomew  # personal repo wants the personal account
+```
+
+The `ian-at-fes` identity rule in the user's CLAUDE.md is scoped to `fanatics-gaming` org repos. This is a personal repo, so the personal account applies. Restore the previous account immediately after the PR is created, whether or not creation succeeded:
+
+```bash
+gh auth switch --user "$PREV"
+gh api user -q .login   # confirm restored
+```
+
+```bash
 gh pr create --title "feat(crew): foreman and crew session orchestration over herdr" --body "$(cat <<'BODY'
 Makes live agent sessions first-class. A `crew` CLI names, tags, lists and
 dispatches herdr-hosted Claude sessions, and a foreman role reports on them.
