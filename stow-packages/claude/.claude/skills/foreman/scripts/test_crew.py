@@ -3,6 +3,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -14,7 +16,8 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    read_entries, next_seq, select_unread,
                    contract_pointer, find_member, find_setup_pane, is_ticket,
                    take_flag, _start_agent, resolve_repo, repo_root_for,
-                   clamp_lines, require_positional, worktree_for)
+                   clamp_lines, require_positional, worktree_for, is_inside,
+                   read_dispatch_artifact)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -1172,6 +1175,404 @@ class TestPeekAndNudgeRejectFlagAsName(unittest.TestCase):
 
     def test_nudge_help_is_refused(self):
         self.assertEqual(crew.main(["nudge", "--help", "text"]), 3)
+
+
+@contextlib.contextmanager
+def _repo_world(branch="FANDEVX-9101-x", repo_name="repo"):
+    """A real repo root with a real worktree under it, plus a private CREW_DIR.
+
+    The artifact is a real file here rather than a mock, because its lifetime
+    on disk IS the behaviour under test. CREW_DIR is redirected so the suite
+    never writes into the developer's own ~/.crew."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = os.path.join(tmp, repo_name)
+        worktree = os.path.join(repo_root, ".claude", "worktrees", branch)
+        os.makedirs(worktree)
+        crew_dir = os.path.join(tmp, "dot-crew")
+        os.makedirs(crew_dir)
+        with mock.patch.object(crew, "CREW_DIR", crew_dir):
+            yield tmp, repo_root, worktree
+
+
+def _write_artifact(key, worktree, repo, text=None):
+    path = crew.dispatch_artifact_path(key)
+    with open(path, "w") as handle:
+        if text is not None:
+            handle.write(text)
+        else:
+            handle.write(json.dumps({"worktree": worktree,
+                                     "branch": os.path.basename(worktree),
+                                     "repo": repo}))
+    return path
+
+
+def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False):
+    """crew.main(["dispatch", ...]) with herdr faked. Returns
+    (code, herdr calls, stdout, stderr)."""
+    calls = []
+
+    def fake_herdr(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("tab", "create"):
+            if tab_error is not None:
+                raise tab_error
+            return {"result": {"root_pane": {"pane_id": "wTest:pW3"}}}
+        if args[:2] == ("pane", "split"):
+            return {"result": {"pane": {"pane_id": "wTest:pSetup"}}}
+        return {"ok": True}
+
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(crew, "resolve_repo",
+                           return_value=(repo_root, repo_name)), \
+         mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+         mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+         mock.patch.object(crew, "herdr", side_effect=fake_herdr), \
+         mock.patch.object(crew, "DRY_RUN", dry), \
+         mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+         contextlib.redirect_stdout(out), \
+         mock.patch.object(crew.sys, "stderr", err):
+        code = crew.main(["dispatch", key, "--type", "implementer"])
+    return code, calls, out.getvalue(), err.getvalue()
+
+
+class TestDispatchClearsTheConsumedArtifact(unittest.TestCase):
+    """Making dispatch resumable gave the artifact a lifetime longer than one
+    call, and nothing ended it. Once the crew member's pane was gone the next
+    dispatch of that key found the stale artifact, skipped /start-ticket, and
+    started a PAID session on the old worktree at exit 0."""
+
+    def test_a_successful_dispatch_leaves_no_artifact(self):
+        with _repo_world() as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9101", worktree, "repo")
+            code, calls, _, err = _run_dispatch("FANDEVX-9101", repo_root,
+                                                "repo")
+            self.assertEqual(code, 0, err)
+            self.assertTrue(any(c[:2] == ("tab", "create") for c in calls))
+            self.assertFalse(os.path.exists(artifact),
+                             "a consumed artifact must not survive, or the "
+                             "next dispatch of this key skips /start-ticket "
+                             "and pays for a session on a stale worktree")
+
+    def test_a_dispatch_that_fails_partway_stays_resumable(self):
+        with _repo_world() as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9102", worktree, "repo")
+            code, _, _, _ = _run_dispatch("FANDEVX-9102", repo_root, "repo",
+                                          tab_error=HerdrError("no tab"))
+            self.assertEqual(code, 3)
+            self.assertTrue(os.path.exists(artifact),
+                            "deleting the artifact before the dispatch "
+                            "succeeds loses the setup work, and the next call "
+                            "opens a second paid setup pane")
+
+            code, calls, _, err = _run_dispatch("FANDEVX-9102", repo_root,
+                                                "repo")
+            self.assertEqual(code, 0, err)
+            self.assertFalse(any(c[:2] == ("pane", "split") for c in calls),
+                             "the retry must resume from the artifact, not "
+                             "open a new setup pane")
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_a_dry_run_leaves_the_artifact_alone(self):
+        # --dry-run is the documented safe way to exercise dispatch. Deleting
+        # resumable state during one would cost a real setup session later.
+        with _repo_world() as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9103", worktree, "repo")
+            code, _, out, err = _run_dispatch("FANDEVX-9103", repo_root,
+                                              "repo", dry=True)
+            self.assertEqual(code, 0, err)
+            self.assertTrue(os.path.exists(artifact))
+            # Narrated, like every other dry-run line, because the refusals
+            # report the deletion in the past tense.
+            self.assertIn("would delete %s" % artifact, out)
+
+
+class TestIsInside(unittest.TestCase):
+    """The containment check the artifact's worktree is validated with. A bare
+    startswith accepts a neighbouring checkout whose name shares a prefix."""
+
+    def test_a_child_is_inside(self):
+        self.assertTrue(is_inside("/a/repo/.claude/worktrees/x", "/a/repo"))
+
+    def test_a_prefix_sibling_is_not_inside(self):
+        self.assertFalse(is_inside("/a/repo-old/.claude/worktrees/x", "/a/repo"))
+
+    def test_the_parent_itself_is_not_inside(self):
+        self.assertFalse(is_inside("/a/repo", "/a/repo"))
+
+    def test_a_trailing_separator_on_the_parent_is_handled(self):
+        self.assertTrue(is_inside("/a/repo/x", "/a/repo/"))
+        self.assertFalse(is_inside("/a/repo-old/x", "/a/repo/"))
+
+    def test_the_filesystem_root_contains_everything(self):
+        # The one separator realpath does not normalise away, so the only
+        # input where stripping it in the comparison is load-bearing.
+        self.assertTrue(is_inside("/a", "/"))
+
+
+class TestReadDispatchArtifact(unittest.TestCase):
+    """The artifact is keyed on the ticket key alone, so the same key in two
+    repos aims both dispatches at one file, and a model wrote its contents.
+    Both make it something to validate, not to trust."""
+
+    def test_no_artifact_is_none_not_an_error(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            self.assertIsNone(
+                read_dispatch_artifact("FANDEVX-9110", "repo", repo_root))
+
+    def test_a_matching_artifact_returns_its_worktree(self):
+        with _repo_world() as (_, repo_root, worktree):
+            _write_artifact("FANDEVX-9111", worktree, "repo")
+            self.assertEqual(
+                read_dispatch_artifact("FANDEVX-9111", "repo", repo_root),
+                worktree)
+
+    def test_the_repo_mismatch_message_names_both_values(self):
+        with _repo_world() as (_, repo_root, worktree):
+            _write_artifact("FANDEVX-9112", worktree, "other-repo")
+            with self.assertRaises(CrewError) as ctx:
+                read_dispatch_artifact("FANDEVX-9112", "repo", repo_root)
+        self.assertIn("other-repo", str(ctx.exception))
+        self.assertIn("'repo'", str(ctx.exception))
+
+    def test_an_artifact_without_a_repo_field_is_refused(self):
+        with _repo_world() as (_, repo_root, worktree):
+            artifact = _write_artifact(
+                "FANDEVX-9113", worktree, None,
+                text=json.dumps({"worktree": worktree, "branch": "b"}))
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9113", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_a_worktree_that_is_gone_is_refused_and_discarded(self):
+        # Previously this raised but kept the file, so the key stayed bricked
+        # at exit 3: only start_setup unlinks, and it cannot be reached while
+        # an artifact exists.
+        with _repo_world() as (_, repo_root, worktree):
+            os.rmdir(worktree)
+            artifact = _write_artifact("FANDEVX-9114", worktree, "repo")
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9114", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+
+
+class TestArtifactMustBeForThisRepo(unittest.TestCase):
+    """An artifact whose repo disagreed and whose worktree lay outside the
+    repo completed anyway, tagging the foreman's own root with the other
+    checkout's branch, so the worktree derived from those tokens did not
+    exist and both `crew ls` and the resume line printed that path."""
+
+    def test_another_repo_is_refused_discarded_and_then_set_up_fresh(self):
+        with _repo_world() as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9120", worktree, "other-repo")
+            code, calls, _, err = _run_dispatch("FANDEVX-9120", repo_root,
+                                                "repo")
+            self.assertEqual(code, 3)
+            self.assertIn("other-repo", err)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls),
+                             "a wrong-repo artifact must not reach a paid "
+                             "session")
+            self.assertFalse(os.path.exists(artifact))
+
+            # And the key is not bricked: the next call starts setup again.
+            code, calls, _, err = _run_dispatch("FANDEVX-9120", repo_root,
+                                                "repo")
+            self.assertEqual(code, 7, err)
+            self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_a_worktree_outside_the_repo_root_is_refused(self):
+        with _repo_world() as (tmp, repo_root, _worktree):
+            outside = os.path.join(tmp, "elsewhere", "wt-good")
+            os.makedirs(outside)
+            artifact = _write_artifact("FANDEVX-9121", outside, "repo")
+            code, calls, _, err = _run_dispatch("FANDEVX-9121", repo_root,
+                                                "repo")
+            self.assertEqual(code, 3)
+            self.assertIn(outside, err)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_a_prefix_sibling_checkout_is_refused(self):
+        # /a/repo-old against /a/repo: the case a bare startswith accepts.
+        with _repo_world() as (tmp, repo_root, _worktree):
+            sibling = os.path.join(tmp, "repo-old", ".claude", "worktrees", "x")
+            os.makedirs(sibling)
+            artifact = _write_artifact("FANDEVX-9122", sibling, "repo")
+            code, calls, _, _ = _run_dispatch("FANDEVX-9122", repo_root, "repo")
+            self.assertEqual(code, 3)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_unparseable_json_is_refused_discarded_and_set_up_fresh(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            artifact = _write_artifact("FANDEVX-9123", None, None,
+                                       text="{not json at all")
+            code, calls, _, _ = _run_dispatch("FANDEVX-9123", repo_root, "repo")
+            self.assertEqual(code, 3)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
+            self.assertFalse(os.path.exists(artifact))
+
+            code, calls, _, err = _run_dispatch("FANDEVX-9123", repo_root,
+                                                "repo")
+            self.assertEqual(code, 7, err)
+            self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
+
+
+CREW_GUARD = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "..", "hooks", "crew-guard.py"))
+
+GUARD_CREW_CWD = "/Users/someone/Dev/repo/.claude/worktrees/FANDEVX-1-x"
+GUARD_HUMAN_CWD = "/Users/someone/Dev/repo"
+
+# The guard's own list is deliberately NOT imported. A test that loops over
+# FORBIDDEN shrinks silently when an entry is deleted, which is the whole
+# defect this covers: removing both entries added in wave 2 left the suite
+# green.
+GUARD_FORBIDDEN = (
+    "crew dispatch FANDEVX-1 --type implementer",
+    'crew nudge sibling "get on with it"',
+    "crew mail ack 12",
+    "crew claim-foreman",
+    "herdr agent start rogue --kind claude --pane wV:p2",
+    "herdr agent prompt sibling 'do this instead'",
+    "herdr agent rename wV:p1 foreman",
+    "herdr agent send-keys sibling 'rm -rf .'",
+    "herdr pane close wV:p2",
+    "herdr tab close wV:t2",
+    "herdr workspace close wV",
+    "herdr server stop",
+)
+
+
+def _guard(command, cwd=GUARD_CREW_CWD, tool_name="Bash", stdin=None):
+    payload = {"tool_name": tool_name, "cwd": cwd,
+               "tool_input": {"command": command}}
+    text = json.dumps(payload) if stdin is None else stdin
+    return subprocess.run([sys.executable, CREW_GUARD], input=text,
+                          capture_output=True, text=True)
+
+
+def _guard_decision(proc):
+    """The contract Claude Code actually uses: exit 0 always, an empty stdout
+    allows, and a deny is a permissionDecision in a JSON object."""
+    if not proc.stdout.strip():
+        return "allow", ""
+    hook = json.loads(proc.stdout)["hookSpecificOutput"]
+    return hook["permissionDecision"], hook["permissionDecisionReason"]
+
+
+class TestCrewGuardHook(unittest.TestCase):
+    """crew-guard.py is the only enforcement of a boundary that is otherwise
+    pure convention, and it shipped twice with no test at all. Driven as a
+    subprocess over real JSON on stdin, because that contract, not any
+    importable function, is what Claude Code invokes."""
+
+    def _assert(self, proc, expected, command):
+        self.assertEqual(proc.returncode, 0,
+                         "the guard must never crash: %s" % proc.stderr)
+        decision, reason = _guard_decision(proc)
+        self.assertEqual(decision, expected, "%s: %s" % (command, reason))
+        return reason
+
+    def test_every_forbidden_command_is_denied_in_a_crew_worktree(self):
+        for command in GUARD_FORBIDDEN:
+            with self.subTest(command=command):
+                reason = self._assert(_guard(command), "deny", command)
+                self.assertIn("crew-guard", reason)
+                self.assertIn(GUARD_CREW_CWD, reason)
+
+    def test_the_same_commands_are_allowed_outside_a_worktree(self):
+        # The human's own shell, and the foreman's. Denying here would get the
+        # hook switched off.
+        for command in GUARD_FORBIDDEN:
+            with self.subTest(command=command):
+                self._assert(_guard(command, cwd=GUARD_HUMAN_CWD), "allow",
+                             command)
+
+    def test_a_crew_member_may_still_report_and_read(self):
+        for command in ("crew mail send --key fandevx-1 done landed",
+                        "herdr agent read foreman --lines 40",
+                        "crew mail unread",
+                        "crew ls",
+                        "crew peek sibling"):
+            with self.subTest(command=command):
+                self._assert(_guard(command), "allow", command)
+
+    def test_every_bypass_form_that_has_broken_it_once_is_denied(self):
+        for command in (
+                # Bare name.
+                "crew dispatch FANDEVX-1",
+                # Absolute path to the same program.
+                "/Users/someone/.local/bin/crew dispatch FANDEVX-1",
+                # The .py form: five characters that defeated the first
+                # version of this guard outright.
+                "python3 /Users/someone/.claude/skills/foreman/scripts/"
+                "crew.py dispatch FANDEVX-1",
+                # A global flag between the program and its subcommand.
+                "herdr --json agent rename wV:p1 foreman"):
+            with self.subTest(command=command):
+                self._assert(_guard(command), "deny", command)
+
+    def test_a_forbidden_verb_inside_a_commit_message_is_allowed(self):
+        # The raw substring pass was removed on purpose: it denied real work
+        # to catch a wrapper evasion the module docstring already concedes.
+        self._assert(_guard('git commit -m "crew dispatch is foreman-only"'),
+                     "allow", "git commit")
+
+    def test_a_non_bash_tool_is_not_inspected(self):
+        self._assert(_guard("crew dispatch FANDEVX-1", tool_name="Read"),
+                     "allow", "Read")
+
+    def test_an_unknown_cwd_allows_rather_than_blocking_the_human(self):
+        self._assert(_guard("crew dispatch FANDEVX-1", cwd=None), "allow",
+                     "no cwd")
+
+    def test_malformed_stdin_exits_zero_and_allows(self):
+        self._assert(_guard("", stdin="not json at all"), "allow", "bad stdin")
+
+
+class TestDoctorFailsClosedOnProtocolDrift(unittest.TestCase):
+    """herdr self-updates, and the whole design rests on five MEASURED
+    behaviours. An unverified protocol must fail the preflight, because the
+    foreman skill is told to stop on a red doctor."""
+
+    def _doctor(self, protocol):
+        def fake_probe(argv):
+            if argv[:2] == ["herdr", "--version"]:
+                return True, "herdr 9.9.9"
+            if argv[:3] == ["herdr", "api", "schema"]:
+                return True, "protocol: %d" % protocol
+            if argv[:2] == ["claude", "--help"]:
+                return True, "--append-system-prompt --continue --model"
+            raise AssertionError("unexpected probe: %s" % argv)
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(crew, "_probe", side_effect=fake_probe), \
+                 mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+                 mock.patch.object(crew, "snapshot",
+                                   return_value=_snap([], [])), \
+                 mock.patch.object(crew, "CREW_DIR", tmp), \
+                 mock.patch.object(crew, "MAILBOX",
+                                   os.path.join(tmp, "mailbox.jsonl")), \
+                 contextlib.redirect_stdout(out):
+                code = crew.doctor()
+        return code, out.getvalue()
+
+    def test_an_unverified_protocol_makes_doctor_fail(self):
+        code, out = self._doctor(99)
+        self.assertEqual(code, 1)
+        self.assertIn("protocol 99 has not been verified", out)
+        self.assertNotIn("(verified)", out)
+        self.assertIn("FAIL", out)
+
+    def test_a_verified_protocol_is_reported_as_verified(self):
+        # The exit code is deliberately not asserted here: doctor also probes
+        # ~/.local/bin/crew and the shadowed skill path, which belong to the
+        # machine rather than to this test. The message is the discriminator.
+        _, out = self._doctor(crew.HERDR_VERIFIED_PROTOCOLS[-1])
+        self.assertIn("(verified)", out)
+        self.assertNotIn("has not been verified", out)
 
 
 if __name__ == "__main__":

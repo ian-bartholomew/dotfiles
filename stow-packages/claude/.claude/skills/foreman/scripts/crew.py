@@ -845,6 +845,38 @@ def dispatch_artifact_path(key):
     return os.path.join(CREW_DIR, "dispatch-%s.json" % sanitize_name(key))
 
 
+def clear_dispatch_artifact(key):
+    """Delete the handoff artifact.
+
+    Nothing deleted it once dispatch consumed it, so after the crew member's
+    pane was gone the next dispatch of that key found the stale artifact,
+    skipped /start-ticket entirely, and started a PAID session on the old
+    worktree at exit 0. Every refusal deletes it too, or the key bricks at
+    exit 3 forever, because the only other caller is start_setup and that is
+    unreachable while an artifact exists.
+
+    A dry run leaves it alone, and says so, because the refusals below report
+    the deletion in the past tense. It is resumable state a real dispatch
+    already paid a setup session for, and re-creating it costs another one."""
+    artifact = dispatch_artifact_path(key)
+    if DRY_RUN:
+        print("would delete %s" % artifact)
+        return
+    if os.path.exists(artifact):
+        os.unlink(artifact)
+
+
+def is_inside(child, parent):
+    """Boundary-safe containment. A bare startswith matches /a/repo-old
+    against /a/repo, which is exactly how a neighbouring checkout's artifact
+    would pass as this repo's. Both sides are resolved so a symlinked path is
+    compared as the directory it actually is. Equal is not inside: a crew
+    worktree is never the repo root itself."""
+    child = os.path.realpath(child)
+    parent = os.path.realpath(parent)
+    return child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
 def start_setup(key, repo, repo_root):
     """Open the ephemeral setup pane and start /start-ticket in it, then
     return immediately. Dispatch must never block on the human answering it:
@@ -852,8 +884,7 @@ def start_setup(key, repo, repo_root):
     and a later `crew dispatch` call on the same key picks up from either."""
     ensure_crew_dir()
     artifact = dispatch_artifact_path(key)
-    if os.path.exists(artifact):
-        os.unlink(artifact)
+    clear_dispatch_artifact(key)
 
     split = herdr("pane", "split", "--current", "--direction", "down",
                   "--cwd", repo_root, "--no-focus")
@@ -868,19 +899,55 @@ def start_setup(key, repo, repo_root):
     return setup_pane
 
 
-def read_dispatch_artifact(key):
+def read_dispatch_artifact(key, repo, repo_root):
     """None if setup has not written it yet, which is the common case on a
-    fresh call. A CrewError if it exists but names a worktree that is not
-    there, rather than silently continuing on a broken handoff."""
+    fresh call.
+
+    Otherwise every field is checked against the dispatch about to consume it.
+    The file is keyed on the ticket key alone, so the same key in two repos,
+    which is ordinary, aims both dispatches at one artifact; and a model wrote
+    it. Unchecked, an artifact whose repo disagreed and whose worktree lay
+    outside the repo completed anyway, tagging the foreman's own root with the
+    other checkout's branch, so the worktree derived from those tokens did not
+    exist and both `crew ls` and the resume line printed that path.
+
+    Every refusal deletes the artifact. Unusable is unusable, whether that is
+    unparseable JSON, another repo, or a worktree that is not there, and
+    keeping the file would brick the key at exit 3 on every later call."""
     artifact = dispatch_artifact_path(key)
     if not os.path.exists(artifact):
         return None
-    with open(artifact) as handle:
-        data = json.load(handle)
-    worktree = data.get("worktree", "")
-    if not worktree or not os.path.isdir(worktree):
+    try:
+        with open(artifact) as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except ValueError as exc:
+        clear_dispatch_artifact(key)
         raise CrewError(
-            "setup wrote %s but worktree %r does not exist"
+            "setup wrote unreadable JSON to %s (%s). It has been discarded; "
+            "re-run this command to start setup again." % (artifact, exc))
+
+    claimed = str(data.get("repo") or "").strip()
+    if claimed != repo:
+        clear_dispatch_artifact(key)
+        raise CrewError(
+            "%s is for repo %r, but this dispatch is for %r. It has been "
+            "discarded; re-run this command to start setup again."
+            % (artifact, claimed, repo))
+
+    worktree = str(data.get("worktree") or "").strip()
+    if not worktree or not is_inside(worktree, repo_root):
+        clear_dispatch_artifact(key)
+        raise CrewError(
+            "%s names worktree %r, which is not inside repo root %r. It has "
+            "been discarded; re-run this command to start setup again."
+            % (artifact, worktree, repo_root))
+    if not os.path.isdir(worktree):
+        clear_dispatch_artifact(key)
+        raise CrewError(
+            "setup wrote %s but worktree %r does not exist. It has been "
+            "discarded; re-run this command to start setup again."
             % (artifact, worktree))
     return worktree
 
@@ -987,13 +1054,20 @@ def cmd_dispatch(key, ctype, repo, model):
         # Resumable, so a retry never has to wait for the human. If setup
         # already wrote its artifact, this call has nothing interactive
         # left to do regardless of whether it is a ticket or a slug.
-        worktree = read_dispatch_artifact(key)
+        worktree = read_dispatch_artifact(key, repo, repo_root)
         if worktree is not None:
             setup = find_setup_pane(snap, repo_root, key)
             if setup is not None:
                 herdr("pane", "close", setup["pane"])
-            return _complete_dispatch(key, ctype, repo, repo_root, workspace,
+            code = _complete_dispatch(key, ctype, repo, repo_root, workspace,
                                       model, worktree, snap)
+            # Only after it returns. By then the paid session is started and
+            # the pane is tagged, including on the exit 6 unconfirmed-delivery
+            # path, so the artifact is spent. Deleting it any earlier means a
+            # call that raises partway loses the setup work and the next call
+            # opens a second paid setup pane.
+            clear_dispatch_artifact(key)
+            return code
 
         if is_ticket(key):
             setup = find_setup_pane(snap, repo_root, key)
