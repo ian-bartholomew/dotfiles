@@ -2904,3 +2904,88 @@ skills instruct sessions to run the VERB. Add tests through `crew.main([...])`
 for the success path, both refusals returning 3, and that the refusal message
 names the offending pane, since both skills tell the session to report it.
 
+
+---
+
+## Hardening wave 3
+
+Three defects the wave-2 re-review found, two of them introduced BY the wave-2
+fix. Making dispatch resumable meant the artifact had to outlive a single call,
+and both money bugs below are the consequence of that lifetime change not being
+thought through. Fix the lifetime, not the symptom.
+
+### W3-1 (Critical, money): the artifact is never deleted after a successful dispatch
+
+`crew.py:856`'s `os.unlink` is inside `start_setup`, where it clears a STALE
+artifact before opening a new setup pane. Nothing removes it once dispatch
+consumes it successfully. Before wave 2, dispatch deleted and consumed in the
+same call, so a leftover artifact was impossible; now it persists indefinitely.
+
+Consequence: once the crew member's pane is gone (finished, closed, or the
+machine restarted), re-dispatching that key finds the stale artifact, skips
+`/start-ticket` entirely, and starts a PAID session on the old worktree at
+exit 0, silently. The user sees a normal successful dispatch.
+
+Fix: unlink the artifact in the path that consumes it, after the dispatch has
+actually succeeded, so a failed dispatch stays resumable. Deleting it earlier
+re-creates the wave-2 bug where a crashed call loses the setup work and the
+next call opens a second paid setup pane. Order matters: consume, succeed,
+then unlink.
+
+Test: a successful dispatch leaves no artifact; a dispatch that fails partway
+leaves it in place and the next call still resumes from it.
+
+### W3-2 (Critical, money): the artifact is trusted without checking it is for this repo
+
+`read_artifact` is keyed on the ticket key alone (`crew.py:845`) and never
+checks the `repo` field it parses, nor that `worktree` is inside `repo_root`.
+Verified: an artifact whose `worktree` points outside the repo and whose `repo`
+disagrees completes anyway, tagging `root=<the foreman's repo>` with
+`branch=wt-good`, so `worktree_for` derives a path that does not exist. `crew
+ls` and the exit-5 resume line then both print that path.
+
+This is the same class as the original defect where the authoritative token was
+allowed to lie, in a new place. Same key in two repos is the ordinary case that
+triggers it, not an exotic one.
+
+Fix: validate before use. The artifact's `repo` must match the dispatch's repo,
+and its `worktree` must resolve to a path inside `repo_root`. Use
+`os.path.realpath` and a boundary-safe containment check, not a bare
+`startswith`, which matches `/a/repo-old` against `/a/repo`. On mismatch,
+refuse with a message naming both values, and unlink it, otherwise the key
+bricks at exit 3 forever, since only `start_setup` unlinks and it is
+unreachable while an artifact exists. That also fixes the reported Minor where
+a malformed artifact bricks a key permanently: treat unparseable and
+wrong-repo the same way, because both mean the artifact is unusable.
+
+Test: an artifact for a different repo is refused, its file is gone afterwards,
+and the next call opens a fresh setup pane rather than reusing it. Cover
+`/a/repo-old` against `/a/repo` explicitly.
+
+### W3-3 (Important): the guard hook has no tests at all
+
+`crew-guard.py` is the ONLY enforcement of a trust boundary that is otherwise
+pure convention, and `test_crew.py` does not reference it once. Verified:
+deleting both FORBIDDEN entries added in wave 2 leaves all 129 tests green. It
+has been correct twice now only because it was checked by hand.
+
+Fix: test it as a subprocess, feeding the real JSON on stdin and asserting the
+exit status and decision, so the test exercises the actual contract Claude Code
+uses rather than an imported function.
+
+Cover, at minimum: each forbidden verb denied from a crew cwd; the same verbs
+allowed from a non-worktree cwd; `crew mail send` and `herdr agent read`
+allowed from a crew cwd; and every bypass form that has already broken it once,
+which is the bare name, an absolute path, a `python3 crew.py` invocation, and a
+global flag between the program and the subcommand as in `herdr --json agent
+rename`. Each of these must fail if its FORBIDDEN entry is removed.
+
+Also add the missing test for the protocol fail-closed path: an unverified
+protocol must make `doctor` FAIL. Mutation-verified: removing the check
+currently leaves the suite green.
+
+### Constraints
+
+Every existing test must still pass, a green run must print nothing, and each
+new test must fail if its behaviour is removed. Say which mutation you ran for
+each. Do not run a real `crew dispatch`.
