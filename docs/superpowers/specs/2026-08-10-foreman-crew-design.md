@@ -453,7 +453,17 @@ Stated plainly rather than mitigated away:
 
 This design does not introduce a new privilege boundary and does not weaken an existing one. It increases the number of concurrent instances of a boundary already crossed by every Claude Code session with Bash access. That is a real increase in blast radius, honestly bounded at N sessions rather than one.
 
-The only genuine control is outside this spec: a Claude Code `PreToolUse` hook denying herdr verbs that target panes the caller does not own. Recorded as available and deliberately not in scope, so the absence is a decision.
+The only genuine control is outside `crew` itself: a Claude Code `PreToolUse` hook. **This now exists**, at `stow-packages/claude/.claude/hooks/crew-guard.py`, installed as a `Bash` matcher in the user's global settings.
+
+When the calling session's cwd is inside a `.claude/worktrees` path, it denies `crew dispatch`, `crew nudge`, `crew mail ack`, `herdr agent start`, `herdr agent prompt`, `herdr agent send-keys`, `herdr pane/tab/workspace close` and `herdr server stop`. Legitimate crew work is untouched and the foreman is unrestricted. Verified on 16 cases with no mismatches.
+
+Its limits, stated so nobody mistakes it for a sandbox:
+
+- It matches command text. A determined process evades it by encoding the command, writing a wrapper, or speaking to the socket directly.
+- It fails **open** on ambiguity: an unknown cwd is allowed. A guard that blocked the human's own shell when it could not tell would be switched off within the hour.
+- It identifies a crew member by cwd, so a foreman that changed directory into a worktree would be restricted, and a crew member that changed directory out of one would not.
+
+What it does stop is a confused or prompt-injected agent following instructions in plain text, which is the realistic threat here: crew members read untrusted diffs, logs and error output, and `crew peek` pipes exactly that into the foreman's context.
 
 ## Audit trail and data handling
 
