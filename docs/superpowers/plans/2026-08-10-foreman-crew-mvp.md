@@ -2162,9 +2162,9 @@ Always lead with load, grouped by repo:
   blocked    fanapp-terraform   fandevx-3487   implementer   permission prompt
 ```
 
-If `crew ls` prints `SNAPSHOT UNPARSED` or exits non-zero, say so and stop.
-Never report zeros you did not measure. A silent fleet and a broken parser
-look identical, and only one of them is good news.
+If `crew ls` exits non-zero, or prints anything containing `UNPARSED` or
+`DRIFT`, say so and stop. Never report zeros you did not measure. A silent
+fleet and a broken parser look identical, and only one of them is good news.
 
 ## Dispatching
 
@@ -2179,11 +2179,14 @@ crew dispatch <KEY> --type implementer
 crew dispatch <KEY> --type reviewer
 ```
 
-Dispatch opens a setup pane where `/start-ticket` runs interactively. Tell the
-human to answer it in that pane. Do not answer it for them and do not run
-`/start-ticket` yourself: it would pull the whole ticket payload into your
-context, once per dispatch, which is exactly the accumulation you exist to
-avoid.
+For a JIRA key, dispatch opens a short-lived setup pane where `/start-ticket`
+runs interactively. Tell the human to answer it in that pane. Do not answer it
+for them and do not run `/start-ticket` yourself: it would pull the whole
+ticket payload into your context, once per dispatch, which is exactly the
+accumulation you exist to avoid.
+
+For a ticketless slug there is no ticket to fetch, so no setup pane appears and
+nothing needs answering. Do not tell the human to go and look for one.
 
 Exit code 5 means a live session already holds that key. Report the resume
 command it printed rather than dispatching again.
