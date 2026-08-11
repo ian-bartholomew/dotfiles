@@ -454,22 +454,39 @@ def _run(args):
         return doctor()
     if verb == "ls":
         return cmd_ls("--json" in args)
+    if verb == "dispatch":
+        if len(args) < 2:
+            print("usage: crew dispatch <key> --type T [--repo R] [--model M]",
+                  file=sys.stderr)
+            return 2
+        key = args[1]
+        opts = {"--type": "implementer", "--repo": None, "--model": None}
+        rest = args[2:]
+        while rest:
+            flag, value, rest = take_flag(rest, tuple(opts))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            opts[flag] = value
+        try:
+            return cmd_dispatch(key, opts["--type"], opts["--repo"],
+                                opts["--model"])
+        except (CrewError, HerdrError) as exc:
+            print("dispatch failed: %s" % exc, file=sys.stderr)
+            return 1
     if verb == "mail":
         sub = args[1] if len(args) > 1 else ""
         if sub == "send":
-            key = repo = None
+            opts = {"--key": None, "--repo": None}
             rest = args[2:]
-            while rest and rest[0] in ("--key", "--repo"):
-                if rest[0] == "--key":
-                    key = rest[1]
-                else:
-                    repo = rest[1]
-                rest = rest[2:]
+            while rest and rest[0] in opts:
+                flag, value, rest = take_flag(rest, tuple(opts))
+                opts[flag] = value
             if len(rest) < 2:
                 print("usage: crew mail send [--key K] [--repo R] <state> <msg>",
                       file=sys.stderr)
                 return 2
-            return mail_send(key, repo, rest[0], " ".join(rest[1:]))
+            return mail_send(opts["--key"], opts["--repo"], rest[0],
+                              " ".join(rest[1:]))
         if sub == "unread":
             return mail_unread()
         if sub == "ack":
@@ -481,6 +498,210 @@ def _run(args):
         return 2
     print("unknown verb: %s" % verb, file=sys.stderr)
     return 2
+
+
+CONTRACT_PATH = os.path.expanduser("~/.claude/skills/crew-member/SKILL.md")
+SETUP_TIMEOUT = 900
+MODEL_BY_TYPE = {"implementer": "opus", "planner": "opus", "reviewer": "opus"}
+
+SETUP_PROMPT = (
+    "You are a short-lived setup agent. Do exactly this and nothing else.\n"
+    "1. Run /start-ticket {key} and answer its prompts with the human.\n"
+    "2. When the worktree exists, write this JSON to {artifact} and stop:\n"
+    '   {{"worktree": "<absolute worktree path>", '
+    '"branch": "<branch name>", "repo": "{repo}"}}\n'
+    "Do not implement anything. Do not open a PR."
+)
+
+
+def take_flag(rest, names):
+    """Pull `--flag value` off the front of rest. Reports a missing value
+    rather than raising IndexError at a crew member."""
+    if not rest or rest[0] not in names:
+        return None, None, rest
+    flag = rest[0]
+    if len(rest) < 2:
+        raise CrewError("%s needs a value" % flag)
+    return flag, rest[1], rest[2:]
+
+
+def contract_pointer(name, ctype, key, repo, worktree):
+    return (
+        "You are crew member `%s`, type %s, on %s in repo %s, worktree %s. "
+        "Read %s now and follow it for the rest of this session. "
+        "Report state changes with `crew mail send --key %s`."
+        % (name, ctype, key, repo, worktree, CONTRACT_PATH, key)
+    )
+
+
+def tag_pane(pane_id, key, repo, ctype, worktree):
+    args = [
+        "pane", "report-metadata", pane_id, "--source", "crew",
+        "--token", "crew=true",
+        "--token", "v=%s" % TOKEN_VERSION,
+        "--token", "key=%s" % sanitize_name(key),
+        "--token", "repo=%s" % repo,
+        "--token", "type=%s" % ctype,
+        "--token", "dispatched=%d" % int(time.time()),
+    ]
+    if worktree:
+        args += ["--token", "worktree=%s" % worktree]
+    herdr(*args)
+
+
+def find_member(snap, repo, key):
+    wanted = sanitize_name(key)
+    for member in crew_members(snap):
+        if member["repo"] == repo and member["key"] == wanted:
+            return member
+    return None
+
+
+def repo_root_for(path):
+    proc = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise CrewError("%s is not inside a git repository" % path)
+    return proc.stdout.strip()
+
+
+JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
+
+
+def is_ticket(key):
+    """A JIRA key takes the interactive /start-ticket path. Anything else is a
+    slug: there is no ticket to fetch, so no setup pane and no agent."""
+    return bool(JIRA_KEY_RE.match(key))
+
+
+def plain_worktree(key, repo_root):
+    """Worktree for a ticketless slug, at the same convention path."""
+    name = sanitize_name(key)
+    path = os.path.join(repo_root, ".claude", "worktrees", name)
+    if os.path.isdir(path):
+        return path
+    proc = subprocess.run(
+        ["git", "-C", repo_root, "worktree", "add", path, "-b", name],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise CrewError(
+            "git worktree add failed: %s" % proc.stderr.strip()[:200])
+    return path
+
+
+def setup_worktree(key, repo, repo_root):
+    """Run /start-ticket in an ephemeral pane. Handoff is a JSON artifact,
+    not scraped terminal output: an interactive REPL renders ANSI and does
+    not exit on its own."""
+    ensure_crew_dir()
+    artifact = os.path.join(CREW_DIR, "dispatch-%s.json" % sanitize_name(key))
+    if os.path.exists(artifact):
+        os.unlink(artifact)
+
+    split = herdr("pane", "split", "--current", "--direction", "down",
+                  "--cwd", repo_root, "--no-focus")
+    if split is None:
+        raise CrewError("cannot create a setup pane in dry-run")
+    setup_pane = split["result"]["pane"]["pane_id"]
+    tag_pane(setup_pane, key, repo, "setup", "")
+
+    setup_name = ("setup-" + sanitize_name(key))[:32]
+    herdr("agent", "start", setup_name, "--kind", "claude",
+          "--pane", setup_pane, "--", "--model", "opus")
+    herdr("agent", "prompt", setup_name,
+          SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo))
+
+    deadline = time.time() + SETUP_TIMEOUT
+    while time.time() < deadline:
+        if os.path.exists(artifact):
+            with open(artifact) as handle:
+                data = json.load(handle)
+            worktree = data.get("worktree", "")
+            if not worktree or not os.path.isdir(worktree):
+                raise CrewError(
+                    "setup wrote %s but worktree %r does not exist"
+                    % (artifact, worktree))
+            herdr("pane", "close", setup_pane)
+            return worktree
+        time.sleep(3)
+
+    raise CrewError(
+        "setup pane %s did not produce %s within %ds. Left open for "
+        "inspection." % (setup_pane, artifact, SETUP_TIMEOUT))
+
+
+def cmd_dispatch(key, ctype, repo, model):
+    if ctype not in MODEL_BY_TYPE:
+        raise CrewError("unknown type %r; expected one of %s"
+                        % (ctype, ", ".join(sorted(MODEL_BY_TYPE))))
+    workspace = os.environ.get("HERDR_WORKSPACE_ID")
+    if not workspace:
+        raise CrewError("dispatch must run inside a herdr pane")
+
+    repo_root = repo_root_for(os.getcwd())
+    repo = repo or os.path.basename(repo_root)
+    model = model or MODEL_BY_TYPE[ctype]
+
+    ensure_crew_dir()
+    lock_path = os.path.join(CREW_DIR, "dispatch-%s.lock" % sanitize_name(key))
+    with _locked(lock_path, "w"):
+        snap = snapshot()
+        assert_snapshot_shape(snap, schema_defs())
+
+        existing = find_member(snap, repo, key)
+        if existing:
+            print("already dispatched: %s/%s in pane %s (%s). "
+                  "Resume with: cd %s && claude --continue"
+                  % (repo, existing["key"], existing["pane"],
+                     existing["bucket"], existing["worktree"]))
+            mail_send(key, repo, "duplicate",
+                      "dispatch declined, a live session already holds this key")
+            return 5
+
+        if is_ticket(key):
+            worktree = setup_worktree(key, repo, repo_root)
+        else:
+            worktree = plain_worktree(key, repo_root)
+
+        tab = herdr("tab", "create", "--workspace", workspace,
+                    "--label", "%s/%s" % (repo, sanitize_name(key)),
+                    "--cwd", worktree, "--no-focus")
+        pane = tab["result"]["root_pane"]["pane_id"]
+
+        # Tag before agent.start. Tokens are authoritative, so an untagged
+        # pane is invisible to ls; a tag that failed afterwards would leave a
+        # live session unowned and burning shared quota.
+        tag_pane(pane, key, repo, ctype, worktree)
+
+        live = set(a.get("name") for a in snap["agents"] if a.get("name"))
+        name = pick_name(key, live)
+
+        start = ["agent", "start", name, "--kind", "claude", "--pane", pane,
+                 "--", "--model", model,
+                 "--append-system-prompt",
+                 contract_pointer(name, ctype, key, repo, worktree)]
+        if ctype == "planner":
+            start += ["--permission-mode", "plan"]
+        herdr(*start)
+
+        assignment = (
+            "You are dispatched on %s in %s. Your worktree is %s and the plan "
+            "from /start-ticket is already there. Read it, then begin. Report "
+            "with crew mail send --key %s when you settle." % (
+                key, repo, worktree, sanitize_name(key)))
+        try:
+            herdr("agent", "prompt", name, assignment)
+        except HerdrError as exc:
+            if "stall" in str(exc).lower():
+                print("DISPATCH FAILED: assignment did not land for %s. The "
+                      "pane stays tagged, so crew ls shows it with no "
+                      "assignment." % name, file=sys.stderr)
+                return 6
+            raise
+
+        print("dispatched %s as %s in pane %s" % (key, name, pane))
+        return 0
 
 
 def main(argv):

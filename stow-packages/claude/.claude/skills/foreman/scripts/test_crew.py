@@ -6,7 +6,8 @@ import crew
 from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
                    assert_schema_declares, CrewError, HerdrError,
-                   read_entries, next_seq, select_unread)
+                   read_entries, next_seq, select_unread,
+                   contract_pointer, find_member, is_ticket, take_flag)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -335,6 +336,90 @@ class TestMainNeverTracebacks(unittest.TestCase):
 
     def test_unknown_verb_returns_two(self):
         self.assertEqual(crew.main(["teleport"]), 2)
+
+
+class TestContractPointer(unittest.TestCase):
+    def test_names_the_contract_path_and_identity(self):
+        out = contract_pointer("fandevx-3511", "implementer", "FANDEVX-3511",
+                               "fanapp-terraform", "/w/FANDEVX-3511-x")
+        self.assertIn("fandevx-3511", out)
+        self.assertIn("implementer", out)
+        self.assertIn("FANDEVX-3511", out)
+        self.assertIn("fanapp-terraform", out)
+        self.assertIn("/w/FANDEVX-3511-x", out)
+        self.assertIn("crew-member/SKILL.md", out)
+        self.assertIn("crew mail send", out)
+
+    def test_no_em_dashes(self):
+        out = contract_pointer("a", "implementer", "K", "r", "/w")
+        self.assertNotIn("—", out)
+
+
+class TestIsTicket(unittest.TestCase):
+    def test_jira_key(self):
+        self.assertTrue(is_ticket("FANDEVX-3511"))
+
+    def test_another_project_prefix(self):
+        self.assertTrue(is_ticket("FESFEAT-603"))
+
+    def test_slug_is_not_a_ticket(self):
+        self.assertFalse(is_ticket("spike-crew-smoke"))
+
+    def test_lowercased_key_is_not_a_ticket(self):
+        self.assertFalse(is_ticket("fandevx-3511"))
+
+    def test_prefix_without_a_number_is_not_a_ticket(self):
+        self.assertFalse(is_ticket("FANDEVX-"))
+
+
+class TestTakeFlag(unittest.TestCase):
+    def test_pulls_a_flag_and_its_value(self):
+        flag, value, rest = take_flag(["--key", "k", "done", "msg"],
+                                      ("--key", "--repo"))
+        self.assertEqual((flag, value), ("--key", "k"))
+        self.assertEqual(rest, ["done", "msg"])
+
+    def test_unrecognised_leading_token_is_left_alone(self):
+        flag, value, rest = take_flag(["done", "msg"], ("--key",))
+        self.assertIsNone(flag)
+        self.assertEqual(rest, ["done", "msg"])
+
+    def test_flag_without_a_value_is_a_clean_error(self):
+        with self.assertRaises(CrewError):
+            take_flag(["--key"], ("--key",))
+
+    def test_empty_rest(self):
+        flag, value, rest = take_flag([], ("--key",))
+        self.assertIsNone(flag)
+        self.assertEqual(rest, [])
+
+
+class TestMainArgumentErrors(unittest.TestCase):
+    def test_dangling_flag_value_does_not_traceback(self):
+        self.assertEqual(crew.main(["mail", "send", "--key"]), 3)
+
+    def test_unexpected_dispatch_argument_does_not_traceback(self):
+        self.assertEqual(crew.main(["dispatch", "k", "--nonsense", "x"]), 3)
+
+
+class TestFindMember(unittest.TestCase):
+    def test_matches_on_repo_and_key(self):
+        snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
+                     [_pane("wQ:p1", CREW_TOKENS)])
+        found = find_member(snap, "fanapp-terraform", "fandevx-3511")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["pane"], "wQ:p1")
+
+    def test_same_key_different_repo_is_not_a_match(self):
+        snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
+                     [_pane("wQ:p1", CREW_TOKENS)])
+        self.assertIsNone(find_member(snap, "fes-config-ops", "fandevx-3511"))
+
+    def test_key_is_compared_sanitised(self):
+        snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
+                     [_pane("wQ:p1", CREW_TOKENS)])
+        self.assertIsNotNone(
+            find_member(snap, "fanapp-terraform", "FANDEVX-3511"))
 
 
 if __name__ == "__main__":
