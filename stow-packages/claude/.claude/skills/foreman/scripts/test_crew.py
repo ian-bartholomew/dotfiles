@@ -12,9 +12,9 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
                    assert_schema_declares, CrewError, HerdrError,
                    read_entries, next_seq, select_unread,
-                   contract_pointer, find_member, is_ticket, take_flag,
-                   _start_agent, resolve_repo, repo_root_for, clamp_lines,
-                   require_positional, worktree_for)
+                   contract_pointer, find_member, find_setup_pane, is_ticket,
+                   take_flag, _start_agent, resolve_repo, repo_root_for,
+                   clamp_lines, require_positional, worktree_for)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -522,6 +522,34 @@ class TestFindMemberIgnoresSetupPanes(unittest.TestCase):
         self.assertIsNone(find_member(snap, "/b/service", "k"))
 
 
+class TestFindSetupPane(unittest.TestCase):
+    """The mirror image of find_member: a setup pane must still be findable
+    on a retry, or a stuck human answering a prompt makes dispatch open a
+    second paid setup session on top of the first."""
+
+    def test_finds_a_matching_setup_pane(self):
+        toks = {"crew": "true", "v": "1", "key": "k", "repo": "r",
+                "root": "/root", "type": "setup"}
+        snap = {"agents": [_full_agent("wQ:p1", "idle", "setup-k")],
+                "panes": [_full_pane("wQ:p1", toks)]}
+        found = find_setup_pane(snap, "/root", "k")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["pane"], "wQ:p1")
+
+    def test_ignores_a_non_setup_member(self):
+        snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
+                     [_pane("wQ:p1", CREW_TOKENS)])
+        self.assertIsNone(
+            find_setup_pane(snap, CREW_TOKENS["root"], "fandevx-3511"))
+
+    def test_root_must_match(self):
+        toks = {"crew": "true", "v": "1", "key": "k", "repo": "r",
+                "root": "/root", "type": "setup"}
+        snap = {"agents": [_full_agent("wQ:p1", "idle", "setup-k")],
+                "panes": [_full_pane("wQ:p1", toks)]}
+        self.assertIsNone(find_setup_pane(snap, "/elsewhere", "k"))
+
+
 class TestStartAgent(unittest.TestCase):
     # Observed live: agent start immediately after tab create can reject a
     # pane that has not yet settled into an interactive shell.
@@ -613,6 +641,172 @@ class TestDispatchExitCodeMatchesOtherVerbs(unittest.TestCase):
         with mock.patch.object(crew, "cmd_dispatch",
                                side_effect=CrewError("boom")):
             self.assertEqual(crew.main(["dispatch", "k"]), 3)
+
+
+class TestDispatchRejectsATypeNameAsKey(unittest.TestCase):
+    """`crew dispatch planner --type implementer` used to return 0 and start
+    a paid session on a branch named planner, because planner is a valid
+    slug that also happens to be a crew type name."""
+
+    def test_a_type_name_is_refused_not_dispatched(self):
+        with self.assertRaises(CrewError) as ctx:
+            crew.cmd_dispatch("planner", "implementer", None, None)
+        self.assertIn("crew type", str(ctx.exception))
+
+    def test_case_is_normalised_before_the_check(self):
+        with self.assertRaises(CrewError):
+            crew.cmd_dispatch("PLANNER", "implementer", None, None)
+
+    def test_setup_is_reserved_too(self):
+        with self.assertRaises(CrewError):
+            crew.cmd_dispatch("setup", "implementer", None, None)
+
+    def test_refused_through_the_verb_too(self):
+        self.assertEqual(
+            crew.main(["dispatch", "planner", "--type", "implementer"]), 3)
+
+    def test_a_real_key_passes_the_guard(self):
+        # Not a type name, so this must fail later, for an unrelated reason,
+        # rather than being caught by this guard.
+        env = dict(crew.os.environ)
+        env.pop("HERDR_WORKSPACE_ID", None)
+        with mock.patch.dict(crew.os.environ, env, clear=True):
+            with self.assertRaises(CrewError) as ctx:
+                crew.cmd_dispatch("fandevx-9001", "implementer", None, None)
+        self.assertIn("herdr pane", str(ctx.exception))
+
+
+class TestSetupNoLongerPolls(unittest.TestCase):
+    """setup_worktree polled for the artifact on a 900 second deadline AFTER
+    the paid setup session already existed. Claude Code's own Bash timeout
+    (120s default, 600s max) killed the call before the poll ever finished,
+    and the setup pane survived the kill. Dispatch must resume on a later
+    call instead of ever waiting."""
+
+    def test_setup_timeout_constant_is_gone(self):
+        self.assertFalse(hasattr(crew, "SETUP_TIMEOUT"))
+
+
+class TestDispatchResumesFromArtifact(unittest.TestCase):
+    """Once /start-ticket has written its handoff artifact, a later dispatch
+    call must pick it up directly rather than re-running setup."""
+
+    def _herdr(self):
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "create"):
+                return {"result": {"root_pane": {"pane_id": "wTest:pArtifact"}}}
+            return {"ok": True}
+        return fake, calls
+
+    def test_artifact_present_completes_without_opening_setup(self):
+        fake, calls = self._herdr()
+        with mock.patch.object(crew, "resolve_repo",
+                               return_value=("/fake/repo", "artifact-test")), \
+             mock.patch.object(crew, "read_dispatch_artifact",
+                               return_value="/fake/repo/.claude/worktrees/x"), \
+             mock.patch.object(crew, "find_setup_pane", return_value=None), \
+             mock.patch.object(crew, "start_setup") as start, \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "herdr", side_effect=fake), \
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = crew.main(["dispatch", "FANDEVX-9001", "--type",
+                              "implementer", "--repo", "artifact-test"])
+        self.assertEqual(code, 0)
+        start.assert_not_called()
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_a_lingering_setup_pane_is_closed_on_completion(self):
+        fake, calls = self._herdr()
+        with mock.patch.object(crew, "resolve_repo",
+                               return_value=("/fake/repo", "artifact-test")), \
+             mock.patch.object(crew, "read_dispatch_artifact",
+                               return_value="/fake/repo/.claude/worktrees/x"), \
+             mock.patch.object(crew, "find_setup_pane",
+                               return_value={"pane": "wTest:pSetup"}), \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "herdr", side_effect=fake), \
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = crew.main(["dispatch", "FANDEVX-9002", "--type",
+                              "implementer", "--repo", "artifact-test"])
+        self.assertEqual(code, 0)
+        self.assertIn(("pane", "close", "wTest:pSetup"), calls)
+
+
+class TestDispatchOpensSetupWithoutBlocking(unittest.TestCase):
+    """crew dispatch on a JIRA key must return immediately once the setup
+    pane exists, rather than blocking on an artifact a paid setup session
+    has not written yet. A retry that finds the setup pane still there must
+    not spawn a second one."""
+
+    def test_a_fresh_jira_key_opens_setup_and_returns_seven(self):
+        with mock.patch.object(crew, "resolve_repo",
+                               return_value=("/fake/repo", "setup-test")), \
+             mock.patch.object(crew, "read_dispatch_artifact",
+                               return_value=None), \
+             mock.patch.object(crew, "find_setup_pane", return_value=None), \
+             mock.patch.object(crew, "start_setup",
+                               return_value="wTest:pSetup") as start, \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = crew.main(["dispatch", "FANDEVX-9003", "--type",
+                              "implementer", "--repo", "setup-test"])
+        self.assertEqual(code, 7)
+        start.assert_called_once()
+
+    def test_an_existing_setup_pane_is_reported_not_duplicated(self):
+        with mock.patch.object(crew, "resolve_repo",
+                               return_value=("/fake/repo", "setup-test")), \
+             mock.patch.object(crew, "read_dispatch_artifact",
+                               return_value=None), \
+             mock.patch.object(crew, "find_setup_pane",
+                               return_value={"pane": "wTest:pSetup"}), \
+             mock.patch.object(crew, "start_setup") as start, \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            code = crew.main(["dispatch", "FANDEVX-9004", "--type",
+                              "implementer", "--repo", "setup-test"])
+        self.assertEqual(code, 7)
+        start.assert_not_called()
+        self.assertIn("wTest:pSetup", out.getvalue())
+
+
+class TestSlugDispatchStillCompletesInOneCall(unittest.TestCase):
+    """A slug has no ticket to fetch and so no interactive step. It must not
+    be routed through setup at all, unlike a JIRA key."""
+
+    def test_a_slug_never_touches_setup(self):
+        def fake_herdr(*args, **kwargs):
+            if args[:2] == ("tab", "create"):
+                return {"result": {"root_pane": {"pane_id": "wTest:pSlug"}}}
+            return {"ok": True}
+
+        with mock.patch.object(crew, "resolve_repo",
+                               return_value=("/fake/repo", "slug-test")), \
+             mock.patch.object(crew, "plain_worktree",
+                               return_value="/fake/repo/.claude/worktrees/y"), \
+             mock.patch.object(crew, "find_setup_pane") as setup_lookup, \
+             mock.patch.object(crew, "start_setup") as start, \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "herdr", side_effect=fake_herdr), \
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = crew.main(["dispatch", "spike-something", "--type",
+                              "implementer", "--repo", "slug-test"])
+        self.assertEqual(code, 0)
+        setup_lookup.assert_not_called()
+        start.assert_not_called()
 
 
 class TestHerdrRawMode(unittest.TestCase):
@@ -796,6 +990,7 @@ class TestClaimForeman(unittest.TestCase):
         snap = {"agents": [_full_agent("wQ:p9", "idle", "someone-else")],
                 "panes": []}
         with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "snapshot", return_value=snap), \
              mock.patch.object(crew, "herdr") as fake, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -805,6 +1000,7 @@ class TestClaimForeman(unittest.TestCase):
     def test_no_op_when_this_pane_already_holds_it(self):
         snap = {"agents": [_full_agent("wV:p1", "idle", "foreman")], "panes": []}
         with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "snapshot", return_value=snap), \
              mock.patch.object(crew, "herdr") as fake, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -814,6 +1010,7 @@ class TestClaimForeman(unittest.TestCase):
     def test_refuses_to_steal_the_name_from_another_pane(self):
         snap = {"agents": [_full_agent("wQ:pT", "idle", "foreman")], "panes": []}
         with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "snapshot", return_value=snap), \
              mock.patch.object(crew, "herdr") as fake:
             with self.assertRaises(CrewError):
@@ -824,6 +1021,69 @@ class TestClaimForeman(unittest.TestCase):
         with mock.patch.object(crew, "calling_pane", return_value=""):
             with self.assertRaises(CrewError):
                 crew.claim_foreman()
+
+    def test_schema_drift_is_caught_before_any_rename(self):
+        """One commit after cmd_ls and cmd_dispatch both gained this check,
+        claim_foreman still called snapshot() raw. `name` is optional
+        precisely because a rename empties every lookup, so under drift this
+        must fail closed rather than attempt a rename with herdr's own
+        uniqueness check as the only guard."""
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs",
+                               side_effect=CrewError("boom")), \
+             mock.patch.object(crew, "herdr") as fake:
+            with self.assertRaises(CrewError):
+                crew.claim_foreman()
+            fake.assert_not_called()
+
+
+class TestClaimForemanVerb(unittest.TestCase):
+    """Deleting `if verb == "claim-foreman": return claim_foreman()` from
+    `_run` would leave every test above green, because they call
+    claim_foreman() directly, while `crew claim-foreman` silently became
+    unknown-verb. Both skills instruct the session to run the VERB, so
+    exercise crew.main instead."""
+
+    def test_success_through_the_verb(self):
+        snap = {"agents": [_full_agent("wQ:p9", "idle", "someone-else")],
+                "panes": []}
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "herdr") as fake, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(crew.main(["claim-foreman"]), 0)
+            fake.assert_called_once_with("agent", "rename", "wV:p1", "foreman")
+
+    def test_no_op_through_the_verb(self):
+        snap = {"agents": [_full_agent("wV:p1", "idle", "foreman")], "panes": []}
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "herdr") as fake, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(crew.main(["claim-foreman"]), 0)
+            fake.assert_not_called()
+
+    def test_refusal_to_steal_returns_three_and_names_the_pane(self):
+        snap = {"agents": [_full_agent("wQ:pT", "idle", "foreman")], "panes": []}
+        buf = io.StringIO()
+        with mock.patch.object(crew, "calling_pane", return_value="wV:p1"), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "herdr") as fake, \
+             mock.patch.object(crew.sys, "stderr", buf):
+            code = crew.main(["claim-foreman"])
+        self.assertEqual(code, 3)
+        fake.assert_not_called()
+        self.assertIn("wQ:pT", buf.getvalue())
+
+    def test_outside_herdr_returns_three_through_the_verb(self):
+        buf = io.StringIO()
+        with mock.patch.object(crew, "calling_pane", return_value=""), \
+             mock.patch.object(crew.sys, "stderr", buf):
+            code = crew.main(["claim-foreman"])
+        self.assertEqual(code, 3)
 
 
 class TestMailboxConcurrency(unittest.TestCase):

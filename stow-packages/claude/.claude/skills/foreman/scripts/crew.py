@@ -507,7 +507,15 @@ def claim_foreman():
     if not me:
         raise CrewError("not running inside a herdr pane, so there is no pane "
                         "to name. Start the foreman inside herdr.")
-    for agent in snapshot()["agents"]:
+    # Same two assertions cmd_ls and cmd_dispatch both use. `name` is
+    # optional precisely because a rename empties every lookup, so under
+    # drift this would attempt a rename with herdr's uniqueness check as
+    # the only guard.
+    defs = schema_defs()
+    assert_schema_declares(defs)
+    snap = snapshot()
+    assert_snapshot_shape(snap, defs)
+    for agent in snap["agents"]:
         if agent.get("name") != "foreman":
             continue
         if agent.get("pane_id") == me:
@@ -616,7 +624,6 @@ def _run(args):
 
 
 CONTRACT_PATH = os.path.expanduser("~/.claude/skills/crew-member/SKILL.md")
-SETUP_TIMEOUT = 900
 DRY_PANE = "wDRY:pDRY"
 MODEL_BY_TYPE = {"implementer": "opus", "planner": "opus", "reviewer": "opus"}
 
@@ -722,6 +729,17 @@ def find_member(snap, root, key):
     return None
 
 
+def find_setup_pane(snap, root, key):
+    """Setup panes are excluded from find_member so an orphan cannot brick a
+    key. They must still be findable, or a retry spawns a second paid one."""
+    wanted = sanitize_name(key)
+    for member in crew_members(snap):
+        if (member["type"] == "setup" and member["root"] == root
+                and member["key"] == wanted):
+            return member
+    return None
+
+
 DEV_ROOT = os.path.expanduser("~/Dev")
 
 
@@ -813,12 +831,17 @@ def _start_agent(args, tries=8, delay=3):
             time.sleep(delay)
 
 
-def setup_worktree(key, repo, repo_root):
-    """Run /start-ticket in an ephemeral pane. Handoff is a JSON artifact,
-    not scraped terminal output: an interactive REPL renders ANSI and does
-    not exit on its own."""
+def dispatch_artifact_path(key):
+    return os.path.join(CREW_DIR, "dispatch-%s.json" % sanitize_name(key))
+
+
+def start_setup(key, repo, repo_root):
+    """Open the ephemeral setup pane and start /start-ticket in it, then
+    return immediately. Dispatch must never block on the human answering it:
+    this pane and the artifact it eventually writes are the resumable state,
+    and a later `crew dispatch` call on the same key picks up from either."""
     ensure_crew_dir()
-    artifact = os.path.join(CREW_DIR, "dispatch-%s.json" % sanitize_name(key))
+    artifact = dispatch_artifact_path(key)
     if os.path.exists(artifact):
         os.unlink(artifact)
 
@@ -832,31 +855,92 @@ def setup_worktree(key, repo, repo_root):
                  "--pane", setup_pane, "--", "--model", "opus"])
     herdr("agent", "prompt", setup_name,
           SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo))
+    return setup_pane
 
-    if DRY_RUN:
-        return os.path.join(repo_root, ".claude", "worktrees",
-                            sanitize_name(key))
 
-    deadline = time.time() + SETUP_TIMEOUT
-    while time.time() < deadline:
-        if os.path.exists(artifact):
-            with open(artifact) as handle:
-                data = json.load(handle)
-            worktree = data.get("worktree", "")
-            if not worktree or not os.path.isdir(worktree):
-                raise CrewError(
-                    "setup wrote %s but worktree %r does not exist"
-                    % (artifact, worktree))
-            herdr("pane", "close", setup_pane)
-            return worktree
-        time.sleep(3)
+def read_dispatch_artifact(key):
+    """None if setup has not written it yet, which is the common case on a
+    fresh call. A CrewError if it exists but names a worktree that is not
+    there, rather than silently continuing on a broken handoff."""
+    artifact = dispatch_artifact_path(key)
+    if not os.path.exists(artifact):
+        return None
+    with open(artifact) as handle:
+        data = json.load(handle)
+    worktree = data.get("worktree", "")
+    if not worktree or not os.path.isdir(worktree):
+        raise CrewError(
+            "setup wrote %s but worktree %r does not exist"
+            % (artifact, worktree))
+    return worktree
 
-    raise CrewError(
-        "setup pane %s did not produce %s within %ds. Left open for "
-        "inspection." % (setup_pane, artifact, SETUP_TIMEOUT))
+
+def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, snap):
+    """Tag, start and confirm the crew member's own pane. Shared by the
+    artifact-ready path for a ticket and the inline path for a slug: once a
+    worktree exists there is no interactive step left either way."""
+    tab = herdr("tab", "create", "--workspace", workspace,
+                "--label", "%s/%s" % (repo, sanitize_name(key)),
+                "--cwd", worktree, "--no-focus")
+    pane = DRY_PANE if tab is None else tab["result"]["root_pane"]["pane_id"]
+
+    # Tag before agent.start. Tokens are authoritative, so an untagged
+    # pane is invisible to ls; a tag that failed afterwards would leave a
+    # live session unowned and burning shared quota.
+    tag_pane(pane, key, repo, ctype, os.path.basename(worktree), repo_root)
+
+    live = set(a.get("name") for a in snap["agents"] if a.get("name"))
+    name = pick_name(key, live)
+
+    start = ["agent", "start", name, "--kind", "claude", "--pane", pane,
+             "--", "--model", model,
+             "--append-system-prompt",
+             contract_pointer(name, ctype, key, repo, worktree)]
+    # A planner is an ordinary session told to plan. It must NOT run in
+    # plan mode: that blocks bash, so it could never send its own report.
+    _start_agent(start)
+
+    duty = {
+        "implementer": "Read the plan in your worktree, then implement it.",
+        "planner": ("Do not implement anything. Produce a plan and stop, "
+                    "then report needs-input with what you decided."),
+        "reviewer": ("Do not change code. Review, write your findings to a "
+                     "file in your worktree, and report done naming that "
+                     "file."),
+    }[ctype]
+    assignment = (
+        "You are dispatched on %s in %s as a %s. Your worktree is %s. %s "
+        "Report with crew mail send --key %s when you settle." % (
+            key, repo, ctype, worktree, duty, sanitize_name(key)))
+    herdr("agent", "prompt", name, assignment)
+
+    # `agent prompt` without --wait can silently not land, so the old
+    # agent_prompt_stalled handler was dead code. Confirm a lifecycle
+    # change instead: either state proves the prompt arrived. Any error
+    # here means delivery is unconfirmed, and herdr's timeout code is not
+    # enumerated in the schema, so treat every failure the same way.
+    #
+    # --until must be repeated, not comma-joined: a comma-joined value
+    # was rejected live with "invalid agent status: working,blocked".
+    try:
+        herdr("agent", "wait", name, "--until", "working",
+              "--until", "blocked", "--timeout", "15000")
+    except HerdrError:
+        print("DISPATCH INCOMPLETE: %s did not react to its assignment "
+              "within 15s, so delivery is unconfirmed. The pane stays "
+              "tagged, so crew ls shows it. Resend with: crew nudge %s "
+              "\"<text>\"" % (name, name), file=sys.stderr)
+        return 6
+
+    print("dispatched %s as %s in pane %s" % (key, name, pane))
+    return 0
 
 
 def cmd_dispatch(key, ctype, repo, model):
+    if sanitize_name(key) in MODEL_BY_TYPE or sanitize_name(key) == "setup":
+        raise CrewError(
+            "%r is a crew type, not a key. Did you mean --type %s?"
+            % (key, sanitize_name(key)))
     if ctype not in MODEL_BY_TYPE:
         raise CrewError("unknown type %r; expected one of %s"
                         % (ctype, ", ".join(sorted(MODEL_BY_TYPE))))
@@ -890,66 +974,36 @@ def cmd_dispatch(key, ctype, repo, model):
                       "dispatch declined, a live session already holds this key")
             return 5
 
+        # Resumable, so a retry never has to wait for the human. If setup
+        # already wrote its artifact, this call has nothing interactive
+        # left to do regardless of whether it is a ticket or a slug.
+        worktree = read_dispatch_artifact(key)
+        if worktree is not None:
+            setup = find_setup_pane(snap, repo_root, key)
+            if setup is not None:
+                herdr("pane", "close", setup["pane"])
+            return _complete_dispatch(key, ctype, repo, repo_root, workspace,
+                                      model, worktree, snap)
+
         if is_ticket(key):
-            worktree = setup_worktree(key, repo, repo_root)
-        else:
-            worktree = plain_worktree(key, repo_root)
+            setup = find_setup_pane(snap, repo_root, key)
+            if setup is not None:
+                print("setup pane %s is already running /start-ticket for "
+                      "%s. Answer the prompt in that pane, then re-run this "
+                      "command." % (setup["pane"], key))
+                return 7
+            setup_pane = start_setup(key, repo, repo_root)
+            print("opened setup pane %s to run /start-ticket for %s. Answer "
+                  "the prompt in that pane, then re-run this command."
+                  % (setup_pane, key))
+            return 7
 
-        tab = herdr("tab", "create", "--workspace", workspace,
-                    "--label", "%s/%s" % (repo, sanitize_name(key)),
-                    "--cwd", worktree, "--no-focus")
-        pane = DRY_PANE if tab is None else tab["result"]["root_pane"]["pane_id"]
-
-        # Tag before agent.start. Tokens are authoritative, so an untagged
-        # pane is invisible to ls; a tag that failed afterwards would leave a
-        # live session unowned and burning shared quota.
-        tag_pane(pane, key, repo, ctype, os.path.basename(worktree), repo_root)
-
-        live = set(a.get("name") for a in snap["agents"] if a.get("name"))
-        name = pick_name(key, live)
-
-        start = ["agent", "start", name, "--kind", "claude", "--pane", pane,
-                 "--", "--model", model,
-                 "--append-system-prompt",
-                 contract_pointer(name, ctype, key, repo, worktree)]
-        # A planner is an ordinary session told to plan. It must NOT run in
-        # plan mode: that blocks bash, so it could never send its own report.
-        _start_agent(start)
-
-        duty = {
-            "implementer": "Read the plan in your worktree, then implement it.",
-            "planner": ("Do not implement anything. Produce a plan and stop, "
-                        "then report needs-input with what you decided."),
-            "reviewer": ("Do not change code. Review, write your findings to a "
-                         "file in your worktree, and report done naming that "
-                         "file."),
-        }[ctype]
-        assignment = (
-            "You are dispatched on %s in %s as a %s. Your worktree is %s. %s "
-            "Report with crew mail send --key %s when you settle." % (
-                key, repo, ctype, worktree, duty, sanitize_name(key)))
-        herdr("agent", "prompt", name, assignment)
-
-        # `agent prompt` without --wait can silently not land, so the old
-        # agent_prompt_stalled handler was dead code. Confirm a lifecycle
-        # change instead: either state proves the prompt arrived. Any error
-        # here means delivery is unconfirmed, and herdr's timeout code is not
-        # enumerated in the schema, so treat every failure the same way.
-        #
-        # --until must be repeated, not comma-joined: a comma-joined value
-        # was rejected live with "invalid agent status: working,blocked".
-        try:
-            herdr("agent", "wait", name, "--until", "working",
-                  "--until", "blocked", "--timeout", "15000")
-        except HerdrError:
-            print("DISPATCH INCOMPLETE: %s did not react to its assignment "
-                  "within 15s, so delivery is unconfirmed. The pane stays "
-                  "tagged, so crew ls shows it. Resend with: crew nudge %s"
-                  % (name, name), file=sys.stderr)
-            return 6
-
-        print("dispatched %s as %s in pane %s" % (key, name, pane))
-        return 0
+        # A slug has no ticket to fetch, so there is no interactive step:
+        # the worktree exists as soon as plain_worktree returns, and this
+        # one call finishes the whole dispatch.
+        worktree = plain_worktree(key, repo_root)
+        return _complete_dispatch(key, ctype, repo, repo_root, workspace,
+                                  model, worktree, snap)
 
 
 PEEK_DEFAULT = 40
