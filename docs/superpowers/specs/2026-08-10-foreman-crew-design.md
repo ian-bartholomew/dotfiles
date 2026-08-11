@@ -36,7 +36,7 @@ Review on 2026-08-24. Measured from the mailbox (never pruned) and a `crew ls` s
 | --- | --- | --- | --- |
 | **New** sessions started untagged after the tooling exists | `crew ls` untagged count, minus the six baseline panes | Near zero | New untagged panes still appearing, meaning dispatch is being bypassed |
 | Cold restarts on work that already had a live crew session | A line in the mailbox written by `crew dispatch` when it declines a duplicate key | None | Recurring, meaning `crew ls` is not consulted before starting work |
-| `crew ls` invocations per working day | A counter incremented by `crew ls` into `~/.crew/usage.jsonl` | Daily or better | Rarely, meaning the roster is not what was missing |
+| `crew ls` invocations per working day | NOT INSTRUMENTED. `crew ls` writes no counter, so this row cannot be measured as written. Count by hand or drop the row | Daily or better | Rarely, meaning the roster is not what was missing |
 | Time from a crew reaching `done` to being acted on | `done` mail timestamp versus the `retire` or next-`nudge` timestamp for that key | Minutes | Hours, meaning notification is not the bottleneck |
 
 Each row names the mechanism that measures it, because an earlier draft asserted metrics nothing collected.
@@ -73,12 +73,18 @@ herdr 0.7.5, protocol 17, server running. Confirmed against the live socket API 
 | Block until settled | `agent.wait --until idle,done,blocked` | |
 | Peek | `agent.read --source detection\|recent-unwrapped --lines N` | CLI reads do **not** mark a pane seen |
 | Roster and status | `herdr api snapshot` | per-agent `agent_status`, `name`, `cwd`, `foreground_cwd`, `terminal_title_stripped`, `pane_id`, `tab_id`, `workspace_id`, `state_change_seq` |
-| Assignment record | `pane report-metadata <pane> --source crew --token k=v` | persists with `ttl_ms` omitted; round-trips as `tokens`; cleared with `--token k=`; 32 keys max per pane (a single `report-metadata` call carries at most 16), key pattern `^[A-Za-z0-9_-]{1,32}$`, **values are unconstrained strings** |
+| Assignment record | `pane report-metadata <pane> --source crew --token k=v` | persists with `ttl_ms` omitted; round-trips as `tokens`; cleared with `--token k=`; 32 keys max per pane (a single `report-metadata` call carries at most 16), key pattern `^[A-Za-z0-9_-]{1,32}$`; **a value is SILENTLY TRUNCATED at 80 characters**, which the schema does not declare |
 | State-change events | `events.wait --match pane.agent_status_changed` | the watchdog's only input |
 | Notify the human | `notification.show --title --body --sound` | |
 | Run a plain command in a pane | `pane.run`, `pane.wait-output --match\|--regex` | |
 
-Measured on 2026-08-10: eight tokens including a full filesystem path as a value persisted and round-tripped intact. Values are not subject to the key pattern, so the worktree path is storable directly.
+Measured on 2026-08-10, and the second measurement corrects the first.
+
+Eight tokens persisted and round-tripped, and values are not subject to the key pattern. But a value is **silently truncated at 80 characters**: 79 and 80 store intact, 100 and 128 both store as 80. `herdr api schema --json` declares no length limit, so this is an empirical fact recorded only here.
+
+The first measurement used a 43 character path and therefore proved nothing. The consequence was live: a worktree path of 91 characters stored as one ending `.claude/work` for a directory actually at `.claude/worktrees/help`, so the authoritative record pointed at a directory that did not exist. A real ticket path is longer still, for example 117 characters for `.../fanapp-terraform/.claude/worktrees/FANDEVX-3511-github-oidc-repository-claim-trust-policies`.
+
+So the path is NOT stored. `tag_pane` records the repo `root` and the `branch`, both short, refuses to write any value that would be truncated, and the path is derived from the two.
 
 herdr's `worktree` commands are deliberately unused. `worktree.remove` is keyed on `workspace_id`, so herdr binds each worktree to a workspace of its own, scattering crew across workspaces. Worktrees stay plain `git worktree add` at the CLAUDE.md convention path; topology comes from `tab.create`.
 
@@ -164,14 +170,14 @@ Stateless by derivation, with one exception, and the record is complete.
 | What | Where | Why |
 | --- | --- | --- |
 | Roster, live status | `herdr api snapshot`, recomputed per query | cannot go stale |
-| Assignment: `crew`, `v`, `key`, `repo`, `type`, `worktree`, `dispatched` | herdr pane `tokens` (7 of 32 keys) | authoritative and complete; dies with the pane, so the substrate enforces the lifetime |
+| Assignment: `crew`, `v`, `key`, `repo`, `root`, `branch`, `type`, `dispatched` | herdr pane `tokens` (8 of 32 keys) | authoritative and complete; dies with the pane, so the substrate enforces the lifetime |
 | Mailbox and cursor | `~/.crew/mailbox.jsonl`, `~/.crew/cursor` | the only files; the only genuinely non-derivable state |
 
 **Pane tokens are the authoritative record. Path derivation is not used to decide anything.** An earlier draft had this backwards.
 
 The reason is observable: a pane working FANDEVX-3511 reports `cwd` as the repo root but `foreground_cwd` as the worktree. The two diverge, and `foreground_cwd` follows the transient foreground process. A crew member that changes directory outside its worktree makes path derivation return **the wrong key rather than no key**. Silent misattribution is worse than a gap.
 
-Because token values are unconstrained strings, the worktree path is stored directly. So:
+Because a token value truncates silently at 80 characters, the worktree path is NOT stored. The short `root` and `branch` are, and the path is derived from them. So:
 
 - `crew ls` reports only panes carrying `crew=true`. An untagged pane is not crew, whatever its cwd.
 - Resume and `crew log` read the worktree from the `worktree` token, never from cwd.
@@ -479,24 +485,27 @@ Wiring `crew log` into `finish-work` Step 7 and `end-of-day` is deferred to a se
 
 ## Failure modes
 
+**Rows marked DEFERRED name a component this MVP does not ship.** The watchdog, `crew watch`, `crew log`, `crew retire`, `crew recover` and `crew uninstall` are a separate plan. Until the watchdog exists nothing detects a blocked, stalled or dead crew member: `crew ls` shows `blocked` only when herdr itself classified the pane that way, and a crew member that dies silently reads as idle forever. Those rows describe the intended design, not current behaviour.
+
+
 | # | Failure | Handling | Verified |
 | --- | --- | --- | --- |
-| 1 | Crew hits a usage limit mid-task and stalls silently | Watchdog detects absence of state change over time, not banner text | no |
+| 1 | Crew hits a usage limit mid-task and stalls silently | Watchdog detects absence of state change over time, not banner text | DEFERRED |
 | 2 | Foreman compacts | Survivable by construction: roster from snapshot, assignment from tokens, cursor on disk | by design |
 | 3 | Mailbox entry lost between read and report | Cursor advances only on `crew mail ack` after reporting; gap-tolerant, so a damaged record cannot wedge it | by design |
-| 4 | Live pane, dead worktree after `finish-work` cleanup | `crew recover` compares the `worktree` token against disk and proposes closing | no |
+| 4 | Live pane, dead worktree after `finish-work` cleanup | `crew recover` compares the `worktree` token against disk and proposes closing | DEFERRED |
 | 5 | Two foremen | Impossible: herdr enforces name uniqueness | yes |
-| 6 | herdr server restart drops pane tokens | `crew recover` proposes a path-derived re-tag for the human to confirm; never silent, because derivation can be confidently wrong | no |
+| 6 | herdr server restart drops pane tokens | `crew recover` proposes a path-derived re-tag for the human to confirm; never silent, because derivation can be confidently wrong | DEFERRED |
 | 7 | `agent.start` times out after the worktree exists | Idempotent on `repo + key`; re-dispatch uses `--continue`, correct whether or not a session was written | no |
 | 8 | `agent.prompt` stalls, assignment never landed | Failed dispatch reported; pane stays tagged so it is visible | no |
-| 9 | `crew log` run twice | Marker-guarded block, replaced not appended | no |
+| 9 | `crew log` run twice | Marker-guarded block, replaced not appended | DEFERRED |
 | 10 | Crew changes directory outside its worktree | Tokens authoritative; derivation only ever proposes | yes, observed |
 | 11 | Concurrent mailbox writes interleave | `fcntl.flock` on every read and write | yes, measured |
 | 12 | herdr field rename breaks the snapshot filter | `crew ls` asserts protocol and fields, prints `SNAPSHOT UNPARSED`, exits non-zero | no |
 | 13 | Tag fails after agent start, orphaning a live session | Tag before `agent.start` | by design |
-| 14 | Crew blocked on a permission prompt cannot self-report | Watchdog reports `blocked` from `agent_status` | no |
-| 15 | Crew process killed by OOM or signal, pane persists reading idle | Watchdog emits `dead` | no |
-| 16 | Setup pane hangs on an unattended JIRA prompt | Bounded timeout, failed dispatch, pane left open, listed by `crew recover` | no |
+| 14 | Crew blocked on a permission prompt cannot self-report | Watchdog reports `blocked` from `agent_status` | DEFERRED |
+| 15 | Crew process killed by OOM or signal, pane persists reading idle | Watchdog emits `dead` | DEFERRED |
+| 16 | Setup pane hangs on an unattended JIRA prompt | Bounded timeout, failed dispatch, pane left open, listed by `crew recover` | DEFERRED |
 | 17 | Quota exhaustion takes the whole fleet including the foreman | See below | no |
 
 Failure 17 is different in kind. The global model is `opus[1m]`, so crew, foreman and the author's scheduled agents draw on one bucket. A limit trip takes all of them at once, and `crew recover` and `crew ls` must therefore be runnable from **any** pane, not only the foreman, because the foreman is exactly what dies. Both are read-mostly and take no foreman-only lock; only `crew mail ack` is foreman-scoped.
