@@ -1881,12 +1881,11 @@ Wire into `main`:
             if flag is None:
                 raise CrewError("unexpected argument: %s" % rest[0])
             opts[flag] = value
-        try:
-            return cmd_dispatch(key, opts["--type"], opts["--repo"],
-                                opts["--model"])
-        except (CrewError, HerdrError) as exc:
-            print("dispatch failed: %s" % exc, file=sys.stderr)
-            return 1
+        # No per-verb handler: main maps CrewError and HerdrError to 3 for
+        # every verb. A dispatch-only handler returning 1 gave the same
+        # failure class two different exit codes depending on the verb.
+        return cmd_dispatch(key, opts["--type"], opts["--repo"],
+                            opts["--model"])
 ```
 
 - [ ] **Step 5: Run the test to verify it passes**
@@ -2237,8 +2236,16 @@ accumulation you exist to avoid.
 For a ticketless slug there is no ticket to fetch, so no setup pane appears and
 nothing needs answering. Do not tell the human to go and look for one.
 
-Exit code 5 means a live session already holds that key. Report the resume
-command it printed rather than dispatching again.
+Exit codes are the same for every verb, so you can rely on them:
+
+- 0 succeeded
+- 2 you passed bad arguments
+- 3 something failed: a herdr error, a crew error, or the filesystem
+- 5 a live session already holds that key. Report the resume command it
+  printed rather than dispatching again
+- 6 the crew member was started but never reacted to its assignment, so
+  delivery is unconfirmed. The pane is tagged and visible in `crew ls`.
+  Resend with `crew nudge`
 
 There is no cap on crew. Report load every time and let the human decide.
 The bottleneck is their review capacity, not tokens.
