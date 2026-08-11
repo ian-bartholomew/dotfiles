@@ -134,6 +134,6 @@ Say these only if relevant, and only once per session:
 
 ## Related
 
-- `/decompose-ticket` — run first, to turn an epic into stories
-- `~/.claude/skills/foreman/SKILL.md` — the role this skill adopts
-- `~/.claude/skills/crew-member/SKILL.md` — the contract each crew member gets
+- `/decompose-ticket`: run first, to turn an epic into stories
+- `~/.claude/skills/foreman/SKILL.md`: the role this skill adopts
+- `~/.claude/skills/crew-member/SKILL.md`: the contract each crew member gets
