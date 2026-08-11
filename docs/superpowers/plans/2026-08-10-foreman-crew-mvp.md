@@ -1597,6 +1597,7 @@ Add above `main`:
 ```python
 CONTRACT_PATH = os.path.expanduser("~/.claude/skills/crew-member/SKILL.md")
 SETUP_TIMEOUT = 900
+DRY_PANE = "wDRY:pDRY"
 MODEL_BY_TYPE = {"implementer": "opus", "planner": "opus", "reviewer": "opus"}
 
 SETUP_PROMPT = (
@@ -1674,6 +1675,9 @@ def plain_worktree(key, repo_root):
     """Worktree for a ticketless slug, at the same convention path."""
     name = sanitize_name(key)
     path = os.path.join(repo_root, ".claude", "worktrees", name)
+    if DRY_RUN:
+        print("git -C %s worktree add %s -b %s" % (repo_root, path, name))
+        return path
     if os.path.isdir(path):
         return path
     proc = subprocess.run(
@@ -1696,9 +1700,7 @@ def setup_worktree(key, repo, repo_root):
 
     split = herdr("pane", "split", "--current", "--direction", "down",
                   "--cwd", repo_root, "--no-focus")
-    if split is None:
-        raise CrewError("cannot create a setup pane in dry-run")
-    setup_pane = split["result"]["pane"]["pane_id"]
+    setup_pane = DRY_PANE if split is None else split["result"]["pane"]["pane_id"]
     tag_pane(setup_pane, key, repo, "setup", "")
 
     setup_name = ("setup-" + sanitize_name(key))[:32]
@@ -1706,6 +1708,10 @@ def setup_worktree(key, repo, repo_root):
           "--pane", setup_pane, "--", "--model", "opus")
     herdr("agent", "prompt", setup_name,
           SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo))
+
+    if DRY_RUN:
+        return os.path.join(repo_root, ".claude", "worktrees",
+                            sanitize_name(key))
 
     deadline = time.time() + SETUP_TIMEOUT
     while time.time() < deadline:
@@ -1762,7 +1768,7 @@ def cmd_dispatch(key, ctype, repo, model):
         tab = herdr("tab", "create", "--workspace", workspace,
                     "--label", "%s/%s" % (repo, sanitize_name(key)),
                     "--cwd", worktree, "--no-focus")
-        pane = tab["result"]["root_pane"]["pane_id"]
+        pane = DRY_PANE if tab is None else tab["result"]["root_pane"]["pane_id"]
 
         # Tag before agent.start. Tokens are authoritative, so an untagged
         # pane is invisible to ls; a tag that failed afterwards would leave a
@@ -1776,8 +1782,8 @@ def cmd_dispatch(key, ctype, repo, model):
                  "--", "--model", model,
                  "--append-system-prompt",
                  contract_pointer(name, ctype, key, repo, worktree)]
-        if ctype == "planner":
-            start += ["--permission-mode", "plan"]
+        # A planner is an ordinary session told to plan. It must NOT run in
+        # plan mode: that blocks bash, so it could never send its own report.
         herdr(*start)
 
         assignment = (
@@ -1785,15 +1791,22 @@ def cmd_dispatch(key, ctype, repo, model):
             "from /start-ticket is already there. Read it, then begin. Report "
             "with crew mail send --key %s when you settle." % (
                 key, repo, worktree, sanitize_name(key)))
+        herdr("agent", "prompt", name, assignment)
+
+        # `agent prompt` without --wait can silently not land, so the old
+        # agent_prompt_stalled handler was dead code. Confirm a lifecycle
+        # change instead: either state proves the prompt arrived. Any error
+        # here means delivery is unconfirmed, and herdr's timeout code is not
+        # enumerated in the schema, so treat every failure the same way.
         try:
-            herdr("agent", "prompt", name, assignment)
-        except HerdrError as exc:
-            if "stall" in str(exc).lower():
-                print("DISPATCH FAILED: assignment did not land for %s. The "
-                      "pane stays tagged, so crew ls shows it with no "
-                      "assignment." % name, file=sys.stderr)
-                return 6
-            raise
+            herdr("agent", "wait", name, "--until", "working,blocked",
+                  "--timeout", "15000")
+        except HerdrError:
+            print("DISPATCH INCOMPLETE: %s did not react to its assignment "
+                  "within 15s, so delivery is unconfirmed. The pane stays "
+                  "tagged, so crew ls shows it. Resend with: crew nudge %s"
+                  % (name, name), file=sys.stderr)
+            return 6
 
         print("dispatched %s as %s in pane %s" % (key, name, pane))
         return 0
@@ -1837,7 +1850,18 @@ Expected: PASS, 67 tests.
 crew --dry-run dispatch FANDEVX-0000 --type implementer --repo scratch 2>&1 | head -20
 ```
 
-Expected: the printed `herdr` lines show `pane report-metadata` for the setup pane, and for the crew pane the `report-metadata` line appears **before** the `agent start` line. If that order is reversed, stop and fix it: it is the difference between a recoverable empty pane and an orphaned live session.
+Expected: the full sequence prints, and for the crew pane the `pane report-metadata` line appears **before** the `agent start` line. If that order is reversed, stop and fix it: it is the difference between a recoverable empty pane and an orphaned live session.
+
+Under `--dry-run` no herdr call executes, so creation calls return nothing. `DRY_PANE` stands in for the pane ids that would be returned, `plain_worktree` prints the `git worktree add` it would run instead of running it, and the setup artifact poll is skipped. Without those, dry-run aborts after one line and this check cannot be performed at all.
+
+Run it for both a JIRA key and a slug, since they take different paths:
+
+```bash
+crew --dry-run dispatch FANDEVX-0000 --type implementer --repo scratch
+crew --dry-run dispatch spike-dry --type implementer --repo scratch
+```
+
+Expected in both: no real pane, tab, agent or worktree is created, and `report-metadata` precedes `agent start`. Confirm afterwards with `crew ls` that the fleet is unchanged and `git worktree list` that no worktree appeared.
 
 - [ ] **Step 7: Smoke test end to end on a scratch repo**
 
