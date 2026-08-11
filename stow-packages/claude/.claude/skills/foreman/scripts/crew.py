@@ -502,6 +502,7 @@ def _run(args):
 
 CONTRACT_PATH = os.path.expanduser("~/.claude/skills/crew-member/SKILL.md")
 SETUP_TIMEOUT = 900
+DRY_PANE = "wDRY:pDRY"
 MODEL_BY_TYPE = {"implementer": "opus", "planner": "opus", "reviewer": "opus"}
 
 SETUP_PROMPT = (
@@ -579,6 +580,9 @@ def plain_worktree(key, repo_root):
     """Worktree for a ticketless slug, at the same convention path."""
     name = sanitize_name(key)
     path = os.path.join(repo_root, ".claude", "worktrees", name)
+    if DRY_RUN:
+        print("git -C %s worktree add %s -b %s" % (repo_root, path, name))
+        return path
     if os.path.isdir(path):
         return path
     proc = subprocess.run(
@@ -615,9 +619,7 @@ def setup_worktree(key, repo, repo_root):
 
     split = herdr("pane", "split", "--current", "--direction", "down",
                   "--cwd", repo_root, "--no-focus")
-    if split is None:
-        raise CrewError("cannot create a setup pane in dry-run")
-    setup_pane = split["result"]["pane"]["pane_id"]
+    setup_pane = DRY_PANE if split is None else split["result"]["pane"]["pane_id"]
     tag_pane(setup_pane, key, repo, "setup", "")
 
     setup_name = ("setup-" + sanitize_name(key))[:32]
@@ -625,6 +627,10 @@ def setup_worktree(key, repo, repo_root):
                  "--pane", setup_pane, "--", "--model", "opus"])
     herdr("agent", "prompt", setup_name,
           SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo))
+
+    if DRY_RUN:
+        return os.path.join(repo_root, ".claude", "worktrees",
+                            sanitize_name(key))
 
     deadline = time.time() + SETUP_TIMEOUT
     while time.time() < deadline:
@@ -681,7 +687,7 @@ def cmd_dispatch(key, ctype, repo, model):
         tab = herdr("tab", "create", "--workspace", workspace,
                     "--label", "%s/%s" % (repo, sanitize_name(key)),
                     "--cwd", worktree, "--no-focus")
-        pane = tab["result"]["root_pane"]["pane_id"]
+        pane = DRY_PANE if tab is None else tab["result"]["root_pane"]["pane_id"]
 
         # Tag before agent.start. Tokens are authoritative, so an untagged
         # pane is invisible to ls; a tag that failed afterwards would leave a
@@ -695,8 +701,8 @@ def cmd_dispatch(key, ctype, repo, model):
                  "--", "--model", model,
                  "--append-system-prompt",
                  contract_pointer(name, ctype, key, repo, worktree)]
-        if ctype == "planner":
-            start += ["--permission-mode", "plan"]
+        # A planner is an ordinary session told to plan. It must NOT run in
+        # plan mode: that blocks bash, so it could never send its own report.
         _start_agent(start)
 
         assignment = (
@@ -704,15 +710,25 @@ def cmd_dispatch(key, ctype, repo, model):
             "from /start-ticket is already there. Read it, then begin. Report "
             "with crew mail send --key %s when you settle." % (
                 key, repo, worktree, sanitize_name(key)))
+        herdr("agent", "prompt", name, assignment)
+
+        # `agent prompt` without --wait can silently not land, so the old
+        # agent_prompt_stalled handler was dead code. Confirm a lifecycle
+        # change instead: either state proves the prompt arrived. Any error
+        # here means delivery is unconfirmed, and herdr's timeout code is not
+        # enumerated in the schema, so treat every failure the same way.
+        #
+        # --until must be repeated, not comma-joined: a comma-joined value
+        # was rejected live with "invalid agent status: working,blocked".
         try:
-            herdr("agent", "prompt", name, assignment)
-        except HerdrError as exc:
-            if "stall" in str(exc).lower():
-                print("DISPATCH FAILED: assignment did not land for %s. The "
-                      "pane stays tagged, so crew ls shows it with no "
-                      "assignment." % name, file=sys.stderr)
-                return 6
-            raise
+            herdr("agent", "wait", name, "--until", "working",
+                  "--until", "blocked", "--timeout", "15000")
+        except HerdrError:
+            print("DISPATCH INCOMPLETE: %s did not react to its assignment "
+                  "within 15s, so delivery is unconfirmed. The pane stays "
+                  "tagged, so crew ls shows it. Resend with: crew nudge %s"
+                  % (name, name), file=sys.stderr)
+            return 6
 
         print("dispatched %s as %s in pane %s" % (key, name, pane))
         return 0

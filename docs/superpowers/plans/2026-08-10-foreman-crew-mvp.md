@@ -313,6 +313,7 @@ def bucket(agent_status):
 def herdr(*args, **kwargs):
     capture = kwargs.pop("capture", True)
     read_only = kwargs.pop("read_only", False)
+    raw = kwargs.pop("raw", False)
     if kwargs:
         raise TypeError("unexpected kwargs: %s" % sorted(kwargs))
     if DRY_RUN and not read_only:
@@ -326,6 +327,8 @@ def herdr(*args, **kwargs):
             (proc.stderr or proc.stdout).strip()
             or "herdr %s exited %d" % (args[0], proc.returncode)
         )
+    if raw:
+        return proc.stdout
     out = proc.stdout.strip()
     if not out or not capture:
         return None
@@ -1799,7 +1802,8 @@ def cmd_dispatch(key, ctype, repo, model):
         # here means delivery is unconfirmed, and herdr's timeout code is not
         # enumerated in the schema, so treat every failure the same way.
         try:
-            herdr("agent", "wait", name, "--until", "working,blocked",
+            herdr("agent", "wait", name,
+                  "--until", "working", "--until", "blocked",
                   "--timeout", "15000")
         except HerdrError:
             print("DISPATCH INCOMPLETE: %s did not react to its assignment "
@@ -1947,6 +1951,23 @@ Bounded reads and one-way messages. Small, and separable from dispatch.
 Extend the `crew` import with `clamp_lines`, then append:
 
 ```python
+class TestHerdrRawMode(unittest.TestCase):
+    """`agent read` returns terminal text, not JSON. Without raw mode the
+    JSON parse raises and every peek fails."""
+
+    def test_raw_returns_stdout_untouched(self):
+        fake = mock.Mock(returncode=0, stdout="not json at all\n", stderr="")
+        with mock.patch.object(crew.subprocess, "run", return_value=fake):
+            self.assertEqual(crew.herdr("agent", "read", "x", raw=True),
+                             "not json at all\n")
+
+    def test_without_raw_the_same_output_is_an_error(self):
+        fake = mock.Mock(returncode=0, stdout="not json at all\n", stderr="")
+        with mock.patch.object(crew.subprocess, "run", return_value=fake):
+            with self.assertRaises(HerdrError):
+                crew.herdr("agent", "read", "x")
+
+
 class TestClampLines(unittest.TestCase):
     def test_default(self):
         self.assertEqual(clamp_lines(None), 40)
@@ -1984,15 +2005,14 @@ def clamp_lines(requested):
 
 
 def cmd_peek(name, lines):
-    payload = herdr("agent", "read", name, "--source", "detection",
-                    "--lines", str(clamp_lines(lines)))
-    if payload is None:
-        return 0
-    text = payload.get("result", {}).get("output", "")
-    if not text:
+    # `agent read` returns raw terminal text, not JSON. Verified against
+    # herdr 0.7.5: --format accepts only text and ansi, and rejects json.
+    text = herdr("agent", "read", name, "--source", "detection",
+                 "--lines", str(clamp_lines(lines)), raw=True)
+    if text is None or not text.strip():
         print("(no output; the pane may be on an alternate screen)")
         return 0
-    print(text)
+    print(text.rstrip())
     return 0
 
 
@@ -2028,11 +2048,14 @@ Wire into `main`:
             return 1
 ```
 
-The `result` key holding the text may differ from `output`. Confirm it against a live read and correct the code if so:
+`agent read` returns raw terminal text, NOT JSON. That was confirmed against herdr 0.7.5 before this task was written: `--format` accepts only `text` and `ansi` and rejects `json`, while `agent get` by contrast does return JSON. The CLI is asymmetric on purpose, content versus metadata. This is why `herdr()` gains a `raw` option rather than `cmd_peek` digging into a `result` key that does not exist. Confirm for yourself:
 
 ```bash
-herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m json.tool | head -20
+herdr agent read <some-live-agent> --source detection --lines 3 | head -c 120
+herdr agent read <some-live-agent> --format json --lines 3 2>&1 | head -c 120
 ```
+
+Expected: the first prints terminal text, the second prints `invalid read format: json`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -2040,7 +2063,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 71 tests.
+Expected: PASS, 75 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 

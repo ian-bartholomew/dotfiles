@@ -457,5 +457,40 @@ class TestStartAgent(unittest.TestCase):
         self.assertEqual(h.call_count, 1)
 
 
+class TestDispatchConfirmsDelivery(unittest.TestCase):
+    """agent prompt has no --wait, so it cannot tell dispatch whether the
+    assignment landed. cmd_dispatch now confirms with a lifecycle check
+    afterwards instead of relying on the (unreachable) agent_prompt_stalled
+    error the old code checked for."""
+
+    def _herdr(self, wait_error=None):
+        def fake(*args, **kwargs):
+            if args[:2] == ("tab", "create"):
+                return {"result": {"root_pane": {"pane_id": "wTest:pDispatch"}}}
+            if args[:2] == ("agent", "wait") and wait_error is not None:
+                raise wait_error
+            return {"ok": True}
+        return fake
+
+    def _dispatch(self, wait_error=None):
+        with mock.patch.object(crew, "repo_root_for",
+                               return_value="/fake/repo"), \
+             mock.patch.object(crew, "plain_worktree",
+                               return_value="/fake/repo/.claude/worktrees/x"), \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "herdr", side_effect=self._herdr(wait_error)), \
+             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}):
+            return crew.main(["dispatch", "test-dispatch-confirm",
+                              "--type", "implementer", "--repo", "dispatch-test"])
+
+    def test_confirmed_delivery_returns_zero(self):
+        self.assertEqual(self._dispatch(), 0)
+
+    def test_unconfirmed_delivery_returns_six_not_a_traceback(self):
+        self.assertEqual(
+            self._dispatch(wait_error=HerdrError("timeout")), 6)
+
+
 if __name__ == "__main__":
     unittest.main()
