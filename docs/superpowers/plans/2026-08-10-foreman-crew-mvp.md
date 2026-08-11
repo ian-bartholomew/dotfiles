@@ -1463,6 +1463,8 @@ The largest task. Creates the worktree via an ephemeral setup pane that hands of
   - `contract_pointer(name, ctype, key, repo, worktree) -> str`
   - `tag_pane(pane_id, key, repo, ctype, worktree) -> None`
   - `find_member(snap, repo, key) -> dict or None`
+  - `is_ticket(key) -> bool`
+  - `plain_worktree(key, repo_root) -> str`
   - `setup_worktree(key, repo, repo_root) -> str`
   - `cmd_dispatch(key, ctype, repo, model) -> int`
 
@@ -1509,6 +1511,23 @@ class TestContractPointer(unittest.TestCase):
     def test_no_em_dashes(self):
         out = contract_pointer("a", "implementer", "K", "r", "/w")
         self.assertNotIn("—", out)
+
+
+class TestIsTicket(unittest.TestCase):
+    def test_jira_key(self):
+        self.assertTrue(is_ticket("FANDEVX-3511"))
+
+    def test_another_project_prefix(self):
+        self.assertTrue(is_ticket("FESFEAT-603"))
+
+    def test_slug_is_not_a_ticket(self):
+        self.assertFalse(is_ticket("spike-crew-smoke"))
+
+    def test_lowercased_key_is_not_a_ticket(self):
+        self.assertFalse(is_ticket("fandevx-3511"))
+
+    def test_prefix_without_a_number_is_not_a_ticket(self):
+        self.assertFalse(is_ticket("FANDEVX-"))
 
 
 class TestTakeFlag(unittest.TestCase):
@@ -1570,6 +1589,8 @@ python3 test_crew.py -v
 Expected: FAIL with `ImportError: cannot import name 'contract_pointer'`.
 
 - [ ] **Step 4: Implement**
+
+Note the branch on `is_ticket`. A JIRA key (matching `^[A-Z][A-Z0-9]*-[0-9]+$` on the key as given) takes the interactive `/start-ticket` path through an ephemeral setup pane. A ticketless slug has no ticket to fetch, so `plain_worktree` does a bare `git worktree add` at the same convention path with no pane and no agent. Without that branch, the slug used by Step 7's smoke test would spawn a setup agent hunting a JIRA ticket that does not exist. A real key typed in lowercase takes the slug path and skips the JIRA step; that is a known and accepted edge, and the foreman skill shows uppercase keys.
 
 Add above `main`:
 
@@ -1638,6 +1659,30 @@ def repo_root_for(path):
     if proc.returncode != 0:
         raise CrewError("%s is not inside a git repository" % path)
     return proc.stdout.strip()
+
+
+JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
+
+
+def is_ticket(key):
+    """A JIRA key takes the interactive /start-ticket path. Anything else is a
+    slug: there is no ticket to fetch, so no setup pane and no agent."""
+    return bool(JIRA_KEY_RE.match(key))
+
+
+def plain_worktree(key, repo_root):
+    """Worktree for a ticketless slug, at the same convention path."""
+    name = sanitize_name(key)
+    path = os.path.join(repo_root, ".claude", "worktrees", name)
+    if os.path.isdir(path):
+        return path
+    proc = subprocess.run(
+        ["git", "-C", repo_root, "worktree", "add", path, "-b", name],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise CrewError(
+            "git worktree add failed: %s" % proc.stderr.strip()[:200])
+    return path
 
 
 def setup_worktree(key, repo, repo_root):
@@ -1709,7 +1754,10 @@ def cmd_dispatch(key, ctype, repo, model):
                       "dispatch declined, a live session already holds this key")
             return 5
 
-        worktree = setup_worktree(key, repo, repo_root)
+        if is_ticket(key):
+            worktree = setup_worktree(key, repo, repo_root)
+        else:
+            worktree = plain_worktree(key, repo_root)
 
         tab = herdr("tab", "create", "--workspace", workspace,
                     "--label", "%s/%s" % (repo, sanitize_name(key)),
@@ -1781,7 +1829,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 62 tests.
+Expected: PASS, 67 tests.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -1968,7 +2016,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 66 tests.
+Expected: PASS, 71 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 
