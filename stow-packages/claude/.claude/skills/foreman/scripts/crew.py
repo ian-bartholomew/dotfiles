@@ -643,6 +643,9 @@ SETUP_PROMPT = (
     "2. When the worktree exists, write this JSON to {artifact} and stop:\n"
     '   {{"worktree": "<absolute worktree path>", '
     '"branch": "<branch name>", "repo": "{repo}"}}\n'
+    "   The worktree must be {root}/.claude/worktrees/<branch name>, which is "
+    "where /start-ticket puts it. Dispatch derives that path back from the "
+    "branch and refuses an artifact where the two disagree.\n"
     "Do not implement anything. Do not open a PR."
 )
 
@@ -877,6 +880,12 @@ def is_inside(child, parent):
     return child.startswith(parent.rstrip(os.sep) + os.sep)
 
 
+def same_path(a, b):
+    """One notion of path equality for this file, resolved the way is_inside
+    resolves: two spellings that reach one directory are one path."""
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def start_setup(key, repo, repo_root):
     """Open the ephemeral setup pane and start /start-ticket in it, then
     return immediately. Dispatch must never block on the human answering it:
@@ -895,7 +904,8 @@ def start_setup(key, repo, repo_root):
     _start_agent(["agent", "start", setup_name, "--kind", "claude",
                  "--pane", setup_pane, "--", "--model", "opus"])
     herdr("agent", "prompt", setup_name,
-          SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo))
+          SETUP_PROMPT.format(key=key, artifact=artifact, repo=repo,
+                              root=repo_root))
     return setup_pane
 
 
@@ -910,6 +920,11 @@ def read_dispatch_artifact(key, repo, repo_root):
     outside the repo completed anyway, tagging the foreman's own root with the
     other checkout's branch, so the worktree derived from those tokens did not
     exist and both `crew ls` and the resume line printed that path.
+
+    Returns the path DERIVED from root and branch, not the artifact's spelling
+    of it, once the two are proven to be one directory. The tokens are the
+    authoritative record and every later reader recomputes the path from them,
+    so dispatch must work in the path that recomputation yields.
 
     Every refusal deletes the artifact. Unusable is unusable, whether that is
     unparseable JSON, another repo, or a worktree that is not there, and
@@ -949,7 +964,39 @@ def read_dispatch_artifact(key, repo, repo_root):
             "setup wrote %s but worktree %r does not exist. It has been "
             "discarded; re-run this command to start setup again."
             % (artifact, worktree))
-    return worktree
+
+    # The branch is validated HERE, not left to reach tag_pane. Over the token
+    # limit it would raise only after a pane already existed, leaking an
+    # untagged pane on every retry; and a separator or .. derives a directory
+    # that is inside the repo but is not a worktree.
+    branch = str(data.get("branch") or "").strip()
+    if not branch or os.sep in branch or branch in (os.curdir, os.pardir):
+        clear_dispatch_artifact(key)
+        raise CrewError(
+            "%s names branch %r, which is not a single directory name. It has "
+            "been discarded; re-run this command to start setup again."
+            % (artifact, branch))
+    if len(branch) > TOKEN_VALUE_MAX:
+        clear_dispatch_artifact(key)
+        raise CrewError(
+            "%s names branch %r, %d chars, over herdr's %d limit, so the token "
+            "recording it would be silently truncated. It has been discarded; "
+            "re-run this command to start setup again."
+            % (artifact, branch, len(branch), TOKEN_VALUE_MAX))
+
+    # Containment is not enough: <root>/tmp/wt is inside the repo, and the
+    # tokens written from it derive <root>/.claude/worktrees/wt, a path that
+    # does not exist. `crew ls`, `crew peek` and the exit 5 resume line would
+    # then all confidently print where the work is not.
+    derived = worktree_for(repo_root, branch)
+    if not same_path(worktree, derived):
+        clear_dispatch_artifact(key)
+        raise CrewError(
+            "%s names worktree %r, but branch %r derives %r, and the tokens "
+            "store the branch rather than the path. It has been discarded; "
+            "re-run this command to start setup again."
+            % (artifact, worktree, branch, derived))
+    return derived
 
 
 def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, snap):

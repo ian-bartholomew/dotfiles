@@ -17,7 +17,7 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    contract_pointer, find_member, find_setup_pane, is_ticket,
                    take_flag, _start_agent, resolve_repo, repo_root_for,
                    clamp_lines, require_positional, worktree_for, is_inside,
-                   read_dispatch_artifact)
+                   read_dispatch_artifact, same_path)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -1194,14 +1194,15 @@ def _repo_world(branch="FANDEVX-9101-x", repo_name="repo"):
             yield tmp, repo_root, worktree
 
 
-def _write_artifact(key, worktree, repo, text=None):
+def _write_artifact(key, worktree, repo, branch=None, text=None):
     path = crew.dispatch_artifact_path(key)
+    if branch is None and worktree is not None:
+        branch = os.path.basename(worktree)
     with open(path, "w") as handle:
         if text is not None:
             handle.write(text)
         else:
-            handle.write(json.dumps({"worktree": worktree,
-                                     "branch": os.path.basename(worktree),
+            handle.write(json.dumps({"worktree": worktree, "branch": branch,
                                      "repo": repo}))
     return path
 
@@ -1402,6 +1403,25 @@ class TestArtifactMustBeForThisRepo(unittest.TestCase):
             self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
             self.assertFalse(os.path.exists(artifact))
 
+    def test_a_convention_path_that_symlinks_out_of_the_repo_is_refused(self):
+        # The one escape the derived-path check cannot see: the artifact sits
+        # at exactly the path the tokens reproduce, and that path is a symlink
+        # to a directory outside the repo. Only the containment check refuses
+        # it, so this is what keeps that check honest.
+        with _repo_world() as (tmp, repo_root, _worktree):
+            outside = os.path.join(tmp, "outside-wt")
+            os.makedirs(outside)
+            escape = os.path.join(repo_root, ".claude", "worktrees", "escape")
+            os.symlink(outside, escape)
+            artifact = _write_artifact("FANDEVX-9124", escape, "repo",
+                                       branch="escape")
+            code, calls, _, _ = _run_dispatch("FANDEVX-9124", repo_root, "repo")
+            self.assertEqual(code, 3)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls),
+                             "a worktree that resolves outside the repo must "
+                             "not reach a paid session, however it is spelled")
+            self.assertFalse(os.path.exists(artifact))
+
     def test_unparseable_json_is_refused_discarded_and_set_up_fresh(self):
         with _repo_world() as (_, repo_root, _worktree):
             artifact = _write_artifact("FANDEVX-9123", None, None,
@@ -1415,6 +1435,131 @@ class TestArtifactMustBeForThisRepo(unittest.TestCase):
                                                 "repo")
             self.assertEqual(code, 7, err)
             self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
+
+
+class TestSetupPromptStatesTheWorktreeInvariant(unittest.TestCase):
+    """Dispatch refuses an artifact whose branch does not derive its worktree.
+    That has to be stated where the artifact is WRITTEN, or the setup agent
+    can only discover it by having a paid dispatch refused."""
+
+    def test_the_prompt_names_the_path_dispatch_will_derive(self):
+        sent = []
+
+        def fake_herdr(*args, **kwargs):
+            sent.append(args)
+            return {"result": {"pane": {"pane_id": "wTest:pSetup"}}}
+
+        with _repo_world() as (_, repo_root, _worktree):
+            with mock.patch.object(crew, "herdr", side_effect=fake_herdr), \
+                 mock.patch.object(crew, "_start_agent"):
+                crew.start_setup("FANDEVX-9140", "repo", repo_root)
+            prompts = [a for a in sent if a[:2] == ("agent", "prompt")]
+            self.assertEqual(len(prompts), 1)
+            self.assertIn(os.path.join(repo_root, ".claude", "worktrees"),
+                          prompts[0][3])
+
+
+class TestSamePath(unittest.TestCase):
+    def test_two_spellings_of_one_directory_are_equal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "real")
+            os.mkdir(real)
+            link = os.path.join(tmp, "link")
+            os.symlink(real, link)
+            self.assertTrue(same_path(link, real))
+            self.assertTrue(same_path(os.path.join(tmp, ".", "real"), real))
+
+    def test_different_directories_are_not_equal(self):
+        self.assertFalse(same_path("/a/repo/x", "/a/repo/y"))
+
+
+class TestArtifactBranchMustDeriveTheWorktree(unittest.TestCase):
+    """The tokens are the authoritative record and the worktree path is
+    DERIVED from root plus branch, so an artifact whose branch does not derive
+    its own worktree makes `crew ls`, `crew peek` and the exit 5 resume line
+    print a path the work is not at. Containment inside the repo does not
+    establish that: <root>/tmp/wt is inside the repo and derives
+    <root>/.claude/worktrees/wt, which does not exist."""
+
+    def test_a_worktree_off_the_convention_path_is_refused(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            off = os.path.join(repo_root, "tmp", "wt")
+            os.makedirs(off)
+            artifact = _write_artifact("FANDEVX-9130", off, "repo")
+            code, calls, _, err = _run_dispatch("FANDEVX-9130", repo_root,
+                                                "repo")
+            self.assertEqual(code, 3)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls),
+                             "a worktree the tokens cannot reproduce must not "
+                             "reach a paid session")
+            self.assertFalse(os.path.exists(artifact))
+            self.assertIn(off, err)
+            self.assertIn(os.path.join(repo_root, ".claude", "worktrees", "wt"),
+                          err)
+
+    def test_a_branch_that_disagrees_with_the_worktree_is_refused(self):
+        with _repo_world(branch="real-branch") as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9131", worktree, "repo",
+                                       branch="other-branch")
+            with self.assertRaises(CrewError) as ctx:
+                read_dispatch_artifact("FANDEVX-9131", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+        message = str(ctx.exception)
+        self.assertIn(worktree, message)
+        self.assertIn("other-branch", message)
+
+    def test_a_symlinked_worktree_resolves_to_the_derived_path(self):
+        # Same directory, different spelling. Dispatch must use the path the
+        # tokens reproduce, which is also the one the guard hook recognises as
+        # a crew worktree.
+        with _repo_world(branch="br") as (_, repo_root, worktree):
+            link = os.path.join(repo_root, "link")
+            os.symlink(worktree, link)
+            _write_artifact("FANDEVX-9132", link, "repo", branch="br")
+            self.assertEqual(
+                read_dispatch_artifact("FANDEVX-9132", "repo", repo_root),
+                worktree)
+
+    def test_an_absent_branch_is_refused(self):
+        with _repo_world() as (_, repo_root, worktree):
+            artifact = _write_artifact(
+                "FANDEVX-9133", worktree, "repo",
+                text=json.dumps({"worktree": worktree, "repo": "repo"}))
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9133", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_a_branch_with_a_separator_is_refused(self):
+        # Built so the derivation would round-trip: only the single-component
+        # rule can refuse it.
+        with _repo_world() as (_, repo_root, _worktree):
+            nested = os.path.join(repo_root, ".claude", "worktrees", "a", "b")
+            os.makedirs(nested)
+            _write_artifact("FANDEVX-9134", nested, "repo", branch="a/b")
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9134", "repo", repo_root)
+
+    def test_a_pardir_branch_is_refused(self):
+        # Also round-trips: <root>/.claude/worktrees/.. resolves to
+        # <root>/.claude, which is inside the repo and exists.
+        with _repo_world() as (_, repo_root, _worktree):
+            dotclaude = os.path.join(repo_root, ".claude")
+            _write_artifact("FANDEVX-9135", dotclaude, "repo", branch="..")
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9135", "repo", repo_root)
+
+    def test_an_over_length_branch_is_refused_before_any_pane_exists(self):
+        # tag_pane already refuses an over-length token, but only after the
+        # tab and pane exist, so every retry leaked an untagged pane and the
+        # artifact survived to do it again.
+        long_branch = "b" * (crew.TOKEN_VALUE_MAX + 1)
+        with _repo_world(branch=long_branch) as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9136", worktree, "repo")
+            code, calls, _, _ = _run_dispatch("FANDEVX-9136", repo_root, "repo")
+            self.assertEqual(code, 3)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls),
+                             "the branch must be refused before a pane exists")
+            self.assertFalse(os.path.exists(artifact))
 
 
 CREW_GUARD = os.path.normpath(os.path.join(
