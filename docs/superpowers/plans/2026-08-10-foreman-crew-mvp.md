@@ -2786,3 +2786,121 @@ Spec build-order steps 8 to 10, which depend on this one:
 - Wiring `crew log` into `finish-work` Step 7 and `end-of-day`, once the `finish-work-verification-fixes` branch lands.
 
 Until the watchdog exists, `blocked` crew are visible in `crew ls` but nobody is notified about them, and a stalled or dead crew member reads as idle. That gap is known and is why the watchdog is the first item in the follow-on plan.
+
+---
+
+## Hardening wave 2: findings from the review of claim-foreman and start-crew
+
+Nine findings, two of which spend money. Written as a spec because the previous
+attempt at these two additions was written directly and produced nine defects in
+about two hundred lines.
+
+### F1 (Critical): dispatch must not block, and a retry must not double-spend
+
+`setup_worktree` polls for the artifact on a 900 second deadline AFTER the setup
+pane and its paid session exist. Claude Code's Bash timeout is 120s by default
+and 600s at most, so the call is killed first. The setup pane survives, and
+because `find_member` skips `type == "setup"` a retry starts a SECOND paid setup
+session. It also makes `start-crew`'s instruction to "tell the user to answer it
+in that pane" impossible, because the session is stuck inside the Bash call.
+
+Remove the poll. `crew dispatch` becomes resumable, and returns a new exit code
+**7** meaning setup is pending:
+
+```python
+def find_setup_pane(snap, root, key):
+    """Setup panes are excluded from find_member so an orphan cannot brick a
+    key. They must still be findable, or a retry spawns a second paid one."""
+    wanted = sanitize_name(key)
+    for member in crew_members(snap):
+        if (member["type"] == "setup" and member["root"] == root
+                and member["key"] == wanted):
+            return member
+    return None
+```
+
+`cmd_dispatch` order becomes:
+
+1. A crew member already holds `root + key`: exit 5, unchanged.
+2. The artifact `~/.crew/dispatch-<key>.json` exists: read it, close the setup
+   pane if one is still open, and complete the mechanical sequence. Exit 0.
+3. A setup pane exists for this key: print which pane, and that the prompt there
+   must be answered, then re-run the same command. **Exit 7. Spawn nothing.**
+4. Otherwise: for a JIRA key, open the setup pane, start the setup agent, print
+   the same instruction. **Exit 7.** For a slug, `plain_worktree` runs inline and
+   flow continues to step 2's mechanics in the same call, exit 0, because there
+   is no interactive step.
+
+`SETUP_TIMEOUT` and the poll loop are deleted. A stale setup pane is the human's
+to close, and `crew recover` will list them when it exists.
+
+### F2 (Critical): a flag must never become a key, and neither must a type name
+
+`crew dispatch planner --type implementer` returns 0 and starts a paid session on
+a branch named `planner`, because `planner` is a valid slug. `start-crew`
+advertises `/start-crew FANDEVX-3401 --type planner` while its body never says
+how arguments are parsed, so a literal session passes `--type` and `planner` as
+keys. `require_positional` catches the flag; nothing catches the type name.
+
+In `crew.py`, reject a key that is a type name:
+
+```python
+    if sanitize_name(key) in MODEL_BY_TYPE or sanitize_name(key) == "setup":
+        raise CrewError(
+            "%r is a crew type, not a key. Did you mean --type %s?"
+            % (key, sanitize_name(key)))
+```
+
+In `start-crew/SKILL.md`, state the parse explicitly: tokens not starting with
+`-` are keys; `--type X` applies to all of them; anything else is an error worth
+stopping on rather than guessing.
+
+### F3 (Important): the guard hook must cover claim-foreman
+
+A crew member can rename its own agent to `foreman`, which destroys its own
+`peek` and `nudge` handle and locks the real foreman into exit 4 forever, which
+is the bug `claim-foreman` exists to fix. Add to `crew-guard.py`:
+
+```python
+    ("crew", ("claim-foreman",), "only the foreman claims the foreman name"),
+    ("herdr", ("agent", "rename"), "renaming an agent is the foreman's to do"),
+```
+
+### F4 (Important): claim_foreman must validate the snapshot
+
+It calls `snapshot()` raw, skipping `assert_schema_declares` and
+`assert_snapshot_shape`, one commit after both were added to `cmd_dispatch` for
+this reason. `name` is in `SCHEMA_OPTIONAL_AGENT_FIELDS` precisely because a
+rename empties every lookup, so under drift this would attempt a rename with
+herdr's uniqueness check as the only guard. Use the same two lines `cmd_ls` uses.
+
+### F5 (Important): the foreman preflight must not hide a failure
+
+`test "${HERDR_ENV:-}" = 1 && crew doctor && crew claim-foreman` prints nothing
+and exits 1 when `HERDR_ENV` is unset, so silent failure reads as nothing
+happening. Split it, as `start-crew` already does, and say what to do when the
+claim fails for any reason rather than only the another-pane case.
+
+### F6 to F9 (Minor), each verified
+
+- `crew nudge <name>` with no text exits 2. Fix the suggestion in
+  `start-crew/SKILL.md` and at `crew.py:947` to include text.
+- `start-crew` never mentions `--repo`, so every key lands in the foreman's own
+  repo. Tokens then disagree with the worktree `/start-ticket` made and
+  `find_member` misses it, producing a duplicate paid dispatch. The skill must
+  ask which repo, or pass `--repo` per key.
+- "killed by the OS reads as idle forever" is false: an agent-less crew pane
+  buckets to `recover` and `render_ls` prints "need recovery". Wrong in
+  `start-crew`, in `crew-member/SKILL.md`, and in the wiki article at
+  `~/Documents/Work/wiki/guides/foreman-crew-orchestration.md`.
+- `crew-member/SKILL.md` says a watchdog reports blocked "from outside". Nothing
+  does. Say so.
+
+### F10: test the verb, not only the function
+
+Deleting `if verb == "claim-foreman": return claim_foreman()` from `_run` leaves
+all four new tests green while `crew claim-foreman` returns "unknown verb". The
+skills instruct sessions to run the VERB. Add tests through `crew.main([...])`
+for the success path, both refusals returning 3, and that the refusal message
+names the offending pane, since both skills tell the session to report it.
+
