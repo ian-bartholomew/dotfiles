@@ -471,15 +471,18 @@ def main(argv):
         return 2
     try:
         return _run(args)
-    except CrewError as exc:
-        print("crew: %s" % exc, file=sys.stderr)
-        return 3
     except HerdrError as exc:
         print("crew: herdr: %s" % exc, file=sys.stderr)
         return 3
-    except ValueError as exc:
-        print("crew: bad argument: %s" % exc, file=sys.stderr)
+    except CrewError as exc:
+        print("crew: %s" % exc, file=sys.stderr)
+        return 3
+    except (ValueError, IndexError) as exc:
+        print("crew: bad arguments: %s" % exc, file=sys.stderr)
         return 2
+    except OSError as exc:
+        print("crew: filesystem: %s" % exc, file=sys.stderr)
+        return 3
 
 
 def _run(args):
@@ -1217,12 +1220,14 @@ Wire into `main`:
         if sub == "send":
             key = repo = None
             rest = args[2:]
-            while rest and rest[0] in ("--key", "--repo"):
-                if rest[0] == "--key":
-                    key = rest[1]
+            while True:
+                flag, value, rest = take_flag(rest, ("--key", "--repo"))
+                if flag is None:
+                    break
+                if flag == "--key":
+                    key = value
                 else:
-                    repo = rest[1]
-                rest = rest[2:]
+                    repo = value
             if len(rest) < 2:
                 print("usage: crew mail send [--key K] [--repo R] <state> <msg>",
                       file=sys.stderr)
@@ -1489,6 +1494,36 @@ class TestContractPointer(unittest.TestCase):
         self.assertNotIn("—", out)
 
 
+class TestTakeFlag(unittest.TestCase):
+    def test_pulls_a_flag_and_its_value(self):
+        flag, value, rest = take_flag(["--key", "k", "done", "msg"],
+                                      ("--key", "--repo"))
+        self.assertEqual((flag, value), ("--key", "k"))
+        self.assertEqual(rest, ["done", "msg"])
+
+    def test_unrecognised_leading_token_is_left_alone(self):
+        flag, value, rest = take_flag(["done", "msg"], ("--key",))
+        self.assertIsNone(flag)
+        self.assertEqual(rest, ["done", "msg"])
+
+    def test_flag_without_a_value_is_a_clean_error(self):
+        with self.assertRaises(CrewError):
+            take_flag(["--key"], ("--key",))
+
+    def test_empty_rest(self):
+        flag, value, rest = take_flag([], ("--key",))
+        self.assertIsNone(flag)
+        self.assertEqual(rest, [])
+
+
+class TestMainArgumentErrors(unittest.TestCase):
+    def test_dangling_flag_value_does_not_traceback(self):
+        self.assertEqual(crew.main(["mail", "send", "--key"]), 3)
+
+    def test_unexpected_dispatch_argument_does_not_traceback(self):
+        self.assertEqual(crew.main(["dispatch", "k", "--nonsense", "x"]), 3)
+
+
 class TestFindMember(unittest.TestCase):
     def test_matches_on_repo_and_key(self):
         snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
@@ -1534,6 +1569,17 @@ SETUP_PROMPT = (
     '"branch": "<branch name>", "repo": "{repo}"}}\n'
     "Do not implement anything. Do not open a PR."
 )
+
+
+def take_flag(rest, names):
+    """Pull `--flag value` off the front of rest. Reports a missing value
+    rather than raising IndexError at a crew member."""
+    if not rest or rest[0] not in names:
+        return None, None, rest
+    flag = rest[0]
+    if len(rest) < 2:
+        raise CrewError("%s needs a value" % flag)
+    return flag, rest[1], rest[2:]
 
 
 def contract_pointer(name, ctype, key, repo, worktree):
@@ -1700,12 +1746,10 @@ Wire into `main`:
         opts = {"--type": "implementer", "--repo": None, "--model": None}
         rest = args[2:]
         while rest:
-            if rest[0] in opts and len(rest) > 1:
-                opts[rest[0]] = rest[1]
-                rest = rest[2:]
-            else:
-                print("unexpected argument: %s" % rest[0], file=sys.stderr)
-                return 2
+            flag, value, rest = take_flag(rest, tuple(opts))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            opts[flag] = value
         try:
             return cmd_dispatch(key, opts["--type"], opts["--repo"],
                                 opts["--model"])
@@ -1720,7 +1764,7 @@ Wire into `main`:
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 56 tests.
+Expected: PASS, 62 tests.
 
 - [ ] **Step 6: Verify the dry-run sequence, especially the tag order**
 
@@ -1907,7 +1951,7 @@ herdr agent read <some-live-agent> --source detection --lines 5 | python3 -m jso
 python3 test_crew.py -v
 ```
 
-Expected: PASS, 60 tests.
+Expected: PASS, 66 tests.
 
 - [ ] **Step 5: Verify peek does not clear the `done` state**
 
