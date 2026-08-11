@@ -9,7 +9,7 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    assert_schema_declares, CrewError, HerdrError,
                    read_entries, next_seq, select_unread,
                    contract_pointer, find_member, is_ticket, take_flag,
-                   _start_agent, resolve_repo, repo_root_for)
+                   _start_agent, resolve_repo, repo_root_for, clamp_lines)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -519,6 +519,52 @@ class TestDispatchConfirmsDelivery(unittest.TestCase):
     def test_unconfirmed_delivery_returns_six_not_a_traceback(self):
         self.assertEqual(
             self._dispatch(wait_error=HerdrError("timeout")), 6)
+
+
+class TestHerdrRawMode(unittest.TestCase):
+    """`agent read` returns terminal text, not JSON. Without raw mode the
+    JSON parse raises and every peek fails."""
+
+    def test_raw_returns_stdout_untouched(self):
+        fake = mock.Mock(returncode=0, stdout="not json at all\n", stderr="")
+        with mock.patch.object(crew.subprocess, "run", return_value=fake):
+            self.assertEqual(crew.herdr("agent", "read", "x", raw=True),
+                             "not json at all\n")
+
+    def test_without_raw_the_same_output_is_an_error(self):
+        fake = mock.Mock(returncode=0, stdout="not json at all\n", stderr="")
+        with mock.patch.object(crew.subprocess, "run", return_value=fake):
+            with self.assertRaises(HerdrError):
+                crew.herdr("agent", "read", "x")
+
+
+class TestClampLines(unittest.TestCase):
+    def test_default(self):
+        self.assertEqual(clamp_lines(None), 40)
+
+    def test_within_range_passes_through(self):
+        self.assertEqual(clamp_lines(120), 120)
+
+    def test_capped_at_200(self):
+        self.assertEqual(clamp_lines(5000), 200)
+
+    def test_floor_of_one(self):
+        self.assertEqual(clamp_lines(0), 1)
+        self.assertEqual(clamp_lines(-9), 1)
+
+
+class TestMainErrorMapping(unittest.TestCase):
+    """main wraps _run centrally; peek and nudge rely on this rather than
+    each carrying their own try/except. Completes the mapping for the two
+    exception types that were not yet covered."""
+
+    def test_index_error_from_a_verb_exits_two_not_a_traceback(self):
+        with mock.patch.object(crew, "_run", side_effect=IndexError("boom")):
+            self.assertEqual(crew.main(["peek", "x"]), 2)
+
+    def test_os_error_from_a_verb_exits_three_not_a_traceback(self):
+        with mock.patch.object(crew, "_run", side_effect=OSError("boom")):
+            self.assertEqual(crew.main(["peek", "x"]), 3)
 
 
 if __name__ == "__main__":

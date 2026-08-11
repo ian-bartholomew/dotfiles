@@ -74,6 +74,7 @@ def bucket(agent_status):
 def herdr(*args, **kwargs):
     capture = kwargs.pop("capture", True)
     read_only = kwargs.pop("read_only", False)
+    raw = kwargs.pop("raw", False)
     if kwargs:
         raise TypeError("unexpected kwargs: %s" % sorted(kwargs))
     if DRY_RUN and not read_only:
@@ -87,6 +88,10 @@ def herdr(*args, **kwargs):
             (proc.stderr or proc.stdout).strip()
             or "herdr %s exited %d" % (args[0], proc.returncode)
         )
+    # `agent read` returns raw terminal text, not JSON; `--format json` is
+    # rejected outright. raw callers want that text as-is, never parsed.
+    if raw:
+        return proc.stdout
     out = proc.stdout.strip()
     if not out or not capture:
         return None
@@ -473,6 +478,24 @@ def _run(args):
         except (CrewError, HerdrError) as exc:
             print("dispatch failed: %s" % exc, file=sys.stderr)
             return 1
+    if verb == "peek":
+        if len(args) < 2:
+            print("usage: crew peek <name> [--lines N]", file=sys.stderr)
+            return 2
+        name = args[1]
+        opts = {"--lines": None}
+        rest = args[2:]
+        while rest:
+            flag, value, rest = take_flag(rest, tuple(opts))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            opts[flag] = value
+        return cmd_peek(name, opts["--lines"])
+    if verb == "nudge":
+        if len(args) < 3:
+            print("usage: crew nudge <name> \"<text>\"", file=sys.stderr)
+            return 2
+        return cmd_nudge(args[1], " ".join(args[2:]))
     if verb == "mail":
         sub = args[1] if len(args) > 1 else ""
         if sub == "send":
@@ -753,6 +776,34 @@ def cmd_dispatch(key, ctype, repo, model):
         return 0
 
 
+PEEK_DEFAULT = 40
+PEEK_CAP = 200
+
+
+def clamp_lines(requested):
+    if requested is None:
+        return PEEK_DEFAULT
+    return max(1, min(int(requested), PEEK_CAP))
+
+
+def cmd_peek(name, lines):
+    # `agent read` returns raw terminal text, not JSON. Verified against
+    # herdr 0.7.5: --format accepts only text and ansi, and rejects json.
+    text = herdr("agent", "read", name, "--source", "detection",
+                 "--lines", str(clamp_lines(lines)), raw=True)
+    if text is None or not text.strip():
+        print("(no output; the pane may be on an alternate screen)")
+        return 0
+    print(text.rstrip())
+    return 0
+
+
+def cmd_nudge(name, text):
+    herdr("agent", "prompt", name, text)
+    print("nudged %s" % name)
+    return 0
+
+
 def main(argv):
     global DRY_RUN
     args = list(argv)
@@ -761,10 +812,10 @@ def main(argv):
         args.remove("--dry-run")
     try:
         return _run(args)
-    except (CrewError, HerdrError) as exc:
+    except (CrewError, HerdrError, OSError) as exc:
         print("crew: %s" % exc, file=sys.stderr)
         return 3
-    except ValueError as exc:
+    except (ValueError, IndexError) as exc:
         print("crew: %s" % exc, file=sys.stderr)
         return 2
 
