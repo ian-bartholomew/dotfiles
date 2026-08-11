@@ -38,8 +38,8 @@ from outside. Do not try to pre-announce it.
 Never put command output, credentials, ARNs, account ids, tokens, hostnames,
 IP addresses, stack traces or file contents in a mail line. State plus one
 human-readable sentence only. Detail belongs in a file in your worktree, not
-in the mailbox: the mailbox is never pruned and gets digested into a
-git-tracked project log. When in doubt, leave it out.
+in the mailbox: the mailbox is never pruned, and a later change will digest it
+into a git-tracked project log.
 
 ## Boundaries
 
@@ -64,8 +64,11 @@ Never force-push. Never merge. The human merges.
 
 - Do NOT run `/start-ticket`. It already ran before you existed; your
   worktree and plan are in place.
-- Do NOT write to any project `log.md`. The foreman digests the mailbox.
-  Several crew writing to one log interleaves.
+- Do NOT write to any project `log.md`. Several crew writing to one log
+  interleaves, and the mailbox already holds your report. Nothing digests it
+  into a project log yet: that is a later change, and the foreman is forbidden
+  to write files at all. Do not paper over that gap by writing the log
+  yourself.
 - Do NOT run `/finish-work`. Report `done` and stop. It would delete the
   worktree the foreman is still tracking.
 
