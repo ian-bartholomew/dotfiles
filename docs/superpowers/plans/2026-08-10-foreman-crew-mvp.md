@@ -2989,3 +2989,149 @@ currently leaves the suite green.
 Every existing test must still pass, a green run must print nothing, and each
 new test must fail if its behaviour is removed. Say which mutation you ran for
 each. Do not run a real `crew dispatch`.
+
+---
+
+## Hardening wave 4
+
+Findings from the whole-branch adversarial review. C1 and C2 mean the JIRA half
+of the product cannot complete a single dispatch, so nothing else matters until
+they are fixed. Chosen scope: C1, C2, C3, and the three invariants whose
+mutation survived. The remaining Importants are documented, not fixed.
+
+### W4-1 (Critical, money): every JIRA dispatch wedges after paying for setup
+
+`crew.py:973` refuses a branch containing `os.sep`. `/start-ticket` mandates
+`{ticket-key}/{slugified-summary}`, for example
+`FANDEVX-2505/submit-aws-account-request`, and `SETUP_PROMPT` tells the setup
+agent to run exactly that skill. So a correct setup agent always produces a
+branch that dispatch always refuses: first call exit 7 and a paid session
+spent, re-run exit 3 with the artifact deleted, then exit 7 forever.
+
+The derivation was never the problem. `worktree_for(root,
+"FANDEVX-2505/submit-aws-account-request")` resolves to exactly where
+`/start-ticket` puts the worktree, and the branch is well inside the 80
+character token limit. The single-component rule is the only thing breaking it,
+and the commit that added it asserted the opposite after checking the branch
+convention in CLAUDE.md rather than the actual producer.
+
+Fix: allow interior separators. Keep refusing what is genuinely unsafe or
+ambiguous, which is an empty branch, an absolute path, a leading or trailing
+separator, any `.` or `..` component, and anything over the token limit. Reject
+by inspecting components, not by scanning for a substring, so `..` is caught
+while `feat..ure` is not.
+
+Test: `FANDEVX-2505/submit-aws-account-request` round-trips through
+`worktree_for` and dispatches; `../escape`, `a/../../b`, `/abs`, `trailing/`
+and an over-length branch are each refused. Assert on the derived path, not
+just the exit code, because the point is that the nested path is correct.
+
+### W4-2 (Critical): a rejected artifact wedges the key, and the message lies
+
+Every rejection ends "It has been discarded; re-run this command to start setup
+again." Re-running does not start setup. `cmd_dispatch` reaches
+`find_setup_pane` first and returns exit 7 naming a pane whose agent has
+already written its JSON and stopped, so there is no prompt for the human to
+answer and no path forward. Escape currently needs the human to close the pane
+by hand, which the foreman is forbidden to do, and then pay for a second setup
+session.
+
+The test asserting "the key is not bricked: the next call starts setup again"
+passes only because its fixture snapshot omits the setup pane that makes the
+claim false. Fix the fixture as part of this, or the fix cannot be trusted.
+
+Fix: a setup pane is only worth waiting on while its agent is still working.
+Distinguish the two cases by agent status:
+
+- agent working or blocked: exit 7, the human genuinely has something to
+  answer.
+- agent done, idle, or gone: setup is spent. Close the stale pane, the same way
+  the success path already closes it, and start setup again so the documented
+  remedy is true.
+
+Crew owns the setup pane and already closes it on success, so closing it here
+is not the foreman reaching into the human's work. Do not close a pane whose
+agent is still working; say what is pending instead. Then make every rejection
+message state what will actually happen.
+
+Test: a rejected artifact with a finished setup pane leads to a fresh setup
+pane on the next call, not exit 7; with a working setup pane it reports exit 7
+and does NOT close anything. Both fixtures must include the setup pane.
+
+### W4-3 (Critical): the guard blocks agent-level verbs and allows pane-level ones
+
+Verified against the live 0.8.0 binary and the real hook, all allowed from a
+crew worktree, all reaching an effect the guard blocks one layer up:
+
+| Allowed today | Equivalent to |
+| --- | --- |
+| `herdr pane run <p> "crew dispatch ..."` | `crew dispatch`, and no hook fires in a pane shell |
+| `herdr pane send-keys`, `pane send-text` | `herdr agent send-keys` |
+| `herdr pane report-metadata --clear-token` | erasing the authoritative record |
+| `herdr pane report-agent --state idle` | faking a lifecycle state |
+| `herdr pane release-agent`, `report-agent-session` | detaching or reassigning an agent |
+
+Fix: add the pane-level verbs to `FORBIDDEN` with reasons in the existing
+voice. Include `run`, `send-keys`, `send-text`, `report-metadata`,
+`report-agent`, `report-agent-session`, `release-agent`, and the `pane move`
+and `pane swap` forms that relocate another session's pane. Do NOT block
+read-only verbs such as `pane list`, `get`, `read`, `current`, `layout`,
+`neighbor`, `edges`, `process-info`.
+
+`crew.py` calls herdr through `subprocess` rather than the Bash tool, so no
+PreToolUse hook fires on its own internal calls and blocking these verbs does
+not break crew itself. Confirm that rather than assuming it.
+
+Then document the hole honestly, in `crew-member/SKILL.md` and the wiki
+"Enforced versus convention" section: `herdr pane run` executes in a pane shell
+where no PreToolUse hook fires at all, so a determined session can bypass the
+guard entirely. The guard stops accidents and honest mistakes. It does not stop
+intent, and the design must not claim otherwise.
+
+### W4-4 (Important): three load-bearing invariants have no effective test
+
+Each of these survived a mutation, meaning the behaviour can be deleted with
+the suite still green. Add a test for each, then confirm the named mutation is
+caught.
+
+- **The per-key dispatch lock** (`crew.py:1080`). Replacing `with
+  _locked(lock_path, "w"):` with `if True:` survives. This is the only thing
+  serialising two concurrent dispatches of one key, so it is the only guard
+  against two paid sessions on one worktree. Test that concurrent dispatches of
+  the same key serialise, with real processes or threads, not a mocked lock.
+- **`is_foreman_pane`** (`crew mail ack`). Making it `return True` survives all
+  167 tests. Exit 4 is documented as load-bearing in two SKILL.md files, and
+  this is the same class as the caller-identity check that ignored its input.
+  Test that ack from a non-foreman pane exits 4 and acks nothing.
+- **`shlex.split` in the guard.** Replacing it with `command.split()` survives.
+  Test a command where the two genuinely differ, so the test pins the parser
+  rather than the happy path.
+
+### Documented, NOT fixed in this wave
+
+State these plainly in the PR body, and in the skills where an agent would act
+on them. Do not silently carry them.
+
+- `is_crew_session` is a `cwd` substring test, so every ordinary worktree
+  session is classified as a crew member and refused `crew dispatch` and `crew
+  claim-foreman`. `/start-crew` therefore cannot be run from a worktree. This
+  one affects how the tool is invoked, so it belongs in `start-crew/SKILL.md`,
+  not only in the PR.
+- `crew mail send` is fail-open when `HERDR_PANE_ID` is unset, so a report can
+  be forged for another key.
+- A failure between `tag_pane` and `agent start` leaves the key at exit 5 with
+  a resume command for a session that never existed.
+- Dispatching a key in one repo deletes another repo's completed setup
+  artifact, because the artifact is keyed on the key alone.
+- `crew mail unread` is unbounded while `crew peek` is capped, so the mailbox is
+  the unbounded path into the foreman's context.
+- Nothing in the branch registers the PreToolUse hook and `doctor` does not
+  check that it is registered, so a fresh stow has the guard present but never
+  invoked.
+
+### Constraints
+
+All existing tests must pass, a green run must print nothing, and every new
+test must fail if its behaviour is removed. Report the mutation per test. Do
+not run a real `crew dispatch`, do not run any mutating herdr verb, and do not
+touch a live pane.
