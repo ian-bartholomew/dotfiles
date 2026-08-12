@@ -285,6 +285,32 @@ echo "$q_manifest" | grep -q $'antigravity\tok' || { echo "FAIL: antigravity sho
 echo "$q_manifest" | grep -q $'sonnet\tok'      && { echo "FAIL: slow sonnet must not be ok under quorum=2"; echo "$q_manifest"; exit 1; }
 echo "PASS: COUNCIL_QUORUM returns on quorum and reaps the slow member"
 
+# --- S5: a member reaped by quorum AFTER writing its answer is ok, not failed ---
+# codex writes its answer via -o mid-run but tears down slowly, so quorum reaps its worker
+# before it records an exit code. A non-empty answer file must still count as ok.
+mkdir -p "$WORK/rbin"
+cat >"$WORK/rbin/codex" <<EOF
+#!/usr/bin/env bash
+out=""; while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; *) shift ;; esac; done
+[ -n "\$out" ] && echo "codex slow-teardown answer" >"\$out"
+sleep 30   # answer already written; slow teardown -> gets reaped before recording exit
+EOF
+cat >"$WORK/rbin/agy" <<'EOF'
+#!/usr/bin/env bash
+echo "agy quick"; exit 0
+EOF
+cat >"$WORK/rbin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "sonnet quick"; exit 0
+EOF
+chmod +x "$WORK/rbin/"*
+r_manifest="$(PATH="$WORK/rbin:$PATH" COUNCIL_TIMEOUT=30 COUNCIL_QUORUM=2 \
+  bash "$HERE/council-round.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/outr")"
+[ ! -s "$WORK/outr/codex.exit" ] || { echo "FAIL: expected codex reaped before recording exit"; echo "$r_manifest"; exit 1; }
+echo "$r_manifest" | grep -q $'codex\tok' || { echo "FAIL: reaped-after-answer codex should be ok"; echo "$r_manifest"; exit 1; }
+grep -q "slow-teardown answer" "$WORK/outr/codex.out" || { echo "FAIL: codex answer not captured"; exit 1; }
+echo "PASS: member reaped after writing its answer is counted ok"
+
 # default (no COUNCIL_QUORUM) still waits for all (regression guard for /council semantics)
 def_manifest="$(PATH="$WORK/bin:$PATH" COUNCIL_TIMEOUT=10 \
   bash "$HERE/council-round.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/outdef")"

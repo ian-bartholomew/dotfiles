@@ -135,3 +135,6 @@ export PATH="$PATH:/Users/ian.bartholomew/.lmstudio/bin"
 
 # Added by Antigravity CLI installer
 export PATH="/Users/ian.bartholomew/.local/bin:$PATH"
+
+# Firecrawl self-hosted instance
+export FIRECRAWL_API_URL=http://192.168.50.139:3002

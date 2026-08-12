@@ -207,7 +207,8 @@ def execute(action, project):
     a = action["action"]
     if a == "create":
         cmd = ["td", "task", "add", action["content"], "--project", project,
-               "--section", action["column"], "--description", action["description"]]
+               "--section", action["column"], "--description", action["description"],
+               "--labels", "jira"]
         if action.get("priority"):
             cmd += ["--priority", action["priority"]]
         run(cmd)

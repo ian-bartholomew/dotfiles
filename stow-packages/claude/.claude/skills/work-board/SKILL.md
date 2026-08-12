@@ -8,9 +8,9 @@ description: Sync the Todoist Work project's kanban board with assigned JIRA tic
 Keeps the Todoist **Work** project board (Backlog | Next Up | In Progress | In Review |
 Waiting on Others | Blocked) in sync with live JIRA/PR state.
 
-Card contract: JIRA-linked cards are titled `<KEY> <summary>`; the description ends with a
-machine-owned line `sync: jira-status=<status> | synced=<date>`. Cards without a key prefix
-are never touched. A card whose column disagrees with JIRA while its recorded status is
+Card contract: JIRA-linked cards are titled `<KEY> <summary>`, carry the `jira` label (applied
+on create), and their description ends with a machine-owned line
+`sync: jira-status=<status> | synced=<date>`. Cards without a key prefix are never touched. A card whose column disagrees with JIRA while its recorded status is
 unchanged was moved by Ian on purpose - the script reports it as `manual-override` and leaves it.
 
 ## Steps

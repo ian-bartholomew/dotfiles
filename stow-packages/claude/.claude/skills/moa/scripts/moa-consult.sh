@@ -62,11 +62,13 @@ proposals_from_manifest() {
 
 REFINE_INSTRUCTION='Below are candidate responses from other models to the same query. Use the strongest points, correct any errors you find, and produce an improved, self-contained response. Do not merely copy one of them. Keep it tight: lead with your recommendation and stay under ~250 words, no preamble.'
 
-# Early-return once a quorum of proposers answer, rather than blocking each layer on the
-# slowest CLI. The aggregator synthesizes fine from a quorum and MoA degrades gracefully,
-# so trading the slowest seat for speed is the right default here. Override to wait for all
-# with COUNCIL_QUORUM=0 (or =3).
-export COUNCIL_QUORUM="${COUNCIL_QUORUM:-2}"
+# Wait for all three proposers by default. Quorum=2 early-return reaps the slowest seat,
+# and codex is reliably slowest (heavier cold start: ~24s vs ~15s for agy+sonnet), so it
+# was dropped from essentially every consult -- defeating MoA's point of getting the most
+# diverse (non-Anthropic) perspective at a hard fork. MoA only fires at genuinely hard
+# forks, so the ~9s extra to keep codex is worth it; the per-member TIMEOUT still bounds a
+# hung seat. Override with COUNCIL_QUORUM=2 for speed if you accept losing the slow seat.
+export COUNCIL_QUORUM="${COUNCIL_QUORUM:-0}"
 
 last_good_dir=""
 last_good_manifest=""

@@ -20,7 +20,14 @@ Use the Atlassian MCP tools to fetch the ticket details:
 - If the ticket is a story, also fetch the parent epic for context
 - Note any linked/blocking tickets
 - If the ticket has subtasks, prompt the user if they want to work on one task in particular.
+  - If the user does want to work on one ticket in particular, focus the current work on that ticket.
+    - Use the Ticket Workflow outlined in this skill to work on the ticket (assign the ticket to the user, worktree, plan, etc)
+    - When work is finished on that ticket, return to the parent ticket and check if there are any remaining subtasks.
+    - If there are remaining subtasks, ask the user if they want to work on one task in particular.
+    - Loop this step until all subtasks are complete.
+    - When all subtasks are complete, inspect the parent ticket for AC and evaluate if the AC is met, and the ticket can be closed
 - Assign the ticket to the user.
+- Transition the ticket status as you work: "In Progress" while you are working on it, "In Code Review" when the PR is up, "Blocked" if work is blocked, and "Done" when the PR is merged
 
 Present a brief summary of the ticket to the user before proceeding.
 
@@ -45,10 +52,14 @@ Once in the worktree:
   - What files need to be created or modified
   - What the implementation approach is
   - How to verify the work is complete (based on AC)
+- Use `adversarial-review` skill to validate the plan
+  - If the review comes back with feedback, integrate it and run a review again
+  - Do a maximum of 2 review rounds
 
 ## Important Notes
 
 - Always use superpowers to plan the work
+- Always do a code review before making a PR
 - If the ticket is already "In Progress", warn the user that work may already be underway
 - If the ticket has blockers that aren't resolved, warn the user
 - Transition the ticket to "In Progress" after the worktree is created (ask the user first)

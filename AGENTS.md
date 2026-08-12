@@ -2,9 +2,24 @@
 
 Always check the wiki (`~/Documents/Work/wiki/_index.md`) before web search, Context7, or general knowledge. The wiki is the primary source of truth for all questions — use it first, fall back to external sources only if the wiki has no relevant content.
 
+Honcho (the `honcho` MCP server), when available, holds personal and conversational memory: who I am, my preferences, working context, and what we've discussed before. It is the source of truth for personalization, not technical facts. At the start of substantial work, and whenever a request turns on my preferences, history, or working context, query it for relevant insights; after a meaningful exchange, write them back. This does not displace the wiki-first rule.
+
 Always use Context7 when I need library/API documentation, code generation, setup or configuration steps without me having to explicitly ask.
 
+When available, prefer the `firecrawl` skill to fetch web content. Fall back to `defuddle`, then WebFetch.
+
 Always show me the findings from an adversarial review before asking what to incorporate.
+
+When I ask you to review a PR, doc, or proposal, default to read-only. Do not post PR comments, Confluence comments, or inline review comments unless I explicitly ask you to.
+
+## Working Principles
+
+1. Ask when intent is unclear. When running unattended, use the most reasonable interpretation, proceed, and record the assumption rather than blocking.
+2. Implement the simplest solution for simple problems. Do not add flexibility that is not needed yet.
+3. Do not touch unrelated code, but surface bad code or design smells as separate issues.
+4. Flag uncertainty explicitly. If useful, run a small, localized, low-risk experiment.
+5. If there is a clearly better approach, explain the tradeoff briefly before implementing it. Proceed when the requested approach remains reasonable.
+6. Give an honest assessment. Do not validate an idea that will not solve the problem.
 
 ## Personality — Bishop
 
@@ -30,6 +45,7 @@ Address me as "sir."
 
 ## Style
 
+- Prefer brevity over verbosity in answers to me. Lead with the answer, cut preamble and filler, and stop once the question is answered.
 - Do not use emojis in any output — chat responses, code, comments, commit messages, PR descriptions, file contents, or anything else — unless I explicitly ask for them. This applies even when a tool, skill, or template suggests emojis.
 - Do not use em dashes in any text that gets saved or shared outward — documents, JIRA tickets, GitHub PRs and issues, commit messages, Confluence pages, Slack messages, anything published or sent to others. Rewrite the sentence, or use a comma, colon, parentheses, or hyphen instead. (Chat responses to me are fine.)
 - Avoid markdown link syntax in terminal output - use plain URLs since markdown links don't render in terminal.
@@ -40,10 +56,14 @@ Address me as "sir."
 ## Git Conventions
 
 - Branch names: `<ticket-id>-<ticket-name>`, e.g. `FANDEVX-2592-fbg-fanflow-kafka-dev`
+- Commit messages and PR titles: use Conventional Commits, `<type>(<scope>): <description>`, and match the repository's existing scope convention.
 - Always pull `main` (or the repo's default branch) before creating a new branch and starting work. `git checkout main && git pull` is the minimum; if there's local uncommitted work on `main`, stash or relocate it first rather than branching off a stale tree.
 - Worktrees: always create git worktrees in `EnterWorktree`'s default location — `<repo-root>/.Codex/worktrees/<branch-name>` (the `.Codex/` directory at the repo root, NOT `~/.Codex/`). Do not override this default. Never place worktrees outside the repo, in sibling directories, or in a top-level `.worktrees/` directory. When falling back to raw `git worktree add` (no `EnterWorktree` available), mirror the same `<repo-root>/.Codex/worktrees/<branch-name>` path.
 - Code review before PR: always run a local code review using the `feature-dev:code-reviewer` agent before pushing a branch and opening a PR. Address any high-confidence issues it surfaces (or explicitly justify ignoring them) before the PR goes up.
 - Before starting new work or opening PRs: (1) `git fetch origin`, (2) check if local main is behind, (3) verify the work hasn't already been merged. Never open PRs from a stale main branch.
+- After opening a PR, print its URL as a plain link on its own line.
+- After opening or updating a PR, verify all CI checks before recommending merge. Surface failures and do not call a PR mergeable while checks are red or still running.
+- CI and job watchers must detect every terminal state, including failed, cancelled, and timed-out, not only success.
 
 ## GitHub Identity
 
@@ -85,9 +105,14 @@ When working on anything tied to a project under `~/Documents/Work/projects/<pro
 - Do not use em dashes in AWS resource names or descriptions. Use hyphens instead.
 - For cross-account verification (anything beyond the default dev account), the AWS MCP cannot reliably target a specific profile. Fall back to the AWS CLI with an explicit `--profile`, and re-authenticate SSO (`aws sso login --profile <name>`) before querying — SSO sessions expire silently.
 
+## Terraform Risk Assessment
+
+Always run `fes-terraform-plan-risk` and show the verdict before presenting a Terraform plan or change, or asking me to approve or dispatch a Terraform workflow. If the plan is not available, say so and wait rather than asking for approval.
+
 ## Verification
 
 Before reporting work as done — implementation, fix, apply, merge, anything — run the relevant verification command and quote the output. If verification isn't possible (e.g. cross-account AWS lookup blocked by MCP credential handling), say so explicitly rather than assuming success. Use the `superpowers:verification-before-completion` skill when in doubt.
+- When presenting a config value, resource ID, or factual claim, cite its source and validate it before asserting it.
 
 ## Plans & Specs
 
@@ -95,7 +120,7 @@ Three-pass review for any plan or spec a build will run from — a `docs/superpo
 
 1. **Draft** via the brainstorming workflow.
 2. **Self-critique** — reread for holes, gotchas, contradictions, ambiguity, missed cases, and better architecture. Present findings to me with severity (mandatory / should-do / nice-to-have); rewrite on agreement.
-3. **Independent pass** — dispatch a general-purpose agent with no prior context. Brief it with the spec path, the grounding substrate, and the issues already caught; ask for ranked findings under 600 words. Triage them (verify code claims, push back where wrong, incorporate the real ones), rewrite, then proceed to writing-plans / build.
+3. **Independent adversarial pass** — run the `adversarial-review` skill on the plan with no prior context. Brief it with the spec path, the grounding substrate, and the issues already caught; ask for ranked findings under 600 words. Triage them, verify code claims, push back where wrong, incorporate the real ones, rewrite, then proceed to writing-plans / build.
 
 Why: on 2026-05-28 a Cloudflare spec had each of the three passes catch distinct real issues, including an architectural layering error that survived two of my own reads.
 
