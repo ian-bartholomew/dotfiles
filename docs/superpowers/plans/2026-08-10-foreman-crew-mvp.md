@@ -3221,3 +3221,118 @@ removed, INCLUDING a test that the close does not happen while an agent is
 present, and one that the calling pane is never closed. Report the mutation per
 test. Do not run a real `crew dispatch`, do not run any mutating herdr verb, and
 do not touch a live pane.
+
+---
+
+## Hardening wave 6
+
+Two Criticals from the pre-PR review, one guard false negative, and a cleanup
+gap the human hit in real use: dispatched panes and their tabs outlive the
+sessions in them and nothing ever removes them.
+
+### W6-1 (Critical, money): a lowercased JIRA key silently takes the slug path
+
+`JIRA_KEY_RE` is uppercase only and `is_ticket` is exact case, so `crew dispatch
+fandevx-3511` is treated as a free-form slug: `plain_worktree` branches off the
+main checkout's HEAD, and a paid session starts with no `/start-ticket`, no
+ticket payload and no plan, at exit 0. The crew member is then told to read a
+plan that does not exist.
+
+It is reachable because the foreman never sees the raw key again. `crew_members`
+stores `sanitize_name`d keys, `render_ls` prints that lowercase form, and the
+exit 5 line prints the stored key, so a foreman re-dispatching a key it read out
+of `crew ls` uses the spelling that breaks. While the first pane lives
+`find_member` catches it at exit 5; once that pane is retired, which is the
+normal end state, nothing does.
+
+Fix: refuse a key that is not already uppercase but whose uppercase form matches
+`JIRA_KEY_RE`, mirroring the existing crew-type guard. The message must offer
+the way out, since `spike-3` is a legitimate slug that this rule would also
+catch: name the uppercase spelling as the fix and say a non JIRA shaped slug is
+the alternative.
+
+Also print the branch and worktree on the success line. Today it names only the
+key, type and pane, so a dispatch into the wrong tree looks identical to a
+correct one.
+
+### W6-2 (Critical): the mail newline injection is still open on two fields
+
+`mail_send`'s docstring claims the injection is closed, but only `msg` is
+collapsed. `state` comes straight from argv and `repo` is taken raw, and
+`mail_unread` prints all four fields. `json.dumps` escapes the newline so the
+JSONL stays valid and parses, then the foreman's terminal renders a second,
+fully caller-controlled line.
+
+The damaging payload is a forged ack instruction, because the foreman's contract
+is to ack what it has reported. A forged `crew mail ack <big number>` advances
+the cursor past every future report, and the foreman skill treats a silent fleet
+as indistinguishable from a working one. It also permanently pollutes a file the
+crew-member skill says will be digested into a git tracked log.
+
+Fix: collapse every field that reaches the terminal, not just `msg`, and
+restrict `state` to the values the design actually uses rather than accepting
+free text. Note that a single-line forged state can still read as crew's own
+output to a model, so quote the values when printing rather than relying on
+collapsing alone.
+
+### W6-3 (Important): the setup pane is crew by design but invisible to the guard
+
+`start_setup` splits the setup pane with `--cwd repo_root`, and
+`is_crew_session` tests for `.claude/worktrees` in the cwd, so the setup pane's
+hook checks all allow until `/start-ticket` happens to move it. That pane is
+tagged `crew=true, type=setup` and hosts a live paid session, so it can
+dispatch, close panes and prompt peers.
+
+This is the inverse of the misclassification already in the known-gaps list.
+That one is a false positive and merely annoying; this is a false negative and
+it costs money. It is also the session most exposed to untrusted input, since
+`/start-ticket` pulls JIRA descriptions and comments into its context.
+
+Fix: gate on the pane's own `crew` token rather than the cwd, falling back to
+the cwd test when the token cannot be read. Establishing membership from the
+record the design already calls authoritative is the correct signal, and it
+fixes both directions at once, so the known-gaps entry for the false positive
+can be removed rather than reworded.
+
+Confirm the hook stays fast enough to run on every Bash call, and that it fails
+CLOSED if the snapshot cannot be read from a crew cwd.
+
+### W6-4 (Important): dispatched panes and tabs outlive their sessions
+
+Observed in real use. `crew dispatch` creates a tab per crew member with `tab
+create`, and nothing removes it. When the session inside exits, the pane and the
+tab both remain, and they accumulate: four orphan tabs were found from earlier
+testing, each holding one dead pane.
+
+Measured while diagnosing it, and both facts matter:
+
+- An agent-less pane reports `agent_status: unknown`, NOT an absence of status.
+  So status cannot distinguish "no agent" from "an agent herdr cannot classify",
+  and only absence from the snapshot's agent list can. `pane_has_agent` already
+  does this correctly; nothing else may regress to a status check.
+- The orphan panes carried NO tokens, yet a token written to an agent-less pane
+  persists. So on those panes the tokens were either cleared on the agent's exit
+  or never written. This is unresolved and it matters, because
+  `crew-member/SKILL.md` promises that a killed crew member's pane is bucketed
+  to `recover`, and an orphan with no tokens can never be recognised as crew at
+  all. Settling it needs one real dispatch, so do NOT guess: implement the
+  cleanup so it works whether or not the tokens survive, and state the open
+  question in the skill rather than repeating the promise.
+
+Fix: add `crew retire <name>`, which closes the crew member's pane AND the tab
+that was created for it, refusing to close the calling pane and refusing a pane
+that still has an agent, so it can never take out live work. Follow the existing
+close helper's shape: a failure warns and continues rather than aborting the
+rest of the cleanup. Do not close a tab that holds other panes.
+
+Also surface the problem, since a cleanup verb nobody knows to run does not help:
+`crew ls` should report agent-less crew panes and orphan tabs that crew created,
+and the foreman skill must propose retirement rather than performing it, which
+is the existing rule for retirement.
+
+### Constraints
+
+Every existing test passes, a green run prints nothing, and each new test must
+fail if its behaviour is removed. Report the mutation per test. Do not run a real
+`crew dispatch`, do not run any mutating herdr verb against a pane that is not
+already dead, and do not touch the pane named `foreman`.
