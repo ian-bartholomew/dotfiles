@@ -83,12 +83,37 @@ the `herdr pane ...` equivalents, because `pane send-keys` reaches the same
 effect as `agent send-keys` and `pane report-metadata` can erase the tokens
 crew treats as the authoritative record of who owns what.
 
-It is not a sandbox, and the design does not pretend otherwise. `herdr pane
-run` would execute its command in a pane shell, where NO PreToolUse hook fires
-at all, so the hook can only refuse the invocation, never the effect. The same
-is true of any wrapper, and herdr's socket has no authorization: every process
-running as this user has full control. The boundary above is yours to keep.
-The hook exists to catch the honest mistake and the prompt injection, not you.
+It also denies you `SendMessage`. Agent teams are enabled, so you can address
+another live session directly, and that would reach the foreman or a peer
+outside the mailbox: no seq, no ack, and nothing in the JSONL. `crew mail send`
+being your only outbound channel is a fact because of this, not a request. Do
+not ask a peer to run something you were denied; that spends the human's
+decision rather than respecting it. Subagents are untouched, so spawn them
+freely, and `ListAgents` still works, because looking is not the boundary.
+Sending is.
+
+`Monitor` is not denied, but the command you give it is classified exactly as a
+Bash command is, because it runs in the same shell. Watch your own build or test
+log freely. A watch carrying a forbidden verb is refused like any other.
+
+It is not a sandbox, and the design does not pretend otherwise. It covers three
+tools, `Bash`, `Monitor` and `SendMessage`, and nothing else you can call. It
+cannot cover a shell it never sees: `herdr pane run` would execute its command in
+a pane shell, where NO PreToolUse hook fires at all, so the hook can only refuse
+the invocation, never the effect. The same is true of any wrapper, and herdr's
+socket has no authorization: every process running as this user has full
+control. The boundary above is yours to keep. The hook exists to catch the
+honest mistake and the prompt injection, not you.
+
+One limit you should know precisely, because the design claims the mailbox is
+authoritative and this is what that claim rests on. `Write` and `Edit` are not
+gated. `~/.crew/cursor` is a plain integer file, so writing a high number into it
+silences every pending report in the foreman's `crew mail unread`, which is the
+effect `crew mail ack` is denied for. `~/.crew/mailbox.jsonl` can be appended to
+directly, past the lock and past the forgery check in `crew mail send`. The hook
+itself and the settings that install it are ordinary files too. So the mailbox is
+authoritative because you keep it that way. Report through `crew mail send` and
+write files only inside your own worktree.
 
 So if the guard denies something, that is the answer. Do not look for another
 route to the same effect. Report what you need with `crew mail send` and let

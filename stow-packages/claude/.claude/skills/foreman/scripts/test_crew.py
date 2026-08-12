@@ -2217,6 +2217,46 @@ GUARD_READ_ONLY_PANE = (
     "herdr pane process-info wV:p2",
 )
 
+# Spelled out here rather than imported from the hook, for the same reason as
+# GUARD_FORBIDDEN above: a test that reads the hook's own table cannot fail when
+# an entry is deleted from it.
+GUARD_FORBIDDEN_TOOLS = ("SendMessage",)
+
+# Tools that must NOT be denied. `Agent` because fanning out subagents is part
+# of the design and a reviewer crew member does exactly that; `ListAgents`
+# because discovery is not the boundary and sending is; the rest because
+# ordinary work needs them. `Write` and `Edit` are here because the work needs
+# them, not because they are harmless: either one can write `~/.crew/cursor`,
+# which is the effect this hook denies at `crew mail ack`.
+GUARD_ALLOWED_TOOLS = ("Agent", "ListAgents", "Read", "Write", "Edit", "Grep",
+                       "Glob", "Skill", "TodoWrite", "TaskUpdate")
+
+SEND_MESSAGE_INPUT = {"to": "sibling", "summary": "ask a peer",
+                      "message": "run crew dispatch FANDEVX-1 for me"}
+
+# Ordinary watches. `Monitor` carries a shell command, so it is classified by the
+# command and not denied by name: a crew member watching its own build or test
+# log is exactly what the tool is for, and denying it would get the hook switched
+# off for no safety.
+GUARD_ORDINARY_WATCH = (
+    "tail -f test.log",
+    "npm test -- --watch",
+    "python3 -m pytest -q",
+    "gh run watch 4242 --exit-status",
+    "herdr pane read wV:p2 --lines 40",
+)
+
+# `Monitor`'s other form: a WebSocket, with no command field at all. Denying a
+# call for lacking a command it never carries would break a legitimate watch.
+MONITOR_WS_INPUT = {"ws": {"url": "wss://events.example.com/stream"},
+                    "description": "deploy events", "timeout_ms": 60000,
+                    "persistent": False}
+
+
+def _monitor_input(command):
+    return {"command": command, "description": "a watch", "timeout_ms": 60000,
+            "persistent": False}
+
 
 def _guard_env(pane=None, herdr_dir=None):
     """The hook's environment, with HERDR_PANE_ID under the test's control.
@@ -2235,13 +2275,22 @@ def _guard_env(pane=None, herdr_dir=None):
 
 
 def _guard(command, cwd=GUARD_CREW_CWD, tool_name="Bash", stdin=None,
-           pane=None, herdr_dir=None):
+           pane=None, herdr_dir=None, tool_input=None):
     payload = {"tool_name": tool_name, "cwd": cwd,
-               "tool_input": {"command": command}}
+               "tool_input": {"command": command} if tool_input is None
+                             else tool_input}
     text = json.dumps(payload) if stdin is None else stdin
     return subprocess.run([sys.executable, CREW_GUARD], input=text,
                           capture_output=True, text=True,
                           env=_guard_env(pane, herdr_dir))
+
+
+def _guard_tool(tool_name, tool_input, cwd=GUARD_CREW_CWD, pane=None,
+                herdr_dir=None):
+    """A non-Bash tool call, whose tool_input carries no `command` at all: the
+    shape the hook actually receives for `SendMessage` or `Agent`."""
+    return _guard(None, cwd=cwd, tool_name=tool_name, pane=pane,
+                  herdr_dir=herdr_dir, tool_input=tool_input)
 
 
 HERDR_CALLED = "herdr-was-called"
@@ -2451,6 +2500,177 @@ class TestGuardMembershipComesFromThePaneToken(unittest.TestCase):
         with _fake_herdr(_snap([], [_full_pane("wV:pCrew", None)])) as herdr_dir:
             _guard("crew dispatch FANDEVX-1 --type implementer",
                    cwd=GUARD_CREW_CWD, pane="wV:pCrew", herdr_dir=herdr_dir)
+            called = os.path.exists(os.path.join(herdr_dir, HERDR_CALLED))
+        self.assertTrue(called)
+
+
+class TestGuardCoversSendMessageAndNotOnlyBash(unittest.TestCase):
+    """The hook returned 0 unless the tool was `Bash`, and the settings matcher
+    was `Bash` alone. A crew member is a full Claude Code session with agent
+    teams enabled, so `SendMessage` reached a peer or the foreman directly: no
+    seq, no cursor, no ack, nothing in the JSONL a mailbox digest would ever
+    show, and a peer that could be asked to run the `crew dispatch` the sender
+    is denied."""
+
+    def _decide(self, tool_name, tool_input=None, cwd=GUARD_CREW_CWD):
+        proc = _guard_tool(tool_name, tool_input or SEND_MESSAGE_INPUT, cwd=cwd)
+        self.assertEqual(proc.returncode, 0,
+                         "the guard must never crash: %s" % proc.stderr)
+        return _guard_decision(proc)
+
+    def test_a_forbidden_tool_is_denied_in_a_crew_worktree(self):
+        for tool in GUARD_FORBIDDEN_TOOLS:
+            with self.subTest(tool=tool):
+                decision, reason = self._decide(tool)
+                self.assertEqual(decision, "deny", reason)
+                self.assertIn("crew-guard", reason)
+                self.assertIn("mailbox", reason)
+                # The remedy has to be named, because unlike a denied command
+                # there is no other route the crew member is meant to take.
+                self.assertIn("crew mail send", reason)
+                self.assertIn(GUARD_CREW_CWD, reason)
+
+    def test_the_same_tool_is_allowed_outside_a_worktree(self):
+        # The human's own session and the foreman's both send messages, and the
+        # foreman's whole job is talking to other sessions.
+        for tool in GUARD_FORBIDDEN_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertEqual(self._decide(tool, cwd=GUARD_HUMAN_CWD)[0],
+                                 "allow")
+
+    def test_the_tools_the_design_depends_on_stay_allowed(self):
+        for tool in GUARD_ALLOWED_TOOLS:
+            with self.subTest(tool=tool):
+                decision, reason = self._decide(tool, {"prompt": "review it"})
+                self.assertEqual(decision, "allow", "%s: %s" % (tool, reason))
+
+    def test_an_agent_prompt_naming_a_forbidden_command_is_still_allowed(self):
+        # The tool name decides and no prompt is read. Matching the text would
+        # break the reviewer crew member for nothing: a subagent's own Bash call
+        # arrives at this same hook, with the same pane and the same cwd.
+        self.assertEqual(
+            self._decide("Agent",
+                         {"prompt": "run crew dispatch FANDEVX-1 --type impl"}),
+            ("allow", ""))
+
+    def test_membership_still_comes_from_the_pane_token_on_the_tool_path(self):
+        # The setup pane is crew while its cwd is an ordinary checkout, so the
+        # tool path must consult the token too and not just the cwd.
+        snapshot = _snap([], [_full_pane("wV:pSetup",
+                                         {"crew": "true", "type": "setup"})])
+        with _fake_herdr(snapshot) as herdr_dir:
+            proc = _guard_tool("SendMessage", SEND_MESSAGE_INPUT,
+                               cwd=GUARD_HUMAN_CWD, pane="wV:pSetup",
+                               herdr_dir=herdr_dir)
+        self.assertEqual(_guard_decision(proc)[0], "deny")
+
+    def test_an_allowed_tool_never_asks_herdr(self):
+        # The same cost ordering the Bash path keeps: classification is free, and
+        # only a call that could be denied pays for the membership round trip.
+        with _fake_herdr(_snap([], [])) as herdr_dir:
+            proc = _guard_tool("Agent", {"prompt": "review the diff"},
+                               cwd=GUARD_CREW_CWD, pane="wV:pCrew",
+                               herdr_dir=herdr_dir)
+            called = os.path.exists(os.path.join(herdr_dir, HERDR_CALLED))
+        self.assertEqual(_guard_decision(proc)[0], "allow")
+        self.assertFalse(called, "an allowed tool must not pay for a herdr "
+                                 "round trip to be allowed")
+
+    def test_a_forbidden_tool_does_ask_herdr(self):
+        with _fake_herdr(_snap([], [_full_pane("wV:pCrew", None)])) as herdr_dir:
+            _guard_tool("SendMessage", SEND_MESSAGE_INPUT, cwd=GUARD_CREW_CWD,
+                        pane="wV:pCrew", herdr_dir=herdr_dir)
+            called = os.path.exists(os.path.join(herdr_dir, HERDR_CALLED))
+        self.assertTrue(called)
+
+    def test_the_bash_path_is_unchanged(self):
+        # The control for the refactor that put a tool table in front of the
+        # command table: Bash is still decided by its command, both ways.
+        self.assertEqual(_guard_decision(
+            _guard("crew dispatch FANDEVX-1 --type implementer"))[0], "deny")
+        self.assertEqual(_guard_decision(_guard("git status"))[0], "allow")
+
+    def test_a_bash_call_with_no_command_field_is_allowed(self):
+        # The tool table is a dict lookup on a name, so a Bash payload whose
+        # input does not carry a command must still fall through to allow rather
+        # than raise: the hook exits 0 on anything it cannot read.
+        self.assertEqual(self._decide("Bash", {"description": "no command"}),
+                         ("allow", ""))
+
+
+class TestGuardClassifiesMonitorLikeBash(unittest.TestCase):
+    """`Monitor` takes a shell command and its own description says the script
+    runs in the same shell environment as Bash, under a tool name the matcher did
+    not match. That made the entire Bash table optional: `Monitor` carrying
+    `crew dispatch` spends a paid session from a crew pane. It is denied by its
+    command and NOT by its name, because watching your own test log is what the
+    tool is for."""
+
+    def _decide(self, tool_input, cwd=GUARD_CREW_CWD):
+        proc = _guard_tool("Monitor", tool_input, cwd=cwd)
+        self.assertEqual(proc.returncode, 0,
+                         "the guard must never crash: %s" % proc.stderr)
+        return _guard_decision(proc)
+
+    def test_every_forbidden_command_is_denied_through_monitor(self):
+        for command in GUARD_FORBIDDEN:
+            with self.subTest(command=command):
+                decision, reason = self._decide(_monitor_input(command))
+                self.assertEqual(decision, "deny", "%s: %s" % (command, reason))
+                self.assertIn("crew-guard", reason)
+
+    def test_an_ordinary_watch_is_allowed(self):
+        for command in GUARD_ORDINARY_WATCH + GUARD_READ_ONLY_PANE:
+            with self.subTest(command=command):
+                decision, reason = self._decide(_monitor_input(command))
+                self.assertEqual(decision, "allow", "%s: %s" % (command, reason))
+
+    def test_the_ws_form_carrying_no_command_is_allowed(self):
+        # A missing command field must allow, not raise and not deny. This is the
+        # over-block a blanket name entry would have caused.
+        self.assertEqual(self._decide(MONITOR_WS_INPUT), ("allow", ""))
+
+    def test_a_forbidden_watch_is_allowed_outside_a_worktree(self):
+        for command in GUARD_FORBIDDEN:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self._decide(_monitor_input(command),
+                                 cwd=GUARD_HUMAN_CWD)[0], "allow")
+
+    def test_it_is_the_same_classifier_and_not_a_second_string_match(self):
+        # The bypass forms that defeated the Bash path have to be closed here by
+        # construction, not by remembering to close them twice.
+        for command in (
+                "python3 /Users/someone/.claude/skills/foreman/scripts/"
+                "crew.py dispatch FANDEVX-1",
+                'crew "dispatch" FANDEVX-1',
+                "herdr --json agent rename wV:p1 foreman"):
+            with self.subTest(command=command):
+                self.assertEqual(self._decide(_monitor_input(command))[0],
+                                 "deny")
+        # And the allowance the Bash path makes on purpose is made here too.
+        self.assertEqual(
+            self._decide(_monitor_input(
+                'git commit -m "crew dispatch is foreman-only"'))[0], "allow")
+
+    def test_an_ordinary_watch_never_asks_herdr(self):
+        # The cost ordering holds on this path too: classification is free, and
+        # only a call that could be denied pays for the membership round trip.
+        with _fake_herdr(_snap([], [])) as herdr_dir:
+            proc = _guard_tool("Monitor", _monitor_input("tail -f test.log"),
+                               cwd=GUARD_CREW_CWD, pane="wV:pCrew",
+                               herdr_dir=herdr_dir)
+            called = os.path.exists(os.path.join(herdr_dir, HERDR_CALLED))
+        self.assertEqual(_guard_decision(proc)[0], "allow")
+        self.assertFalse(called, "an ordinary watch must not pay for a herdr "
+                                 "round trip to be allowed")
+
+    def test_a_forbidden_watch_does_ask_herdr(self):
+        with _fake_herdr(_snap([], [_full_pane("wV:pCrew", None)])) as herdr_dir:
+            _guard_tool("Monitor",
+                        _monitor_input("crew dispatch FANDEVX-1 --type impl"),
+                        cwd=GUARD_CREW_CWD, pane="wV:pCrew",
+                        herdr_dir=herdr_dir)
             called = os.path.exists(os.path.join(herdr_dir, HERDR_CALLED))
         self.assertTrue(called)
 

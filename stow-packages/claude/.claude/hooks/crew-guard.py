@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Deny a crew member the commands that let it spend money or steer its peers.
+"""Deny a crew member the commands and tools that let it spend money or steer
+its peers.
 
 The crew-member contract asks a crew session not to dispatch, nudge or close
 another session. That is a convention: herdr's socket has no authorization, so
@@ -13,6 +14,17 @@ output reaches the foreman's context, and a crew member reads untrusted diffs
 and logs. It does NOT stop a determined process, which can evade any
 string-matching gate by encoding the command, writing a wrapper, or calling the
 socket directly. Treat it as a guard rail, not a sandbox.
+
+Tools come in two kinds, and a boundary drawn around one tool gets drawn by
+accident. FORBIDDEN_TOOLS denies by tool name, for a tool whose whole effect is
+the thing being denied. COMMAND_FIELDS names the field a tool carries a shell
+command in, and the command decides, so the tool itself stays usable. Both are
+one-line additions, which is the point: the next tool of either kind should not
+need an `if` in here.
+
+Whatever this hook is matched on in settings is the whole of what it can ever
+see, so the matcher and both tables have to change together: an entry here that
+the matcher does not deliver is inert, and looks enforced.
 
 `herdr pane run` is blocked below, but understand what that buys: the command
 it carries would execute in a pane shell, where no PreToolUse hook fires at
@@ -66,6 +78,40 @@ FORBIDDEN = (
     ("herdr", ("server", "stop"), "stopping the server kills every pane"),
 )
 
+# Tool name -> why. `SendMessage` addresses another live Claude session, so a
+# crew member using it reports outside the mailbox entirely: no seq, no cursor,
+# no ack, and nothing in the JSONL the foreman's digest reads. The design's
+# claim that `crew mail send` is a crew member's only outbound channel is true
+# only while this entry exists. It is also the laundering route, since a peer
+# can be asked to run the `crew dispatch` the sender is denied above.
+#
+# Deliberately absent, because the design depends on them: `Agent` and every
+# other subagent-spawning tool, since a reviewer crew member fans out subagents
+# and a subagent's own Bash calls arrive back here anyway; `ListAgents`, because
+# discovery is not the boundary and sending is; and every ordinary file, search
+# and task tool.
+FORBIDDEN_TOOLS = {
+    "SendMessage": "messaging another session reports outside the mailbox, "
+                   "which is a crew member's only outbound channel",
+}
+
+# Tool name -> the tool_input field it carries a shell command in. The command
+# decides, through the same FORBIDDEN table Bash uses, so the tool stays usable.
+#
+# `Monitor` is here rather than in FORBIDDEN_TOOLS because it is legitimate work:
+# a crew member watching its own build or test log is what it is for. But its own
+# description says the script "runs in the same shell environment as Bash", so
+# the command it carries reaches every entry in FORBIDDEN, and it was the whole
+# Bash table made optional by choosing a different tool name.
+#
+# A missing or empty field allows. `Monitor` also takes a `ws` form that carries
+# no command at all, and denying a call for lacking a command it never has would
+# break a legitimate watch.
+COMMAND_FIELDS = {
+    "Bash": "command",
+    "Monitor": "command",
+}
+
 WORKTREE_MARKER = os.path.join(".claude", "worktrees")
 
 
@@ -109,6 +155,24 @@ def forbidden_reason(command):
                 return why
 
     return None
+
+
+def refusal_reason(payload):
+    """Why a crew member is refused this call, or None.
+
+    Name first, because it is a dict lookup and a tool denied outright has no
+    command to parse. A tool in neither table is not this hook's business, which
+    keeps `Agent`, `ListAgents` and the ordinary file and search tools out of the
+    way even if the settings matcher starts delivering them.
+    """
+    tool = payload.get("tool_name")
+    why = FORBIDDEN_TOOLS.get(tool)
+    if why is not None:
+        return why
+    field = COMMAND_FIELDS.get(tool)
+    if field is None:
+        return None
+    return forbidden_reason((payload.get("tool_input") or {}).get(field) or "")
 
 
 SNAPSHOT_TIMEOUT = 5
@@ -182,16 +246,12 @@ def main():
     except ValueError:
         return 0
 
-    if payload.get("tool_name") != "Bash":
-        return 0
-
-    # The command is classified BEFORE membership, because membership now costs
-    # a herdr round trip and this hook runs on every Bash call. A command that
-    # is not forbidden is allowed for crew and human alike, so the round trip
-    # would buy nothing; ordering it second keeps the ordinary call decided by
-    # string work alone.
-    command = (payload.get("tool_input") or {}).get("command") or ""
-    why = forbidden_reason(command)
+    # The call is classified BEFORE membership, because membership costs a herdr
+    # round trip and this hook runs on every Bash call. A call that is not
+    # forbidden is allowed for crew and human alike, so the round trip would buy
+    # nothing; ordering it second keeps the ordinary call decided by a dict
+    # lookup and string work alone.
+    why = refusal_reason(payload)
     if why and is_crew_session(payload):
         print(json.dumps({
             "hookSpecificOutput": {
