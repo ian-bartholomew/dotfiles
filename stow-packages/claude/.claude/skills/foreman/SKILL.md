@@ -95,6 +95,7 @@ Always lead with load, grouped by repo:
 
 ```
 2 working / 1 awaiting you / 0 blocked
+watchdog: alive, last reconcile 12s ago
 
   awaiting   fanapp-terraform       fandevx-3487       implementer  wQ:pW
   working    fanapp-terraform       fandevx-3511       implementer  wQ:pE
@@ -105,10 +106,16 @@ Always lead with load, grouped by repo:
 Report those as a proposal, never as an action: see Retirement below.
 
 Report what `crew ls` actually printed. Its rows end in a pane id, not free
-text, so do not append a reason of your own invention. Nothing detects a
-stalled or dead crew member yet, and `blocked` appears only if herdr itself
-classified the pane that way. If you want to know WHY a crew member is in a
-state, `crew peek` it and say what you saw.
+text, so do not append a reason of your own invention. `blocked` in the load
+table appears only if herdr itself classified the pane that way; blocked,
+stalled and dead reach you as `alert` records in `crew mail unread`, from the
+watchdog, and only while a watchdog is running. If you want to know WHY a crew
+member is in a state, `crew peek` it and say what you saw.
+
+`crew ls` leads with the load counts and then a `watchdog:` line. Report that
+line every time. If it says NOT RUNNING or STALE, say plainly that blocked,
+stalled and dead are unmonitored, because the counts above it then mean less
+than they look like they mean.
 
 If `crew ls` exits non-zero, or prints anything containing `UNPARSED` or
 `DRIFT`, say so and stop. Never report zeros you did not measure. A silent
@@ -192,6 +199,52 @@ so do not expect a 7 from `crew peek` or a 5 from `crew nudge`:
 
 There is no cap on crew. Report load every time and let the human decide.
 The bottleneck is their review capacity, not tokens.
+
+## The watchdog
+
+Three failure modes cannot be self-reported by a crew member, because in all
+three the crew member is the thing that is stuck: **blocked** at a permission
+prompt, **stalled** while herdr still reports it working, and **dead** with the
+process gone and the pane still reading idle. A blocked crew member is mid-turn
+and cannot run `crew mail send` at all.
+
+So one long-lived pane runs `crew watchdog`, with no agent in it. It reconciles
+against a full snapshot every 30 seconds and appends `alert` records to the
+mailbox, which reach you through `crew mail unread` alongside crew reports. An
+alert is told apart by its `state`: `blocked`, `stalled` or `dead`, none of which
+a crew member is allowed to send.
+
+**Do not run `crew watchdog` yourself.** It never returns, so it would hold your
+session until the Bash timeout. Propose it to the human, who runs it in a pane
+of their own:
+
+```bash
+crew watchdog
+```
+
+If they report that it refused with a message about a lock, that is good news:
+one is already running, and one is the correct number.
+
+The watchdog pane is not tagged, so it does not appear in the `crew ls` table.
+The `watchdog:` line is the only report of it, and it comes from a heartbeat the
+loop writes only after a reconcile that actually succeeded. So a STALE line
+means the loop is alive but cannot read herdr, or is gone; either way nothing is
+watching. `crew doctor` fails on a stale heartbeat and passes with none at all,
+because running no watchdog is a choice and running a blind one is a fault.
+
+Treat an alert as a prompt to look, not as a verdict:
+
+- **blocked**: the human, or you with `crew peek`, has to see what the prompt is
+  asking. The watchdog cannot answer it.
+- **stalled**: it means no status change and no terminal output for the whole
+  threshold. Usually a quota stall, sometimes a crew member waiting on something
+  silent. `crew peek` before saying which.
+- **dead**: the session is gone and the pane is not. That is a retirement to
+  propose, following the rules below.
+
+During a fleet-wide quota exhaustion every crew member stalls at once. The
+mailbox gets one record per pane, and the desktop notification is coalesced into
+one naming the count, so do not read one notification as one crew member.
 
 ## Inspecting and messaging
 
@@ -285,6 +338,23 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
   the foreman's own pane in it is not detected at all. Read a quiet mailbox as
   quiet, not as fine, and `crew peek` when a crew member has been silent longer
   than its work should take.
+- **A stall is detected as total silence, which a countdown defeats.** `stalled`
+  fires only when herdr's agent state and the pane's terminal output are BOTH
+  frozen for the whole threshold. That is deliberate: a crew member working
+  productively holds one agent state for its whole task, so output is the only
+  thing that separates it from a quota stall, and a false stall alert teaches the
+  human to ignore the watchdog. The cost is a missed stall when the stalled
+  session animates something, such as a retry countdown. If a crew member has
+  gone quiet and no alert arrived, `crew peek` it rather than trusting silence.
+- **`dead` needs an answer from herdr, and says nothing without one.** It is
+  established by asking herdr which processes run in the pane, so on a herdr that
+  cannot answer for another pane, or on any unreadable reply, the watchdog emits
+  nothing rather than guessing. An unreported dead crew member still shows in
+  `crew ls` as a pane no agent occupies once herdr drops the agent.
+- **The watchdog is not in the guard's forbidden list.** A crew member can start
+  one. The lock stops a second one from running, and it only reads and appends
+  alerts, so the damage is bounded, but the pane it starts is not tagged and you
+  will not see it in `crew ls`.
 - **`crew doctor` checks that the guard is armed, and still cannot prove it is
   live.** Doctor fails if the `crew-guard` PreToolUse hook is not registered, if
   the path it names does not exist or is not executable, or if the matcher omits

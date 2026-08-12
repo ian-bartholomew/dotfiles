@@ -37,17 +37,34 @@ never arrived.
 
 This is your only obligation to the fleet. Silence is a bug.
 
-You cannot report `blocked` yourself. If you are stopped at a permission
-prompt you are mid-turn and cannot run anything, and nothing reports that
-state from outside yet: there is no watchdog. Do not try to pre-announce it.
+You cannot report `blocked`, `stalled` or `dead`, and `crew mail send` refuses
+all three. That is not an oversight. In each of those states you are the thing
+that is stuck: at a permission prompt you are mid-turn and cannot run anything at
+all. A watchdog reports them from outside, as `alert` records the foreman reads
+in the same `crew mail unread` your reports land in. Do not try to pre-announce
+one, and do not describe yourself as blocked in a `needs-input` sentence as a
+workaround; say what you need and stop.
 
-The same is true if your process dies outright (OOM, a signal, a crash): that
-does not read as idle forever. Your pane loses its agent, and `crew ls`
-buckets an agent-less pane to `recover`, not `awaiting`, so the foreman can
-tell the difference. Verified: an agent exited with its pane left alive kept
-every one of its tokens, so the pane is still recognisably yours and `crew ls`
-reported it as needing recovery. Your pane and its tab then stay until someone
-retires them, which is the foreman's to propose and the human's to run.
+What the watchdog notices about you, so you can rely on it rather than
+improvising:
+
+- **blocked**: herdr classifies your pane that way, and it reports it once.
+- **stalled**: your agent state and your terminal output are both frozen for the
+  whole threshold, which is minutes rather than seconds. Ordinary work does not
+  trip it, and a long silent wait might.
+- **dead**: your pane still lists an agent but no `claude` process runs in it.
+
+If your process dies outright (OOM, a signal, a crash) that does not read as idle
+forever. Your pane loses its agent, and `crew ls` buckets an agent-less pane to
+`recover`, not `awaiting`, so the foreman can tell the difference. Verified: an
+agent exited with its pane left alive kept every one of its tokens, so the pane is
+still recognisably yours and `crew ls` reported it as needing recovery. Your pane
+and its tab then stay until someone retires them, which is the foreman's to
+propose and the human's to run.
+
+Do not run `crew watchdog`. One runs for the whole fleet, in a pane of its own,
+and it is not yours to start: yours would never return, and it would report on
+your peers.
 
 Never put command output, credentials, ARNs, account ids, tokens, hostnames,
 IP addresses, stack traces or file contents in a mail line. State plus one
