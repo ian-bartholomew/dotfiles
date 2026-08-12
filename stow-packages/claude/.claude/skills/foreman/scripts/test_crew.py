@@ -3516,7 +3516,7 @@ def _guard_world():
         yield _GuardWorld(tmp)
 
 
-def _doctor_output(settings_path, protocol=None):
+def _doctor_output(settings_path, protocol=None, gh=True):
     """crew.doctor() with every external probe faked and the settings path under
     the test's control, as (exit code, stdout)."""
     if protocol is None:
@@ -3529,6 +3529,8 @@ def _doctor_output(settings_path, protocol=None):
             return True, "protocol: %d" % protocol
         if argv[:2] == ["claude", "--help"]:
             return True, "--append-system-prompt --continue --model"
+        if argv[:2] == ["gh", "--version"]:
+            return (True, "gh 2.0.0") if gh else (False, "gh not runnable")
         raise AssertionError("unexpected probe: %s" % argv)
 
     out = io.StringIO()
@@ -3811,6 +3813,28 @@ class TestDoctorFailsClosedOnProtocolDrift(unittest.TestCase):
         _, out = self._doctor(crew.HERDR_VERIFIED_PROTOCOLS[-1])
         self.assertIn("(verified)", out)
         self.assertNotIn("has not been verified", out)
+
+
+class TestDoctorNotesGhWithoutFailingOnIt(unittest.TestCase):
+    """`gh` is reached by one verb. Failing the whole preflight for it would stop
+    work for a reason unrelated to what the session is about to do, and the
+    foreman skill is told to stop on a red doctor. crew watch refuses on its own,
+    before it creates a pane, which is where it matters."""
+
+    def _doctor(self, gh):
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings()
+            return _doctor_output(world.settings, gh=gh)
+
+    def test_a_missing_gh_is_a_note(self):
+        _, out = self._doctor(gh=False)
+        self.assertIn("note: gh is not usable", out)
+        self.assertNotIn("- note: gh", out)
+
+    def test_a_usable_gh_says_nothing(self):
+        _, out = self._doctor(gh=True)
+        self.assertNotIn("gh", out)
 
 
 class TestALowercasedJiraKeyIsRefused(unittest.TestCase):
@@ -5273,6 +5297,8 @@ class TestDoctorReadsTheHeartbeat(unittest.TestCase):
                 return True, "protocol: %d" % crew.HERDR_VERIFIED_PROTOCOLS[-1]
             if argv[:2] == ["claude", "--help"]:
                 return True, "--append-system-prompt --continue --model"
+            if argv[:2] == ["gh", "--version"]:
+                return True, "gh version 2.0.0"
             raise AssertionError("unexpected probe: %s" % argv)
 
         out = io.StringIO()
@@ -5448,6 +5474,1146 @@ class TestWatchdogArgumentParsing(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(crew.main([]), 2)
         self.assertIn("watchdog", err.getvalue())
+
+RUN_ID = "12345678"
+WATCH_TOKENS = {"crew": "true", "v": "1", "key": "watch-" + RUN_ID,
+                "repo": "repo", "type": "watch", "root": "/repo",
+                "dispatched": "1786000000"}
+
+
+def _record(seq, state="done", key="fandevx-3511", kind=None, msg="landed it",
+            repo="repo", branch="FANDEVX-3511-x", ts=1786000000):
+    """One mailbox record. `kind=None` writes NO kind field, which is the shape
+    of the 41 records already in the live mailbox."""
+    record = {"v": 1, "seq": seq, "ts": ts, "key": key, "repo": repo,
+              "pane": "wQ:p1", "branch": branch, "state": state, "msg": msg}
+    if kind:
+        record["kind"] = kind
+    return record
+
+
+@contextlib.contextmanager
+def _mailbox(records=(), exists=True):
+    """A private mailbox holding these records, never the developer's own."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mailbox.jsonl")
+        if exists:
+            with open(path, "w") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+        with mock.patch.object(crew, "CREW_DIR", tmp), \
+             mock.patch.object(crew, "MAILBOX", path):
+            yield path
+
+
+def _gh(status="completed", conclusion="success", workflow="ci",
+        branch="FANDEVX-1-x"):
+    return {"status": status, "conclusion": conclusion,
+            "workflowName": workflow, "headBranch": branch}
+
+
+def _watch_run(polls, run_id=RUN_ID, budget=60, tokens=None):
+    """cmd_watch_run against a scripted sequence of gh results.
+
+    Each poll is either a dict of gh fields or an error string. The last is
+    repeated, so a run that never terminates keeps returning the same thing until
+    the budget runs out. Returns (code, records written, stdout, stderr)."""
+    remaining = list(polls) or [None]
+
+    def fake_gh(asked):
+        assert asked == run_id, asked
+        item = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        if isinstance(item, str):
+            return None, item
+        return item, None
+
+    out, err = io.StringIO(), io.StringIO()
+    with _mailbox() as path:
+        with mock.patch.object(crew, "_gh_run", side_effect=fake_gh), \
+             mock.patch.object(crew, "calling_pane_tokens",
+                               return_value=tokens or dict(WATCH_TOKENS)), \
+             mock.patch.object(crew, "calling_pane", return_value="wV:pWatch"), \
+             contextlib.redirect_stdout(out), \
+             mock.patch.object(crew.sys, "stderr", err):
+            code = crew.cmd_watch_run(run_id, poll=0, budget=budget)
+        with open(path) as handle:
+            records, unreadable = read_entries(handle.readlines())
+    assert unreadable == 0
+    return code, records, out.getvalue(), err.getvalue()
+
+
+class TestCiOutcomeReportsEveryTerminalState(unittest.TestCase):
+    """A watcher that recognises the success signal alone goes silent through a
+    failure, and silence reads as still running. So terminality is decided by the
+    status, and the conclusion only picks which bucket the report lands in."""
+
+    def test_success_is_a_pass(self):
+        self.assertEqual(crew.ci_outcome("completed", "success")[0], "ci-passed")
+
+    def test_every_bad_conclusion_is_a_failure(self):
+        for conclusion in ("failure", "cancelled", "timed_out",
+                           "startup_failure", "action_required", "stale"):
+            with self.subTest(conclusion=conclusion):
+                state, sentence = crew.ci_outcome("completed", conclusion)
+                self.assertEqual(state, "ci-failed")
+                self.assertIn(conclusion, sentence)
+
+    def test_an_unrecognised_conclusion_still_reports(self):
+        # The whole point. GitHub can add a conclusion tomorrow, and a watcher
+        # that dropped it would be indistinguishable from one still watching.
+        for conclusion in ("neutral", "skipped", "teleported", ""):
+            with self.subTest(conclusion=conclusion):
+                state, sentence = crew.ci_outcome("completed", conclusion)
+                self.assertEqual(state, "ci-inconclusive")
+                self.assertIn(conclusion or "none", sentence)
+
+    def test_a_run_still_going_is_not_terminal(self):
+        for status in ("queued", "in_progress", "waiting", "pending",
+                       "requested"):
+            with self.subTest(status=status):
+                self.assertIsNone(crew.ci_outcome(status, None))
+
+    def test_a_status_crew_has_never_seen_terminates_on_its_conclusion(self):
+        # The second independent signal: either alone goes stale, and neither
+        # going stale is allowed to mean silence.
+        state, _ = crew.ci_outcome("finalising", "failure")
+        self.assertEqual(state, "ci-failed")
+
+    def test_completed_with_no_conclusion_at_all_is_still_terminal(self):
+        self.assertEqual(crew.ci_outcome("completed", None)[0], "ci-inconclusive")
+
+    def test_the_watch_vocabulary_is_not_the_report_vocabulary(self):
+        # MAIL_STATES stays what a crew member may claim about itself. A CI
+        # outcome is measured from outside, so widening that list to carry one
+        # would let a crew member claim it too.
+        self.assertFalse(set(crew.WATCH_STATES) & set(crew.MAIL_STATES))
+
+
+class TestAWatcherNeverEndsWithoutARecord(unittest.TestCase):
+    """The foreman learns a run went red by reading the mailbox, so a watcher
+    that stops without writing is indistinguishable from one still watching.
+    Every exit from the loop writes, including the watcher's own failures."""
+
+    def _one(self, records):
+        self.assertEqual(len(records), 1, records)
+        record = records[0]
+        self.assertEqual(record["kind"], "alert")
+        self.assertEqual(record["key"], "watch-" + RUN_ID)
+        return record
+
+    def test_a_passing_run_is_recorded(self):
+        code, records, out, _ = _watch_run([_gh()])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._one(records)["state"], "ci-passed")
+        self.assertIn(RUN_ID, out)
+
+    def test_a_failing_run_is_recorded(self):
+        code, records, _, _ = _watch_run([_gh(conclusion="failure")])
+        self.assertEqual(code, 0)
+        record = self._one(records)
+        self.assertEqual(record["state"], "ci-failed")
+        self.assertIn("failure", record["msg"])
+
+    def test_a_cancelled_run_is_recorded(self):
+        code, records, _, _ = _watch_run([_gh(conclusion="cancelled")])
+        self.assertEqual(code, 0)
+        record = self._one(records)
+        self.assertEqual(record["state"], "ci-failed")
+        self.assertIn("cancelled", record["msg"])
+
+    def test_a_timed_out_run_is_recorded(self):
+        code, records, _, _ = _watch_run([_gh(conclusion="timed_out")])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._one(records)["state"], "ci-failed")
+
+    def test_a_run_that_terminates_on_a_later_poll_is_recorded(self):
+        code, records, _, _ = _watch_run(
+            [_gh("queued", None), _gh("in_progress", None),
+             _gh(conclusion="failure")])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._one(records)["state"], "ci-failed")
+
+    def test_a_run_that_never_terminates_records_that_crew_gave_up(self):
+        code, records, _, err = _watch_run([_gh("in_progress", None)], budget=0)
+        self.assertEqual(code, 3)
+        record = self._one(records)
+        self.assertEqual(record["state"], "watch-failed")
+        self.assertIn("stopped watching", record["msg"])
+        self.assertIn("gave up", err)
+
+    def test_gh_failing_over_and_over_records_that_crew_gave_up(self):
+        code, records, _, err = _watch_run(["gh exited 1: no such run"])
+        self.assertEqual(code, 3)
+        record = self._one(records)
+        self.assertEqual(record["state"], "watch-failed")
+        self.assertIn("no such run", record["msg"])
+        self.assertIn("no such run", err)
+
+    def test_a_transient_gh_failure_is_not_the_end_of_the_watch(self):
+        code, records, _, _ = _watch_run(
+            ["network unreachable", _gh(conclusion="failure")])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._one(records)["state"], "ci-failed")
+
+    def test_watch_failed_is_not_reported_as_the_run_failing(self):
+        # Two different claims. A watcher that conflated them would report a red
+        # PR that is not red, and the foreman acts on that.
+        _, records, _, _ = _watch_run(["gh is not runnable"])
+        self.assertNotEqual(records[0]["state"], "ci-failed")
+
+    def test_a_mailbox_that_cannot_be_written_is_said_out_loud(self):
+        # The one failure with nowhere to report itself. The pane's text is then
+        # the only record of the run's outcome, so it has to carry it.
+        out, err = io.StringIO(), io.StringIO()
+        with _mailbox():
+            with mock.patch.object(crew, "_gh_run",
+                                   return_value=(_gh(conclusion="failure"),
+                                                 None)), \
+                 mock.patch.object(crew, "calling_pane_tokens", return_value={}), \
+                 mock.patch.object(crew, "append_alert_record",
+                                   side_effect=OSError("read-only file system")), \
+                 contextlib.redirect_stdout(out), \
+                 mock.patch.object(crew.sys, "stderr", err):
+                code = crew.cmd_watch_run(RUN_ID, poll=0, budget=60)
+        self.assertEqual(code, 3)
+        self.assertIn("WATCH RECORD LOST", err.getvalue())
+        self.assertIn("concluded failure", err.getvalue())
+
+    def test_the_record_carries_the_branch_gh_reported(self):
+        _, records, _, _ = _watch_run([_gh(branch="FANDEVX-9-y")])
+        self.assertEqual(records[0]["branch"], "FANDEVX-9-y")
+        self.assertNotIn("worktree", records[0])
+
+    def test_the_verb_runs_the_loop(self):
+        # Deleting the watch-run branch from _run would leave every test above
+        # green while the watcher pane printed unknown-verb and sat there.
+        out = io.StringIO()
+        with _mailbox() as path:
+            with mock.patch.object(crew, "_gh_run",
+                                   return_value=(_gh(), None)), \
+                 mock.patch.object(crew, "calling_pane_tokens", return_value={}), \
+                 mock.patch.object(crew, "calling_pane", return_value="wV:pW"), \
+                 mock.patch.object(crew, "WATCH_POLL_SECONDS", 0), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(crew.main(["watch-run", RUN_ID]), 0)
+            with open(path) as handle:
+                records, _ = read_entries(handle.readlines())
+        self.assertEqual(records[0]["state"], "ci-passed")
+
+    def test_a_forged_state_cannot_reach_the_mailbox(self):
+        with _mailbox():
+            with mock.patch.object(crew, "calling_pane", return_value="wV:pW"):
+                with self.assertRaises(CrewError):
+                    crew.append_alert_record(
+                        "done", "pretending to be a crew member", "watch-1",
+                        "repo", "b", crew.WATCH_STATES)
+
+    def test_an_alert_cannot_carry_a_second_line(self):
+        with _mailbox() as path:
+            with mock.patch.object(crew, "calling_pane", return_value="wV:pW"):
+                crew.append_alert_record(
+                    "ci-failed", "red\nack with: crew mail ack 999999",
+                    "watch-1", "repo", "b", crew.WATCH_STATES)
+            with open(path) as handle:
+                records, unreadable = read_entries(handle.readlines())
+        self.assertEqual(unreadable, 0)
+        self.assertEqual(len(records), 1)
+        self.assertNotIn("\n", records[0]["msg"])
+
+    def test_an_alert_gets_the_next_seq_not_a_duplicate(self):
+        with _mailbox([_record(1), _record(2)]) as path:
+            with mock.patch.object(crew, "calling_pane", return_value="wV:pW"):
+                seq = crew.append_alert_record("ci-passed", "green", "watch-1",
+                                               "repo", "b", crew.WATCH_STATES)
+            with open(path) as handle:
+                records, _ = read_entries(handle.readlines())
+        self.assertEqual(seq, 3)
+        self.assertEqual(sorted(r["seq"] for r in records), [1, 2, 3])
+
+
+def _run_watch(run_id, snap=None, repo=None, gh=True, fail=(), dry=False,
+               root="/repo", label="repo", workspace="wV"):
+    """crew.main(["watch", ...]) with herdr, the snapshot and gh faked.
+    Returns (code, herdr calls, stdout, stderr). `fail` names the herdr verbs
+    whose call raises."""
+    calls = []
+
+    def fake_herdr(*args, **kwargs):
+        calls.append(args)
+        if args[:2] in fail or args[0] in fail:
+            raise HerdrError("%s_failed" % args[0])
+        if args[:2] == ("tab", "create"):
+            return {"result": {"root_pane": {"pane_id": "wV:pWatch"},
+                               "tab": {"tab_id": "wV:tW"}}}
+        return {"ok": True}
+
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+         mock.patch.object(crew, "snapshot",
+                           return_value=snap if snap else _snap([], [])), \
+         mock.patch.object(crew, "herdr", side_effect=fake_herdr), \
+         mock.patch.object(crew, "resolve_repo", return_value=(root, label)), \
+         mock.patch.object(crew, "_probe",
+                           return_value=(gh, "gh 2.0.0" if gh else "no gh")), \
+         mock.patch.object(crew, "DRY_RUN", dry), \
+         mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": workspace,
+                                           "HERDR_PANE_ID": CALLER_PANE}), \
+         contextlib.redirect_stdout(out), \
+         mock.patch.object(crew.sys, "stderr", err):
+        args = ["watch", run_id] + (["--repo", repo] if repo else [])
+        code = crew.main(args)
+    return code, calls, out.getvalue(), err.getvalue()
+
+
+class TestWatchOpensAPaneWithNoAgent(unittest.TestCase):
+    """A watcher follows CI so the foreman does not have to poll. It is a pane
+    and a shell, never an agent: an agent would be a paid session sitting in a
+    sleep loop."""
+
+    def test_it_creates_a_tab_tags_it_and_runs_the_loop(self):
+        code, calls, out, err = _run_watch(RUN_ID)
+        self.assertEqual(code, 0, err)
+        self.assertIn(("tab", "create"), [c[:2] for c in calls])
+        tagged = [c for c in calls if c[:2] == ("pane", "report-metadata")]
+        self.assertEqual(len(tagged), 1)
+        self.assertIn("type=watch", tagged[0])
+        ran = [c for c in calls if c[:2] == ("pane", "run")]
+        self.assertEqual(len(ran), 1)
+        self.assertIn("watch-run %s" % RUN_ID, ran[0][3])
+        self.assertIn(RUN_ID, out)
+
+    def test_no_agent_is_ever_started(self):
+        _, calls, _, _ = _run_watch(RUN_ID)
+        self.assertFalse([c for c in calls if c[0] == "agent"],
+                         "a watcher with an agent is a paid session sitting in "
+                         "a sleep loop, and it would occupy a load bucket")
+
+    def test_the_start_is_confirmed_not_assumed(self):
+        _, calls, _, _ = _run_watch(RUN_ID)
+        waits = [c for c in calls if c[:2] == ("pane", "wait-output")]
+        self.assertEqual(len(waits), 1)
+        self.assertIn(crew.WATCH_STARTED + " " + RUN_ID, waits[0])
+
+    def test_a_command_that_never_reports_itself_started_is_not_called_watching(
+            self):
+        code, _, out, err = _run_watch(RUN_ID, fail=(("pane", "wait-output"),))
+        self.assertEqual(code, 3)
+        self.assertIn("WATCH UNCONFIRMED", err)
+        self.assertIn("crew retire", err)
+        self.assertNotIn("watching run", out)
+
+    def test_a_run_id_that_is_not_a_run_id_creates_nothing(self):
+        for bad in ("https://github.com/o/r/actions/runs/1", "main",
+                    "123; rm -rf ~", "--help"):
+            with self.subTest(bad=bad):
+                code, calls, _, _ = _run_watch(bad)
+                self.assertEqual(code, 3)
+                self.assertFalse(calls, "the run id is interpolated into "
+                                        "another pane's shell")
+
+    def test_no_gh_means_no_pane(self):
+        code, calls, _, err = _run_watch(RUN_ID, gh=False)
+        self.assertEqual(code, 3)
+        self.assertFalse(calls, "a pane opened to run a command that is not "
+                                "there looks exactly like a watcher")
+        self.assertIn("gh", err)
+
+    def test_an_unrecordable_root_is_refused_before_anything_is_created(self):
+        code, calls, _, err = _run_watch(RUN_ID,
+                                         root="/" + "r" * crew.TOKEN_VALUE_MAX)
+        self.assertEqual(code, 3)
+        self.assertFalse(calls)
+        self.assertIn("truncated", err)
+
+    def test_a_second_watcher_for_one_run_creates_nothing(self):
+        snap = _snap([], [_full_pane("wV:pWatch", WATCH_TOKENS, tab="wV:tW")])
+        code, calls, out, err = _run_watch(RUN_ID, snap=snap)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(calls, "two watchers on one run write the outcome "
+                                "twice and one red run reads as two")
+        self.assertIn("already being watched", out)
+
+    def test_the_handle_it_prints_is_one_crew_retire_can_resolve(self):
+        # A watcher is not a crew member, so `crew retire <pane id>` cannot find
+        # it and the tab label is not a handle at all. Printing either is a
+        # command the human cannot run.
+        _, _, out, err = _run_watch(RUN_ID)
+        self.assertIn("crew retire wV:tW", out, err)
+        self.assertNotIn("crew retire wV:pWatch", out)
+        self.assertNotIn("crew retire repo/watch", out)
+
+    def test_an_unreadable_tab_id_points_at_ls_rather_than_at_a_guess(self):
+        snap = _snap([], [])
+        with mock.patch.object(crew, "response_tab_id", return_value=""):
+            _, _, out, err = _run_watch(RUN_ID, snap=snap)
+        self.assertIn("crew ls", out, err)
+        self.assertNotIn("crew retire", out)
+
+    def test_a_tab_id_that_is_not_a_string_is_not_printed_as_a_handle(self):
+        # The value is checked and not just the path, the same way the pane id
+        # reader checks it: herdr is pre-1.0 and self-updating, and a handle of
+        # `{'id': 4}` is worse than saying to look at crew ls.
+        for value in (4, None, {"id": "wV:tW"}, ""):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    crew.response_tab_id({"result": {"tab": {"tab_id": value}}}),
+                    "")
+
+    def test_the_command_names_this_script_not_the_symlink_on_path(self):
+        # ~/.local/bin/crew is a symlink into a git worktree and need not be the
+        # version that opened the pane. A watch-run that does not exist there
+        # prints one line and then sits looking like a watcher.
+        command = crew.watch_command(RUN_ID)
+        self.assertIn(os.path.abspath(crew.__file__), command)
+        self.assertNotIn(" crew watch-run", command)
+
+    def test_a_crew_members_own_pane_may_not_open_a_watcher(self):
+        # The guard hook is the enforcement and it acts on a table of commands,
+        # so a verb that table does not name is not denied at all. This is the
+        # backstop until it does.
+        snap = _snap([], [_full_pane(CALLER_PANE, UNINSTALL_TOKENS)])
+        code, calls, _, err = _run_watch(RUN_ID, snap=snap)
+        self.assertEqual(code, 3)
+        self.assertFalse(calls)
+        self.assertIn("it is a crew member", err)
+
+
+class TestWatchersAreNotCrewMembers(unittest.TestCase):
+    """A watcher has no agent for its whole life, so counted as a member it
+    would sit in `recover` forever and a healthy fleet would read as needing
+    recovery."""
+
+    def _snap(self, tokens=None, agent=False):
+        panes = [_full_pane("wV:pWatch", tokens or WATCH_TOKENS, tab="wV:tW")]
+        agents = [_full_agent("wV:pWatch", "idle", "someone")] if agent else []
+        return _snap(agents, panes, [_tab("wV:tW", "repo/watch-" + RUN_ID)])
+
+    def test_a_watcher_pane_is_not_a_member(self):
+        self.assertEqual(crew_members(self._snap()), [])
+
+    def test_a_watcher_pane_is_a_watcher(self):
+        found = crew.watchers(self._snap())
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["run"], RUN_ID)
+        self.assertEqual(found[0]["tab"], "wV:tW")
+
+    def test_a_watcher_with_an_unrecognised_token_version_is_still_a_watcher(
+            self):
+        # Read off the RAW token in both readers, or a watcher tagged by an
+        # older crew is skipped as a member AND missed as a watcher, which is
+        # the invisible-pane defect this design has already paid for.
+        tokens = dict(WATCH_TOKENS)
+        tokens["v"] = "99"
+        self.assertEqual(crew_members(self._snap(tokens)), [])
+        self.assertEqual(len(crew.watchers(self._snap(tokens))), 1)
+
+    def test_it_is_not_counted_as_load(self):
+        out = render_ls(crew_members(self._snap()),
+                        untagged_agents(self._snap()), None,
+                        watcher_list=crew.watcher_rows(
+                            crew.watchers(self._snap()), []))
+        self.assertIn("0 working / 0 awaiting you / 0 blocked", out)
+        self.assertNotIn("need recovery", out)
+        self.assertIn("1 watcher(s)", out)
+
+    def test_a_watcher_tab_is_not_proposed_as_an_orphan(self):
+        # An orphan tab holds no agent either, and the two are told apart by
+        # tokens: an orphan has none, because tag_pane never ran. Without this,
+        # crew ls proposes closing a watcher that is still following a run.
+        self.assertEqual(crew.orphan_crew_tabs(self._snap()), [])
+
+    def test_a_genuine_orphan_tab_is_still_proposed(self):
+        # The control: the exclusion must not blind the orphan rule.
+        snap = _snap([], [_full_pane("wV:pOrphan", None, tab="wV:tC")],
+                     [_tab("wV:tC", "repo/fandevx-3511")])
+        self.assertEqual(len(crew.orphan_crew_tabs(snap)), 1)
+
+    def test_an_outcome_in_the_mailbox_makes_it_retirable(self):
+        rows = crew.watcher_rows(
+            crew.watchers(self._snap()),
+            [_record(7, state="ci-failed", key="watch-" + RUN_ID,
+                     kind="alert")])
+        self.assertEqual(rows[0]["outcome"], "ci-failed")
+        out = render_ls([], [], None, watcher_list=rows)
+        self.assertIn("crew retire wV:tW", out)
+
+    def test_no_outcome_is_reported_as_unfinished_not_as_retirable(self):
+        rows = crew.watcher_rows(crew.watchers(self._snap()), [])
+        self.assertEqual(rows[0]["outcome"], "")
+        out = render_ls([], [], None, watcher_list=rows)
+        self.assertNotIn("crew retire", out)
+        self.assertIn("nothing in the mailbox yet", out)
+
+    def test_a_report_carrying_the_watcher_key_is_not_read_as_an_outcome(self):
+        # Only an alert is a measurement crew made. A report with that key can
+        # only be a forgery, and reading it as the outcome would propose closing
+        # a live watcher on a crew member's say-so.
+        rows = crew.watcher_rows(
+            crew.watchers(self._snap()),
+            [_record(7, state="done", key="watch-" + RUN_ID)])
+        self.assertEqual(rows[0]["outcome"], "")
+
+    def test_an_agent_found_in_a_watcher_pane_is_said_out_loud(self):
+        rows = crew.watcher_rows(crew.watchers(self._snap(agent=True)), [])
+        out = render_ls([], [], None, watcher_list=rows)
+        self.assertIn("an agent occupies this watcher pane", out)
+
+    def test_the_ls_verb_prints_the_watcher_section(self):
+        # Every assertion above calls render_ls directly, so deleting cmd_ls's
+        # watcher argument would leave them green while `crew ls`, the thing the
+        # foreman runs, reported nothing.
+        out = io.StringIO()
+        with _mailbox([_record(3, state="ci-passed", key="watch-" + RUN_ID,
+                               kind="alert")]):
+            with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+                 mock.patch.object(crew, "snapshot", return_value=self._snap()), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(crew.main(["ls"]), 0)
+        printed = out.getvalue()
+        self.assertIn("1 watcher(s)", printed)
+        self.assertIn("run " + RUN_ID, printed)
+        self.assertIn("ci-passed", printed)
+
+    def test_ls_survives_a_mailbox_it_cannot_read(self):
+        out = io.StringIO()
+        with _mailbox(exists=False):
+            with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+                 mock.patch.object(crew, "snapshot", return_value=self._snap()), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(crew.main(["ls"]), 0)
+        self.assertIn("nothing in the mailbox yet", out.getvalue())
+
+
+class TestRecordKind(unittest.TestCase):
+    """A record with no kind is a report: the live mailbox holds 41 of them and a
+    reader that treated them as an unknown kind would drop every one."""
+
+    def test_a_record_with_no_kind_is_a_report(self):
+        self.assertEqual(crew.record_kind(_record(1)), "report")
+
+    def test_an_empty_kind_is_a_report(self):
+        self.assertEqual(crew.record_kind({"kind": ""}), "report")
+
+    def test_a_declared_kind_is_kept(self):
+        for kind in ("ack", "alert", "report"):
+            with self.subTest(kind=kind):
+                self.assertEqual(crew.record_kind({"kind": kind}), kind)
+
+
+@contextlib.contextmanager
+def _projects(names=("crew-mvp",), contents=None):
+    """A private projects directory, never the developer's own wiki."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in names:
+            os.makedirs(os.path.join(tmp, name))
+            body = (contents or {}).get(name)
+            if body is not None:
+                with open(os.path.join(tmp, name, "README.md"), "w") as handle:
+                    handle.write(body)
+        with mock.patch.object(crew, "PROJECTS_DIR", tmp):
+            yield tmp
+
+
+def _run_log(key, records, project="crew-mvp", existing=None, names=None,
+             contents=None, dry=False):
+    """crew.main(["log", ...]) against a private mailbox and projects dir.
+    Returns (code, log text or None, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with _projects(names or ("crew-mvp",), contents) as projects:
+        path = os.path.join(projects, "crew-mvp", "log.md")
+        if existing is not None:
+            with open(path, "w") as handle:
+                handle.write(existing)
+        with _mailbox(records):
+            with mock.patch.object(crew, "snapshot",
+                                   side_effect=HerdrError("no herdr here")), \
+                 mock.patch.object(crew, "DRY_RUN", dry), \
+                 contextlib.redirect_stdout(out), \
+                 mock.patch.object(crew.sys, "stderr", err):
+                args = ["log", key] + (["--project", project] if project else [])
+                code = crew.main(args)
+        text = None
+        if os.path.exists(path):
+            with open(path) as handle:
+                text = handle.read()
+    return code, text, out.getvalue(), err.getvalue()
+
+
+class TestCrewLogDigestsReportsOnly(unittest.TestCase):
+    """An ack is the foreman's bookkeeping and an alert is written ABOUT a pane
+    from outside it. A digest that mixed either in would credit a CI failure, or
+    the foreman's own cursor, to the crew member as work it landed."""
+
+    KEY = "fandevx-3511"
+
+    def test_a_report_becomes_a_done_bullet(self):
+        code, text, out, err = _run_log(
+            self.KEY, [_record(1, msg="landed the guard tables")])
+        self.assertEqual(code, 0, err)
+        self.assertIn("### Done", text)
+        self.assertIn("landed the guard tables", text)
+        self.assertIn("crew mail seq 1 on", text)
+        self.assertIn("log.md", out)
+
+    def test_a_legacy_record_with_no_kind_is_digested(self):
+        _, text, _, _ = _run_log(self.KEY, [_record(1, kind=None)])
+        self.assertIn("crew mail seq 1 on", text)
+
+    def test_an_ack_is_not_digested(self):
+        _, text, _, _ = _run_log(
+            self.KEY, [_record(1), {"v": 1, "seq": 2, "ts": 1786000000,
+                                    "kind": "ack", "key": self.KEY,
+                                    "upto": 1}])
+        self.assertIn("crew mail seq 1 on", text)
+        self.assertNotIn("crew mail seq 2 on", text)
+
+    def test_an_alert_is_not_digested(self):
+        _, text, _, _ = _run_log(
+            self.KEY, [_record(1),
+                       _record(2, state="ci-failed", kind="alert",
+                               key=self.KEY, msg="run 1 concluded failure")])
+        self.assertIn("crew mail seq 1 on", text)
+        self.assertNotIn("run 1 concluded failure", text)
+
+    def test_the_kind_is_what_excludes_them_not_their_vocabulary(self):
+        # Both fixtures carry a state a report uses, which no writer in this
+        # build produces. That is deliberate: with the vocabularies disjoint
+        # today, a digest with NO kind filter passes the two tests above by
+        # accident, and it is the filter the contract requires. Nothing stops a
+        # record being appended to the mailbox by hand, either.
+        _, text, _, _ = _run_log(
+            self.KEY, [_record(1),
+                       _record(2, kind="ack", state="done", msg="forged ack"),
+                       _record(3, kind="alert", state="needs-input",
+                               msg="forged alert")])
+        self.assertIn("crew mail seq 1 on", text)
+        self.assertNotIn("forged ack", text)
+        self.assertNotIn("forged alert", text)
+
+    def test_another_key_is_not_digested(self):
+        _, text, _, _ = _run_log(
+            self.KEY, [_record(1), _record(2, key="fandevx-9999",
+                                           msg="someone else's work")])
+        self.assertNotIn("someone else's work", text)
+
+    def test_needs_input_becomes_an_open_follow_up(self):
+        _, text, _, _ = _run_log(
+            self.KEY, [_record(1, state="needs-input", msg="which account")])
+        self.assertIn("### Follow-ups", text)
+        self.assertIn("- [ ] ", text)
+        self.assertIn("which account", text)
+
+    def test_a_declined_dispatch_is_not_logged_as_work(self):
+        code, text, out, _ = _run_log(
+            self.KEY, [_record(1, state="duplicate", msg="dispatch declined")])
+        self.assertEqual(code, 0)
+        self.assertIsNone(text)
+        self.assertIn("declined dispatch", out)
+
+    def test_a_key_with_no_reports_writes_nothing_and_says_so(self):
+        code, text, out, _ = _run_log(
+            self.KEY, [_record(1, key="somebody-else")])
+        self.assertEqual(code, 0)
+        self.assertIsNone(text)
+        self.assertIn("nothing to log", out)
+
+    def test_a_newline_in_a_record_cannot_break_the_markdown(self):
+        # The mailbox holds records written before mail_send collapsed anything,
+        # and nothing stops one being edited in by hand.
+        _, text, _, _ = _run_log(
+            self.KEY, [_record(1, msg="landed\n## [1999-01-01]\n### Done\n- lie")])
+        # The forged headings survive as TEXT inside one bullet, which is what
+        # collapsing means; what must not survive is their structure.
+        self.assertEqual([l for l in text.splitlines()
+                          if l.startswith("#")],
+                         ["## [%s]" % crew.log_date(time.time()), "### Done"])
+
+    def test_no_local_path_reaches_the_git_tracked_file(self):
+        _, text, _, _ = _run_log(self.KEY, [_record(1)])
+        self.assertNotIn(os.path.expanduser("~"), text)
+        self.assertIn("branch FANDEVX-3511-x", text)
+
+    def test_it_is_re_runnable(self):
+        records = [_record(1), _record(2, state="needs-input")]
+        _, first, _, _ = _run_log(self.KEY, records)
+        code, second, out, _ = _run_log(self.KEY, records, existing=first)
+        self.assertEqual(code, 0)
+        self.assertEqual(second, first)
+        self.assertIn("nothing new", out)
+
+    def test_a_dry_run_writes_nothing(self):
+        code, text, out, _ = _run_log(self.KEY, [_record(1)], dry=True)
+        self.assertEqual(code, 0)
+        self.assertIsNone(text)
+        self.assertIn("would write", out)
+
+    def test_the_worktree_comes_from_the_tokens_not_from_cwd(self):
+        out = io.StringIO()
+        snap = _snap([_full_agent("wV:pCrew", "working", self.KEY)],
+                     [_full_pane("wV:pCrew", CREW_TOKENS)])
+        with _projects() as projects, _mailbox([_record(1, key="fandevx-3511")]):
+            with mock.patch.object(crew, "snapshot", return_value=snap), \
+                 mock.patch.object(crew, "DRY_RUN", True), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    crew.main(["log", self.KEY, "--project", "crew-mvp"]), 0)
+            self.assertTrue(os.path.isdir(projects))
+        printed = out.getvalue()
+        self.assertIn(worktree_for(CREW_TOKENS["root"],
+                                   CREW_TOKENS["branch"]), printed)
+        self.assertIn("from the live pane wV:pCrew", printed)
+
+    def test_a_crew_members_own_pane_may_not_write_the_project_log(self):
+        # Its own contract forbids it, because several crew writing one log
+        # interleaves, and the guard's command table does not name this verb.
+        out, err = io.StringIO(), io.StringIO()
+        with _projects(), _mailbox([_record(1)]):
+            with mock.patch.object(crew, "calling_pane_tokens",
+                                   return_value=UNINSTALL_TOKENS), \
+                 contextlib.redirect_stdout(out), \
+                 mock.patch.object(crew.sys, "stderr", err):
+                code = crew.main(["log", self.KEY, "--project", "crew-mvp"])
+        self.assertEqual(code, 3)
+        self.assertIn("it is a crew member", err.getvalue())
+
+    def test_a_retired_key_still_logs_from_the_records(self):
+        # The ordinary case, not the edge one: work is logged when it finishes,
+        # which is exactly when the pane has been retired.
+        code, text, out, _ = _run_log(self.KEY, [_record(1)])
+        self.assertEqual(code, 0)
+        self.assertIn("from the records", out)
+        self.assertIn("crew mail seq 1 on", text)
+
+
+class TestCrewLogRefusesTheWrongProject(unittest.TestCase):
+    """These logs are git tracked. The right words in the wrong project's log is
+    worse than writing nothing."""
+
+    def test_a_project_that_does_not_exist_is_refused(self):
+        code, text, _, err = _run_log("fandevx-3511", [_record(1)],
+                                      project="not-a-project")
+        self.assertEqual(code, 3)
+        self.assertIsNone(text)
+        self.assertIn("will not create one", err)
+
+    def test_one_project_naming_the_key_is_inferred(self):
+        code, text, _, err = _run_log(
+            "fandevx-3511", [_record(1)], project=None,
+            names=("crew-mvp", "other"),
+            contents={"crew-mvp": "Tickets: FANDEVX-3511\n"})
+        self.assertEqual(code, 0, err)
+        self.assertIn("crew mail seq 1 on", text)
+
+    def test_two_projects_naming_the_key_refuse_and_name_both(self):
+        code, text, _, err = _run_log(
+            "fandevx-3511", [_record(1)], project=None,
+            names=("crew-mvp", "other"),
+            contents={"crew-mvp": "FANDEVX-3511\n", "other": "FANDEVX-3511\n"})
+        self.assertEqual(code, 3)
+        self.assertIsNone(text)
+        self.assertIn("crew-mvp", err)
+        self.assertIn("other", err)
+        self.assertIn("--project", err)
+
+    def test_no_project_naming_the_key_refuses(self):
+        code, text, _, err = _run_log("fandevx-3511", [_record(1)],
+                                      project=None, names=("crew-mvp",))
+        self.assertEqual(code, 3)
+        self.assertIsNone(text)
+        self.assertIn("--project", err)
+
+
+TODAY = "2026-08-12"
+NEWEST_FIRST = ("# Project - Log\n\nWork log. Newest entries at the top.\n\n"
+                "## [2026-08-11]\n\n### Done\n- older work\n")
+OLDEST_FIRST = ("# Project - Log\n\n## [2026-08-09]\n\n### Done\n- first\n\n"
+                "## [2026-08-10]\n\n### Done\n- second\n")
+
+
+def _bullet(section, line, marker):
+    return {"section": section, "line": line, "marker": marker}
+
+
+class TestProjectLogMergeIsAppendOnly(unittest.TestCase):
+    """The digest writes into a git-tracked file a human also writes by hand, so
+    it may add and never rewrite."""
+
+    DONE = _bullet(crew.LOG_DONE, "- new work (crew mail seq 9 on 2026-08-12)",
+                   "crew mail seq 9 on")
+    ASK = _bullet(crew.LOG_FOLLOWUPS,
+                  "- [ ] a question (crew mail seq 10 on 2026-08-12)",
+                  "crew mail seq 10 on")
+
+    def test_an_empty_file_gets_the_bracketed_heading(self):
+        text, added = crew.merge_log_entry("", TODAY, [self.DONE])
+        self.assertEqual(added, 1)
+        self.assertIn("## [%s]" % TODAY, text)
+        self.assertTrue(text.endswith("\n"))
+
+    def test_a_newest_first_log_gets_the_entry_above_the_first(self):
+        text, _ = crew.merge_log_entry(NEWEST_FIRST, TODAY, [self.DONE])
+        lines = [l for l in text.splitlines() if l.startswith("## ")]
+        self.assertEqual(lines, ["## [%s]" % TODAY, "## [2026-08-11]"])
+        self.assertIn("Newest entries at the top.", text)
+        self.assertIn("- older work", text)
+
+    def test_an_oldest_first_log_gets_the_entry_at_the_end(self):
+        text, _ = crew.merge_log_entry(OLDEST_FIRST, TODAY, [self.DONE])
+        lines = [l for l in text.splitlines() if l.startswith("## ")]
+        self.assertEqual(lines[-1], "## [%s]" % TODAY)
+        self.assertTrue(text.startswith("# Project - Log"))
+
+    def test_todays_entry_is_never_duplicated(self):
+        first, _ = crew.merge_log_entry(NEWEST_FIRST, TODAY, [self.DONE])
+        second, added = crew.merge_log_entry(first, TODAY, [self.ASK])
+        self.assertEqual(added, 1)
+        self.assertEqual(len([l for l in second.splitlines()
+                              if l.startswith("## [%s]" % TODAY)]), 1)
+
+    def test_a_bullet_joins_the_section_that_is_already_there(self):
+        first, _ = crew.merge_log_entry("", TODAY, [self.DONE])
+        again = _bullet(crew.LOG_DONE, "- more (crew mail seq 11 on 2026-08-12)",
+                        "crew mail seq 11 on")
+        second, _ = crew.merge_log_entry(first, TODAY, [again])
+        self.assertEqual(second.count(crew.LOG_DONE), 1)
+        body = second.split(crew.LOG_DONE)[1]
+        self.assertIn("- new work", body)
+        self.assertIn("- more", body)
+
+    def test_a_section_is_created_inside_the_entry_not_at_the_end_of_the_file(
+            self):
+        text, _ = crew.merge_log_entry(NEWEST_FIRST, TODAY, [self.DONE])
+        text, _ = crew.merge_log_entry(text, TODAY, [self.ASK])
+        entry = text.split("## [2026-08-11]")[0]
+        self.assertIn(crew.LOG_FOLLOWUPS, entry)
+        self.assertIn("a question", entry)
+
+    def test_a_section_belonging_to_another_date_is_not_written_into(self):
+        text, _ = crew.merge_log_entry(NEWEST_FIRST, TODAY, [self.DONE])
+        older = text.split("## [2026-08-11]")[1]
+        self.assertNotIn("new work", older)
+        self.assertIn("- older work", older)
+
+    def test_an_older_entrys_section_does_not_collect_todays_bullet(self):
+        # The case that makes the span bound load-bearing rather than
+        # incidental: a real log has Follow-ups in older entries, and a search
+        # that ran past today's entry would file today's question under a date
+        # months ago.
+        with_followups = (NEWEST_FIRST
+                          + "\n### Follow-ups\n- [ ] something old\n")
+        text, _ = crew.merge_log_entry(with_followups, TODAY, [self.DONE])
+        text, _ = crew.merge_log_entry(text, TODAY, [self.ASK])
+        today, older = text.split("## [2026-08-11]")
+        self.assertIn("a question", today)
+        self.assertNotIn("a question", older)
+        self.assertIn("- [ ] something old", older)
+
+    def test_a_marker_already_in_the_file_adds_nothing(self):
+        first, _ = crew.merge_log_entry(NEWEST_FIRST, TODAY, [self.DONE])
+        second, added = crew.merge_log_entry(first, TODAY, [self.DONE])
+        self.assertEqual(added, 0)
+        self.assertEqual(second, first)
+
+    def test_seq_one_does_not_match_inside_seq_twelve(self):
+        twelve = _bullet(crew.LOG_DONE, "- x (crew mail seq 12 on 2026-08-12)",
+                         "crew mail seq 12 on")
+        one = _bullet(crew.LOG_DONE, "- y (crew mail seq 1 on 2026-08-12)",
+                      "crew mail seq 1 on")
+        text, _ = crew.merge_log_entry("", TODAY, [twelve])
+        _, added = crew.merge_log_entry(text, TODAY, [one])
+        self.assertEqual(added, 1)
+
+    def test_a_legacy_unbracketed_heading_for_today_is_recognised(self):
+        legacy = "# Log\n\n## %s - FANDEVX-1: thing\n\n### Done\n- old\n" % TODAY
+        text, _ = crew.merge_log_entry(legacy, TODAY, [self.DONE])
+        self.assertEqual(len([l for l in text.splitlines()
+                              if l.startswith("## ")]), 1)
+        self.assertIn("- new work", text.split("### Done")[1])
+
+    def test_an_empty_section_is_never_written(self):
+        text, _ = crew.merge_log_entry("", TODAY, [self.DONE])
+        self.assertNotIn(crew.LOG_FOLLOWUPS, text)
+
+    def test_existing_content_is_preserved_verbatim(self):
+        text, _ = crew.merge_log_entry(NEWEST_FIRST, TODAY, [self.DONE])
+        for line in NEWEST_FIRST.splitlines():
+            if line.strip():
+                self.assertIn(line, text.splitlines())
+
+
+UNINSTALL_TOKENS = {"crew": "true", "v": "1", "key": "fandevx-3511",
+                    "repo": "repo", "type": "implementer",
+                    "branch": "FANDEVX-3511-x", "root": "/repo",
+                    "dispatched": "1786000000"}
+
+
+@contextlib.contextmanager
+def _install(worktree=False, crew_dir=True, records=2, real_skill=False):
+    """A fake install: skill links, the crew symlink and a ~/.crew, all inside a
+    temp directory. Nothing here touches the real install."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = os.path.join(tmp, "dotfiles", "stow-packages", "claude",
+                              ".claude", "skills")
+        if worktree:
+            source = os.path.join(tmp, "dotfiles", ".claude", "worktrees",
+                                  "wave", "stow-packages", "claude", ".claude",
+                                  "skills")
+        skills = os.path.join(tmp, "home", ".claude", "skills")
+        os.makedirs(skills)
+        os.makedirs(os.path.join(tmp, "home", ".local", "bin"))
+        script = os.path.join(source, "foreman", "scripts")
+        os.makedirs(script)
+        open(os.path.join(script, "crew.py"), "w").close()
+        for name in crew.CREW_SKILLS:
+            target = os.path.join(source, name)
+            if not os.path.isdir(target):
+                os.makedirs(target)
+            if real_skill and name == "foreman":
+                os.makedirs(os.path.join(skills, name))
+                continue
+            os.symlink(target, os.path.join(skills, name))
+        binary = os.path.join(tmp, "home", ".local", "bin", "crew")
+        os.symlink(os.path.join(script, "crew.py"), binary)
+        dot_crew = os.path.join(tmp, "home", ".crew")
+        mailbox = os.path.join(dot_crew, "mailbox.jsonl")
+        if crew_dir:
+            os.makedirs(dot_crew)
+            with open(mailbox, "w") as handle:
+                for seq in range(1, records + 1):
+                    handle.write(json.dumps(_record(seq)) + "\n")
+        settings = os.path.join(tmp, "home", ".claude", "settings.json")
+        with open(settings, "w") as handle:
+            json.dump({"hooks": {"PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"command": "%s/hooks/crew-guard.py"
+                                      % os.path.dirname(source)}]}]}}, handle)
+        with mock.patch.object(crew, "SKILLS_DIR", skills), \
+             mock.patch.object(crew, "CREW_BIN", binary), \
+             mock.patch.object(crew, "CREW_DIR", dot_crew), \
+             mock.patch.object(crew, "MAILBOX", mailbox), \
+             mock.patch.object(crew, "SETTINGS_PATH", settings):
+            yield {"skills": skills, "bin": binary, "crew_dir": dot_crew,
+                   "settings": settings, "source": source}
+
+
+def _run_uninstall(snap=None, confirm=False, caller=CALLER_PANE, fail=(),
+                   dry=False, rmtree_fails=False):
+    """crew.main(["uninstall", ...]) with herdr and the snapshot faked.
+    Returns (code, herdr calls, stdout, stderr)."""
+    calls = []
+
+    def fake_herdr(*args, **kwargs):
+        calls.append(args)
+        if args[0] in fail:
+            raise HerdrError("%s_failed" % args[0])
+        return {"ok": True}
+
+    def refuse(path):
+        raise OSError("Permission denied: %s" % path)
+
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+         mock.patch.object(crew, "snapshot",
+                           return_value=snap if snap else _snap([], [])), \
+         mock.patch.object(crew, "herdr", side_effect=fake_herdr), \
+         mock.patch.object(crew, "DRY_RUN", dry), \
+         mock.patch.object(crew.shutil, "rmtree",
+                           side_effect=refuse if rmtree_fails
+                           else crew.shutil.rmtree), \
+         mock.patch.dict(crew.os.environ, {"HERDR_PANE_ID": caller}), \
+         contextlib.redirect_stdout(out), \
+         mock.patch.object(crew.sys, "stderr", err):
+        code = crew.main(["uninstall"] + (["--confirm"] if confirm else []))
+    return code, calls, out.getvalue(), err.getvalue()
+
+
+class TestUninstallRefusesWhileCrewIsLive(unittest.TestCase):
+    """It removes the mailbox a report lands in, the crew it reports through, and
+    the guard that is the only thing stopping a crew member dispatching paid
+    sessions."""
+
+    def _live(self):
+        return _snap([_full_agent("wV:pCrew", "working", "fandevx-3511")],
+                     [_full_pane("wV:pCrew", UNINSTALL_TOKENS)])
+
+    def test_a_live_crew_member_refuses_and_removes_nothing(self):
+        with _install() as paths:
+            code, calls, out, err = _run_uninstall(self._live())
+            self.assertEqual(code, 3)
+            self.assertIn("still live", err)
+            self.assertIn("wV:pCrew", err)
+            self.assertFalse(calls)
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
+            self.assertTrue(os.path.islink(paths["bin"]))
+
+    def test_a_live_crew_member_refuses_even_with_confirm(self):
+        with _install() as paths:
+            code, _, _, err = _run_uninstall(self._live(), confirm=True)
+            self.assertEqual(code, 3)
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
+
+    def test_an_agent_of_any_status_is_still_live(self):
+        for status in ("idle", "done", "working", "blocked", "unknown"):
+            with self.subTest(status=status):
+                snap = self._live()
+                snap["agents"] = [_full_agent("wV:pCrew", status, None)]
+                with _install():
+                    code, _, _, _ = _run_uninstall(snap, confirm=True)
+                self.assertEqual(code, 3)
+
+    def test_a_watcher_pane_refuses_because_it_would_rebuild_the_directory(self):
+        snap = _snap([], [_full_pane("wV:pWatch", WATCH_TOKENS, tab="wV:tW")])
+        with _install() as paths:
+            code, _, _, err = _run_uninstall(snap, confirm=True)
+            self.assertEqual(code, 3)
+            self.assertIn("watcher", err)
+            self.assertIn("crew retire", err)
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
+
+    def test_a_crew_members_own_pane_may_not_uninstall_the_boundary(self):
+        snap = _snap([], [_full_pane("wV:pCrew", UNINSTALL_TOKENS)])
+        with _install() as paths:
+            code, _, _, err = _run_uninstall(snap, confirm=True,
+                                             caller="wV:pCrew")
+            self.assertEqual(code, 3)
+            self.assertIn("it is a crew member", err)
+            self.assertTrue(os.path.islink(paths["bin"]))
+
+    def test_a_spent_crew_pane_does_not_block(self):
+        # The control: a pane whose session has exited is exactly what uninstall
+        # has to be able to clean up after.
+        snap = _snap([], [_full_pane("wV:pCrew", UNINSTALL_TOKENS)])
+        with _install():
+            code, _, out, err = _run_uninstall(snap)
+        self.assertEqual(code, 0, err)
+        self.assertIn("PROPOSAL", out)
+
+
+class TestUninstallProposesBeforeItActs(unittest.TestCase):
+    """Retirement destroys one session's context. This destroys every record crew
+    ever wrote and removes the only enforcement of the boundary, so it proposes
+    the same way and the human confirms."""
+
+    def test_the_bare_verb_changes_nothing(self):
+        with _install() as paths:
+            code, calls, out, err = _run_uninstall()
+            self.assertEqual(code, 0, err)
+            self.assertIn("PROPOSAL", out)
+            self.assertIn("Nothing has been changed", out)
+            self.assertFalse(calls)
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
+            self.assertTrue(os.path.islink(paths["bin"]))
+            for name in crew.CREW_SKILLS:
+                self.assertTrue(
+                    os.path.islink(os.path.join(paths["skills"], name)))
+
+    def test_the_proposal_names_what_is_lost(self):
+        with _install(records=7):
+            _, _, out, _ = _run_uninstall()
+        self.assertIn("7 mailbox record(s)", out)
+        self.assertIn("Unrecoverable", out)
+
+    def test_the_proposal_names_the_worktree_hazard(self):
+        with _install(worktree=True):
+            _, _, out, _ = _run_uninstall()
+        self.assertIn("resolves inside a git worktree", out)
+
+    def test_the_stow_step_and_the_hook_step_are_the_humans(self):
+        with _install() as paths:
+            _, _, out, _ = _run_uninstall()
+            self.assertIn("you do these yourself", out)
+            self.assertIn("stow -D", out)
+            self.assertIn(paths["settings"], out)
+            self.assertIn("EVERY other skill", out)
+
+    def test_the_settings_file_is_never_touched(self):
+        with _install() as paths:
+            with open(paths["settings"]) as handle:
+                before = handle.read()
+            _run_uninstall(confirm=True)
+            with open(paths["settings"]) as handle:
+                self.assertEqual(handle.read(), before)
+
+    def test_confirm_removes_the_links_the_directory_and_the_tokens(self):
+        snap = _snap([], [_full_pane("wV:pCrew", UNINSTALL_TOKENS)])
+        with _install() as paths:
+            code, calls, out, err = _run_uninstall(snap, confirm=True)
+            self.assertEqual(code, 0, err)
+            self.assertFalse(os.path.exists(paths["crew_dir"]))
+            self.assertFalse(os.path.lexists(paths["bin"]))
+            for name in crew.CREW_SKILLS:
+                self.assertFalse(
+                    os.path.lexists(os.path.join(paths["skills"], name)))
+            self.assertTrue(os.path.isdir(paths["source"]),
+                            "the source of a symlink is not crew's to delete")
+        cleared = [c for c in calls if c[:2] == ("pane", "report-metadata")]
+        self.assertEqual(len(cleared), 1)
+        self.assertIn("wV:pCrew", cleared[0])
+
+    def test_every_token_tag_pane_writes_is_cleared(self):
+        # A subset would leave a pane that still reads as crew's to something.
+        written = []
+
+        def fake_herdr(*args, **kwargs):
+            written.extend(args[index + 1].split("=")[0]
+                           for index, arg in enumerate(args)
+                           if arg == "--token")
+            return None
+
+        with mock.patch.object(crew, "herdr", side_effect=fake_herdr):
+            crew.tag_pane("wV:p1", "k", "repo", "implementer", "b", "/root")
+        self.assertTrue(set(written))
+        self.assertFalse(set(written) - set(crew.CREW_TOKEN_NAMES),
+                         "tag_pane writes a token uninstall does not clear")
+
+    def test_confirm_under_a_dry_run_removes_nothing(self):
+        with _install() as paths:
+            code, calls, out, err = _run_uninstall(confirm=True, dry=True)
+            self.assertEqual(code, 0, err)
+            self.assertIn("would ", out)
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
+            self.assertTrue(os.path.islink(paths["bin"]))
+
+    def test_a_real_directory_where_a_link_belongs_is_not_deleted(self):
+        with _install(real_skill=True) as paths:
+            code, _, out, err = _run_uninstall(confirm=True)
+            self.assertEqual(code, 0, err)
+            self.assertTrue(os.path.isdir(os.path.join(paths["skills"],
+                                                       "foreman")))
+        self.assertIn("crew did not create it", out)
+
+    def test_a_failed_step_warns_and_the_steps_after_it_still_happen(self):
+        # The failure is an EARLY step on purpose. Aborting is how the setup-pane
+        # close became the thing that wedged a key, and here it would leave a
+        # half-uninstalled crew, which is worse than either end state.
+        snap = _snap([], [_full_pane("wV:pCrew", UNINSTALL_TOKENS)])
+        with _install() as paths:
+            code, calls, out, err = _run_uninstall(snap, confirm=True,
+                                                   rmtree_fails=True)
+            self.assertEqual(code, 3)
+            self.assertIn("Permission denied", err)
+            self.assertIn("Carrying on", err)
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
+            self.assertFalse(os.path.lexists(paths["bin"]))
+        self.assertIn(("pane", "report-metadata", "wV:pCrew"),
+                      [c[:3] for c in calls],
+                      "the steps after the failure are what abandoning loses")
+
+    def test_a_failed_token_clear_is_reported_not_raised(self):
+        snap = _snap([], [_full_pane("wV:pCrew", UNINSTALL_TOKENS)])
+        with _install() as paths:
+            code, _, _, err = _run_uninstall(snap, confirm=True, fail=("pane",))
+            self.assertEqual(code, 3)
+            self.assertIn("pane_failed", err)
+            self.assertIn("Carrying on", err)
+            self.assertFalse(os.path.exists(paths["crew_dir"]))
+
+    def test_an_unexpected_argument_is_refused(self):
+        with _install() as paths:
+            with mock.patch.object(crew.sys, "stderr", io.StringIO()) as err:
+                self.assertEqual(crew.main(["uninstall", "--yes-really"]), 3)
+            self.assertIn("--yes-really", err.getvalue())
+            self.assertTrue(os.path.isdir(paths["crew_dir"]))
 
 
 if __name__ == "__main__":

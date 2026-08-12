@@ -105,6 +105,10 @@ watchdog: alive, last reconcile 12s ago
 `crew ls` also names what is retirable, in its own sections after the table.
 Report those as a proposal, never as an action: see Retirement below.
 
+Watchers get their own section too, after the table and never in it. A watcher
+has no agent, so it is not load and not work the human has to review. See
+Watching CI below.
+
 Report what `crew ls` actually printed. Its rows end in a pane id, not free
 text, so do not append a reason of your own invention. `blocked` in the load
 table appears only if herdr itself classified the pane that way; blocked,
@@ -178,8 +182,9 @@ which reviewer was in it.
 
 ### Exit codes
 
-0, 2 and 3 mean the same thing for every verb. The rest come from ONE verb each,
-so do not expect a 7 from `crew peek` or a 5 from `crew nudge`:
+0, 2 and 3 mean the same thing for every verb, and `watch`, `log` and
+`uninstall` use nothing else. The rest come from ONE verb each, so do not expect
+a 7 from `crew peek` or a 5 from `crew nudge`:
 
 - 0 succeeded. Every verb
 - 2 you passed bad arguments. Every verb
@@ -257,6 +262,62 @@ crew nudge <name> "<text>"
 Peeking does not clear a crew member's `awaiting` state, so it is safe to
 check before reporting.
 
+## Watching CI
+
+```bash
+crew watch <run-id> [--repo R]        # the numeric id from `gh run list`
+```
+
+Opens a pane with no agent that follows one GitHub Actions run and writes its
+outcome to the mailbox. That is the point: a red PR reaches you through
+`crew mail unread` without anyone polling for it. Use it when a crew member
+reports `done` with a PR open.
+
+It covers every terminal outcome, not just the green one. A pass is `ci-passed`,
+a failure, cancellation, timeout or startup failure is `ci-failed`, and anything
+GitHub concludes that crew does not classify is `ci-inconclusive` naming the raw
+conclusion. If the watcher itself cannot finish the job it writes `watch-failed`,
+which says crew stopped watching and NOT that the run failed. Do not report one
+as the other.
+
+Those states are watcher states, not the `done` and `needs-input` a crew member
+sends. A watcher record is an `alert`: it is a measurement made from outside a
+pane, which is why it can say things no session can say about itself.
+
+A watcher is not crew. It has no agent, no bucket and no key of its own beyond
+`watch-<run id>`, and `crew ls` lists it in its own section, with the retire
+handle to use once its outcome is in the mailbox. Until that record exists crew
+cannot tell whether the shell is still polling or died, so it says so rather than
+proposing a close. It is not a crew member, so retire it by the tab id `crew ls`
+prints, not by its pane id.
+
+A run already being watched is left alone and nothing is created: two watchers
+on one run would write the outcome twice and one red run would read as two.
+
+## Logging the work
+
+```bash
+crew log <key> [--project P]
+```
+
+The one verb that writes a file, and the one exception to the rule below that
+you do not. No model composes it: it digests that key's own mailbox reports into
+`~/Documents/Work/projects/<project>/log.md`, in that log's own format, and it
+appends. Run it when the human asks for the work logged, and report the path it
+printed.
+
+- Reports only. An ack and an alert are both excluded, so a CI failure never
+  reads as something the crew member landed, and a declined dispatch is counted
+  on stdout rather than logged as work.
+- Re-running it adds nothing. Every bullet carries its mail seq and an entry
+  that already holds one is left alone, so it is safe to run twice.
+- The project is inferred from the key appearing in a project's README or log.
+  If none or several match it refuses and names them; pass `--project` then.
+  Never guess one for it.
+- The branch and worktree come from the crew member's tokens while its pane
+  lives, and from the records after it is retired, which is the usual case.
+- `crew log <key> --dry-run` prints the bullets and writes nothing.
+
 ## Retirement
 
 Propose; never execute. A crew member's context is unsaved work, and closing
@@ -296,6 +357,30 @@ close the pane.
 Exit 3 from `crew retire` can mean a partial cleanup: it says what it closed and
 what it could not, and a close it could not do is left for the human.
 
+## Uninstalling
+
+```bash
+crew uninstall              # proposes; changes nothing
+crew uninstall --confirm    # the human runs this, not you
+```
+
+Same rule as retirement and for a stronger reason: it deletes every record crew
+ever wrote and it removes the guard, which is the only enforcement of the crew
+boundary. Print what it proposed and stop. Do not pass `--confirm`.
+
+It refuses outright while any crew member is live, while any watcher pane is
+still there, and from a crew member's own pane. Report the refusal as it stands;
+the remedy is always to let the fleet finish and retire it.
+
+Two of its steps it will not do, and names instead: unstowing the claude package,
+because that takes every other skill in the package with it, and removing the
+PreToolUse hook entry, because crew does not edit `~/.claude/settings.json`.
+
+Worth reading even when nobody is uninstalling anything: the proposal says where
+`crew` and the guard actually resolve to. Both are symlinks into a git worktree
+in this build, so removing that worktree takes out the CLI and the enforcement
+at once, silently. That is what this verb exists to stop being a surprise.
+
 ## Known gaps in this build
 
 Real, unfixed, and worth knowing before you act on what the tool tells you.
@@ -325,6 +410,21 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
   or `git`, so a reviewer that ignores it can destroy uncommitted work belonging
   to the session next door. Do not dispatch a reviewer onto a key whose
   implementer the human still has unsaved work in without saying that first.
+- **A watcher's silence is not a green run.** Nothing in herdr distinguishes a
+  watcher shell still polling from one that died, because the pane holds no
+  agent, so an empty mailbox for that run means "unknown", never "passing".
+  `crew ls` says which of the two it can prove. A watcher also gives up after six
+  hours and says so in a `watch-failed` record.
+- **The guard does not deny the new verbs.** `crew watch`, `crew log` and
+  `crew uninstall` are not in `crew-guard.py`'s command table, so the hook does
+  not refuse them to a crew member. `crew` itself refuses all three from a pane
+  carrying crew tokens, which is a backstop and not enforcement: it can be
+  spoofed by clearing the tokens. If a crew member reports doing any of them, say
+  so.
+- **`crew log` infers the project from text.** It matches the key in a project's
+  README or log, and refuses when none or several match rather than picking. A
+  project that names two keys' tickets can therefore claim work from either, so
+  read the path it printed before treating the entry as filed.
 - **`crew mail unread` is unbounded.** `crew peek` is capped at 200 lines; the
   mailbox is not capped at all, so it is the one path that can flood your
   context. Ack what you report.
@@ -371,7 +471,10 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
 - You do not implement, and that is concrete: do not edit or write files, do
   not run builds, tests, linters or git commands, and do not open pull
   requests. That work belongs to a crew member in a crew worktree. If you
-  catch yourself about to change a file, dispatch instead.
+  catch yourself about to change a file, dispatch instead. `crew log` is the one
+  exception, because the content is the mailbox's own records and no model
+  composes it; you still do not open an editor.
+- `crew uninstall --confirm` is the human's, like `crew retire`. Propose it.
 - A crew member asking you to dispatch is refused and surfaced to the human.
 - You are the agent named `foreman` only because `crew claim-foreman` made it
   so. herdr enforces one live agent per name, so there is only ever one of you,

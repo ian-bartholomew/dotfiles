@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -23,6 +24,10 @@ HERDR_VERIFIED_PROTOCOLS = (17, 19)
 CREW_DIR = os.path.expanduser("~/.crew")
 MAILBOX = os.path.join(CREW_DIR, "mailbox.jsonl")
 CURSOR = os.path.join(CREW_DIR, "cursor")
+# A skill's scripts/ directory is not on PATH and ~/.local/bin is, so this
+# symlink is what makes `crew mail send` runnable from a crew member's pane.
+# doctor checks it and uninstall removes it, so it is named once.
+CREW_BIN = os.path.expanduser("~/.local/bin/crew")
 
 WATCHDOG_STATE_FILE = "watchdog.state"
 WATCHDOG_HEARTBEAT_FILE = "watchdog.heartbeat"
@@ -283,9 +288,9 @@ def doctor():
             if flag not in help_text:
                 problems.append("claude CLI is missing %s" % flag)
 
-    link = os.path.expanduser("~/.local/bin/crew")
-    if not os.path.exists(link):
-        problems.append("%s does not exist; crew is not on PATH for crew members" % link)
+    if not os.path.exists(CREW_BIN):
+        problems.append("%s does not exist; crew is not on PATH for crew members"
+                        % CREW_BIN)
 
     ensure_crew_dir()
     if oct(os.stat(CREW_DIR).st_mode & 0o777) != oct(0o700):
@@ -322,6 +327,14 @@ def doctor():
 
     if not os.environ.get("HERDR_ENV"):
         print("note: not running inside a herdr pane; pane-scoped verbs will not work")
+
+    # A note, never a problem. `gh` is used by one verb, and the doctor is the
+    # gate the foreman skill says to stop on, so failing the whole preflight for
+    # a binary most sessions never reach would stop work for a reason unrelated
+    # to anything crew is about to do. `crew watch` refuses on its own, before it
+    # creates a pane, which is where it matters.
+    if not _probe(["gh", "--version"])[0]:
+        print("note: gh is not usable here, so crew watch cannot follow a run")
 
     if problems:
         print("\nFAIL")
@@ -568,6 +581,13 @@ def crew_members(snap):
         tokens = pane.get("tokens") or {}
         if tokens.get("crew") != "true":
             continue
+        # A watcher is crew's pane but not a crew member: it holds no agent by
+        # design, so counted here it would sit in the `recover` bucket forever
+        # and a healthy fleet would read as needing recovery. Read off the RAW
+        # token, which is what `watchers` matches on too, so no watcher can fall
+        # between the two readers and become invisible.
+        if tokens.get("type") == WATCH_TYPE:
+            continue
         agent = agents_by_pane.get(pane["pane_id"], {})
         ctype = tokens.get("type", "unknown")
         if tokens.get("v") != TOKEN_VERSION:
@@ -665,14 +685,23 @@ def orphan_crew_tabs(snap):
 
     Occupancy is read off the agent list, never off a status. `tabs` carries an
     agent_status too, and an agent-less tab reports `unknown` there exactly as
-    an unclassifiable agent would."""
+    an unclassifiable agent would.
+
+    A watcher's tab is excluded. A watcher holds no agent for its whole life, so
+    the rule above would name a watcher still following a run as an orphan and
+    propose closing it. The two are told apart by tokens, not by occupancy: an
+    orphan carries none at all, because tag_pane never ran, while a watcher is
+    tagged. Watchers are reported in their own section instead."""
     out = []
+    watcher_panes = set(w["pane"] for w in watchers(snap))
     for tab in snap.get("tabs") or []:
         tab_id = tab.get("tab_id")
         if not tab_id or not is_crew_tab_label(tab.get("label") or ""):
             continue
         panes = [p["pane_id"] for p in tab_panes(snap, tab_id)]
         if any(pane_has_agent(snap, pane_id) for pane_id in panes):
+            continue
+        if any(pane_id in watcher_panes for pane_id in panes):
             continue
         if not tab_holds_only(snap, tab_id, panes):
             continue
@@ -695,7 +724,8 @@ def retire_handle(members, member):
     return member["key"]
 
 
-def render_ls(members, untagged, orphan_tabs=None, watchdog=None):
+def render_ls(members, untagged, orphan_tabs=None, watchdog=None,
+              watcher_list=None):
     counts = {"working": 0, "awaiting": 0, "blocked": 0, "recover": 0}
     for m in members:
         counts[m["bucket"]] += 1
@@ -735,6 +765,29 @@ def render_ls(members, untagged, orphan_tabs=None, watchdog=None):
             lines.append("  %-10s %-24s %-14s propose: crew retire %s"
                          % (t["tab"], t["label"], ",".join(t["panes"]),
                             t["tab"]))
+    # Their own section, and never a row in the table above: a watcher has no
+    # agent, so it has no status to bucket and it is not load the human has to
+    # review. It is named by its TAB, because a watcher is not a crew member and
+    # so `crew retire <pane id>` cannot resolve it.
+    if watcher_list:
+        lines.append("")
+        lines.append("%d watcher(s), no agent, so not counted as load:"
+                     % len(watcher_list))
+        for w in watcher_list:
+            if w.get("outcome"):
+                verdict = ("%s, in the mailbox at seq %d, so it is spent: "
+                           "propose crew retire %s"
+                           % (w["outcome"], w["seq"], w["tab"] or w["pane"]))
+            else:
+                verdict = ("nothing in the mailbox yet, so it is still "
+                           "following the run, or it died without saying so; "
+                           "look at the pane")
+            lines.append("  %-12s %-14s %-20s %s"
+                         % (w["pane"], "run " + (w["run"] or "?"), w["repo"],
+                            verdict))
+            if w["agent"]:
+                lines.append("    an agent occupies this watcher pane, which "
+                             "crew never puts there")
     return "\n".join(lines)
 
 
@@ -751,7 +804,9 @@ def cmd_ls(as_json):
     else:
         print(render_ls(members, untagged_agents(snap),
                         orphan_crew_tabs(snap),
-                        watchdog_report(time.time())))
+                        watchdog=watchdog_report(time.time()),
+                        watcher_list=watcher_rows(watchers(snap),
+                                                 mailbox_entries())))
     return 0
 
 
@@ -1896,7 +1951,7 @@ def cmd_watchdog(once=False, tick=None, stall=None):
 def _run(args):
     if not args:
         print("usage: crew <doctor|claim-foreman|ls|dispatch|peek|nudge|retire|"
-              "mail|watchdog> [args]", file=sys.stderr)
+              "mail|watch|watchdog|log|uninstall> [args]", file=sys.stderr)
         return 2
     verb = args[0]
     if verb == "doctor":
@@ -1983,6 +2038,45 @@ def _run(args):
             return mail_ack(int(args[2]))
         print("usage: crew mail <send|unread|ack>", file=sys.stderr)
         return 2
+    if verb == "watch":
+        if len(args) < 2:
+            print("usage: crew watch <run-id> [--repo R]", file=sys.stderr)
+            return 2
+        run_id = require_positional(args[1], "watch run id")
+        opts = {"--repo": None}
+        rest = args[2:]
+        while rest:
+            flag, value, rest = take_flag(rest, tuple(opts))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            opts[flag] = value
+        return cmd_watch(run_id, opts["--repo"])
+    if verb == "watch-run":
+        # The loop `crew watch` runs inside the watcher pane. Listed so a human
+        # reading a watcher pane can tell what is in it, not to be run by hand.
+        if len(args) < 2:
+            print("usage: crew watch-run <run-id>   (what crew watch runs in "
+                  "the watcher pane)", file=sys.stderr)
+            return 2
+        return cmd_watch_run(require_positional(args[1], "watch-run run id"))
+    if verb == "log":
+        if len(args) < 2:
+            print("usage: crew log <key> [--project P]", file=sys.stderr)
+            return 2
+        key = require_positional(args[1], "log key")
+        opts = {"--project": None}
+        rest = args[2:]
+        while rest:
+            flag, value, rest = take_flag(rest, tuple(opts))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            opts[flag] = value
+        return cmd_log(key, opts["--project"])
+    if verb == "uninstall":
+        rest = [a for a in args[1:] if a != "--confirm"]
+        if rest:
+            raise CrewError("unexpected argument: %s" % rest[0])
+        return cmd_uninstall("--confirm" in args[1:])
     print("unknown verb: %s" % verb, file=sys.stderr)
     return 2
 
@@ -3017,6 +3111,1091 @@ def cmd_retire(name):
         done = _close_or_warn("tab", tab_id) and done
     else:
         print("tab %s went with its last pane." % tab_id)
+    return 0 if done else 3
+
+
+# Aliases for the one set defined with the record contract above. Two names for
+# one concept arrived from two parallel workstreams, and a second `record_kind`
+# alongside them silently shadowed the first: its version did not collapse the
+# value, so a newline in `kind` could forge a line in the foreman's terminal
+# again, a defect the first version had already closed. One implementation only.
+RECORD_KIND_REPORT = KIND_REPORT
+RECORD_KIND_ACK = KIND_ACK
+RECORD_KIND_ALERT = KIND_ALERT
+
+
+def mailbox_entries():
+    """Every readable mailbox record, or an empty list.
+
+    Deliberately quiet about failure, because its callers must not fail with it:
+    `crew ls` reports the fleet, which does not come from the mailbox at all, and
+    an unreadable mailbox must not turn the one surface that must never lie about
+    being empty into an error. The cost is that watchers then read as having
+    written nothing, which reads as unfinished, and that is the safe direction:
+    it can never propose closing a watcher still following a run."""
+    if not os.path.exists(MAILBOX):
+        return []
+    try:
+        with _locked(MAILBOX, "r") as handle:
+            entries, _ = read_entries(handle.readlines())
+    except (IOError, OSError):
+        return []
+    return entries
+
+
+def append_alert_record(state, msg, key, repo, branch, allowed):
+    """Append one `alert` record to the mailbox and return its seq.
+
+    An alert is written ABOUT a pane, by something outside it, so it carries its
+    own vocabulary rather than MAIL_STATES. That separation is the point: a
+    session cannot report that it is blocked, or that its CI went red after it
+    finished, and widening the states a crew member may claim about ITSELF would
+    undo the one check that makes a report trustworthy.
+
+    Same care as a report, for the same measured reasons. The seq is allocated
+    under the same flock, so a watcher writing while a crew member reports cannot
+    collide. Every string field is collapsed to one line, because json.dumps
+    escapes a newline into valid JSONL that the foreman's terminal then renders
+    as a second line crew appears to have printed. And the state is validated
+    against a closed vocabulary, because it is the one field read as a machine
+    value rather than as prose."""
+    state = one_line(state)
+    if state not in allowed:
+        raise CrewError("%r is not a state crew alerts with; expected one of %s"
+                        % (state, ", ".join(allowed)))
+    if not key:
+        raise CrewError("an alert record needs a key")
+    ensure_crew_dir()
+    record = {
+        "v": 1,
+        "kind": RECORD_KIND_ALERT,
+        "ts": int(time.time()),
+        "key": sanitize_name(key),
+        "repo": repo or "",
+        "pane": calling_pane(),
+        # Branch, never a path: these records are permanent and get digested
+        # into a git-tracked log, where an absolute path would leak a username
+        # and directory layout into repository history.
+        "branch": branch or "",
+        "state": state,
+        "msg": msg,
+    }
+    for field, value in list(record.items()):
+        if isinstance(value, str):
+            record[field] = one_line(value)
+    if DRY_RUN:
+        print("would append to %s: %s"
+              % (MAILBOX, json.dumps(record, sort_keys=True)))
+        return 0
+    return append_record(lambda _entries: record)["seq"]
+
+
+WATCH_TYPE = "watch"
+WATCH_KEY_PREFIX = "watch-"
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
+WATCH_STATES = ("ci-passed", "ci-failed", "ci-inconclusive", "watch-failed")
+CI_TERMINAL_STATUSES = ("completed",)
+CI_PASSED_CONCLUSIONS = ("success",)
+CI_FAILED_CONCLUSIONS = ("failure", "cancelled", "timed_out", "startup_failure",
+                         "action_required", "stale")
+GH_RUN_FIELDS = "status,conclusion,workflowName,headBranch"
+WATCH_POLL_SECONDS = 20
+WATCH_BUDGET_SECONDS = 6 * 60 * 60
+WATCH_POLL_FAILURES = 5
+WATCH_STARTED = "crew watch: following run"
+WATCH_START_TIMEOUT_MS = "20000"
+
+
+def watch_key(run_id):
+    """The mailbox key a watcher reports under.
+
+    A run id is not a crew key and a watcher is not a crew member, so it gets a
+    key of its own shape. Prefixed rather than bare because `crew log` and the
+    roster both match on keys, and a run id of digits alone would sanitise into
+    something that reads like a ticket."""
+    return sanitize_name(WATCH_KEY_PREFIX + str(run_id))
+
+
+def watch_run_id(key):
+    """The run id a watcher's key records, or an empty string."""
+    key = one_line(key)
+    return key[len(WATCH_KEY_PREFIX):] if key.startswith(WATCH_KEY_PREFIX) else ""
+
+
+def ci_outcome(status, conclusion):
+    """(state, sentence) once a CI run has reached a terminal state, else None.
+
+    Every terminal outcome is reported, not only the one that matches success.
+    A watcher that recognises `success` alone goes silent through a failure, and
+    silence reads as still running, which is the whole failure mode this verb
+    exists to remove.
+
+    Terminal is decided by TWO independent signals, because either alone goes
+    stale. A status crew has not seen before still terminates once GitHub sets a
+    conclusion; a run `completed` with no conclusion at all still terminates on
+    the status. And a conclusion crew does not classify is reported verbatim as
+    inconclusive rather than dropped, so a value GitHub adds later cannot make
+    this go quiet either. Being wrong about which BUCKET an outcome falls in is
+    recoverable; saying nothing is not."""
+    status = one_line(status).lower()
+    conclusion = one_line(conclusion).lower()
+    if status not in CI_TERMINAL_STATUSES and not conclusion:
+        return None
+    if conclusion in CI_PASSED_CONCLUSIONS:
+        return "ci-passed", "concluded %s" % conclusion
+    if conclusion in CI_FAILED_CONCLUSIONS:
+        return "ci-failed", "concluded %s" % conclusion
+    return "ci-inconclusive", (
+        "reached %s with conclusion %s, which crew does not classify as passed "
+        "or failed: look at the run"
+        % (status or "no status", conclusion or "none"))
+
+
+def _gh_run(run_id):
+    """One `gh run view` poll, as (fields, error).
+
+    Never raises. This is called from a loop whose only obligation is to end
+    with a record in the mailbox, so a failure has to be a value the loop can
+    count rather than an exception that ends it without writing."""
+    argv = ["gh", "run", "view", run_id, "--json", GH_RUN_FIELDS]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        return None, "gh is not runnable: %s" % exc
+    if proc.returncode != 0:
+        return None, "gh run view %s exited %d: %s" % (
+            run_id, proc.returncode,
+            one_line(proc.stderr or proc.stdout)[:160])
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return None, "gh run view %s returned non-JSON: %s" % (
+            run_id, one_line(proc.stdout)[:160])
+    if not isinstance(data, dict):
+        return None, "gh run view %s returned %s, not an object" % (
+            run_id, type(data).__name__)
+    return data, None
+
+
+def calling_pane_tokens():
+    """This pane's own tokens, or {} when herdr cannot be reached.
+
+    Tolerant on purpose, and the callers are the reason. A watcher must write its
+    record whether or not herdr answers, because a watcher that goes quiet is the
+    failure this design is removing; and `crew log` must work after the fleet is
+    gone, which is when work usually gets logged."""
+    pane_id = calling_pane()
+    if not pane_id:
+        return {}
+    try:
+        return _pane_tokens(pane_id)
+    except (CrewError, HerdrError, OSError):
+        return {}
+
+
+def tokens_in(snap, pane_id):
+    """One pane's tokens out of a snapshot already in hand."""
+    for pane in snap["panes"]:
+        if pane["pane_id"] == pane_id:
+            return pane.get("tokens") or {}
+    return {}
+
+
+def crew_pane_refusal(tokens, what):
+    """Why a crew member's own pane may not run this verb, or None.
+
+    The guard hook is the enforcement, and it can act only on the commands its
+    own table names, so a verb that table does not list is not denied at all.
+    These three are new, so this is the backstop until the table catches up.
+
+    calling_pane is spoofable, which is harmless here: this check can only ever
+    prevent an action, so a spoofed value cannot cause one that would not
+    otherwise happen."""
+    if (tokens or {}).get("crew") != "true":
+        return None
+    return ("this pane carries crew tokens, so it is a crew member, and %s is "
+            "the foreman's. Nothing has been done. Report what you need with "
+            "crew mail send and let the foreman or the human act." % what)
+
+
+def cmd_watch_run(run_id, poll=WATCH_POLL_SECONDS, budget=WATCH_BUDGET_SECONDS):
+    """Follow a CI run from a pane with no agent and write its outcome to the
+    mailbox. The loop `crew watch` starts; not something to run by hand.
+
+    EVERY exit from here writes a record, including the exits that are the
+    watcher's OWN failure: gh unusable, and the budget spent. The foreman learns
+    a run went red by reading the mailbox, so a watcher that stops without
+    writing is indistinguishable from one still watching. That is also why the
+    failure state is `watch-failed` rather than `ci-failed`: crew stopped
+    watching is a different claim from the run having failed, and a watcher that
+    conflated them would report a red PR that is not red."""
+    if not RUN_ID_RE.match(str(run_id)):
+        raise CrewError("%r is not a run id" % run_id)
+    tokens = calling_pane_tokens()
+    key = watch_key(run_id)
+    repo = tokens.get("repo", "")
+    print("%s %s" % (WATCH_STARTED, run_id))
+    sys.stdout.flush()
+
+    deadline = time.time() + budget
+    failures = []
+    while time.time() < deadline:
+        data, error = _gh_run(run_id)
+        if error:
+            failures.append(error)
+            print("crew watch: %s" % error, file=sys.stderr)
+            if len(failures) >= WATCH_POLL_FAILURES:
+                return _watch_gave_up(
+                    run_id, key, repo, tokens.get("branch", ""),
+                    "gh could not be asked about it %d times in a row; last "
+                    "error: %s" % (len(failures), failures[-1]))
+        else:
+            failures = []
+            outcome = ci_outcome(data.get("status"), data.get("conclusion"))
+            if outcome:
+                state, sentence = outcome
+                branch = one_line(data.get("headBranch")) or tokens.get("branch", "")
+                seq = _record_outcome(
+                    state,
+                    "run %s (%s on %s) %s"
+                    % (run_id, one_line(data.get("workflowName"))
+                       or "an unnamed workflow", branch or "an unnamed branch",
+                       sentence),
+                    key, repo, branch)
+                if seq is None:
+                    return 3
+                print("crew watch: run %s %s, recorded at mail seq %s"
+                      % (run_id, state, seq))
+                return 0
+        time.sleep(poll)
+    return _watch_gave_up(
+        run_id, key, repo, tokens.get("branch", ""),
+        "crew stopped watching after %d seconds without a terminal state; the "
+        "run may still be going" % budget)
+
+
+def _record_outcome(state, msg, key, repo, branch):
+    """Write one watcher record, or say in the pane that it could not.
+
+    The mailbox is the only channel a watcher has, so a failure to write it has
+    nowhere to be reported except this pane's own text. Printing the outcome here
+    is what stops the whole watch being lost: the pane is then the record, and it
+    says so, rather than the run's outcome disappearing with the exit code."""
+    try:
+        return append_alert_record(state, msg, key, repo, branch, WATCH_STATES)
+    except (CrewError, HerdrError, OSError, ValueError) as exc:
+        print("WATCH RECORD LOST: %s could not be written to the mailbox (%s). "
+              "The outcome was: %s. crew mail unread will not show it, so this "
+              "pane is the only record of it." % (state, exc, msg),
+              file=sys.stderr)
+        return None
+
+
+def _watch_gave_up(run_id, key, repo, branch, why):
+    """Record that the WATCHER failed, not that the run did."""
+    seq = _record_outcome("watch-failed", "run %s: %s" % (run_id, why),
+                          key, repo, branch)
+    print("crew watch: gave up on run %s, recorded at mail seq %s"
+          % (run_id, seq), file=sys.stderr)
+    return 3
+
+
+def watch_command(run_id):
+    """The command the watcher pane runs.
+
+    THIS interpreter and THIS script, both by absolute path, rather than `crew`
+    from PATH. `~/.local/bin/crew` is a symlink into a git worktree and need not
+    be the version that opened the pane: a watcher whose `watch-run` verb does
+    not exist there prints one unknown-verb line and then sits looking exactly
+    like a watcher, which is the silence this verb exists to remove. The
+    interpreter is named for the same reason the path is: it does not depend on
+    the executable bit surviving a re-stow."""
+    return "%s %s watch-run %s" % (shlex.quote(sys.executable),
+                                   shlex.quote(os.path.abspath(__file__)),
+                                   shlex.quote(str(run_id)))
+
+
+def response_tab_id(payload):
+    """The tab id a `tab create` response carries, or "" when it cannot be read.
+
+    Tolerant where response_pane_id is fatal, and for the opposite reason: the
+    pane id is what everything afterwards acts on, while this is only what the
+    human is told to retire with. By the time it is read the tab already exists,
+    so raising here would leak the very tab the id names."""
+    node = payload
+    for step in ("result", "tab", "tab_id"):
+        node = node.get(step) if isinstance(node, dict) else None
+    return node if isinstance(node, str) and node.strip() else ""
+
+
+def watchers(snap):
+    """Every watcher pane. A watcher is never a crew member.
+
+    It holds no agent for its whole life, so as a member it would sit in the
+    `recover` bucket forever and a healthy fleet would read as needing recovery.
+    crew_members skips this type for that reason and `crew ls` gives watchers
+    their own section.
+
+    The type is read off the RAW token here, exactly as crew_members skips it,
+    rather than off the version-checked type: a watcher tagged by an older crew
+    would otherwise be skipped as a member AND missed as a watcher, which is the
+    invisible-pane defect this design has already paid for once."""
+    out = []
+    for pane in snap["panes"]:
+        tokens = pane.get("tokens") or {}
+        if tokens.get("crew") != "true" or tokens.get("type") != WATCH_TYPE:
+            continue
+        key = tokens.get("key", "")
+        out.append({
+            "pane": pane["pane_id"],
+            "tab": pane.get("tab_id") or "",
+            "key": key,
+            "run": watch_run_id(key),
+            "repo": tokens.get("repo", "(no repo)"),
+            "root": tokens.get("root", ""),
+            "agent": pane_has_agent(snap, pane["pane_id"]),
+        })
+    out.sort(key=lambda w: (w["repo"], w["run"], w["pane"]))
+    return out
+
+
+def watcher_rows(watch_panes, entries):
+    """Each watcher plus the outcome it has already written, if any.
+
+    The mailbox is the ONLY thing that can say a watcher has finished. Its pane
+    holds no agent, so there is no status to read, and the snapshot carries no
+    foreground command, so nothing in herdr tells a shell still polling apart
+    from one that exited. A watcher with no record is therefore reported as
+    unfinished rather than as retirable: proposing the close of a watcher still
+    following a run is the one wrong answer here.
+
+    Only `alert` records count. A crew member's own report can carry the same key
+    only by forgery, and an ack carries no state at all, so filtering by kind is
+    what stops either being read as an outcome crew measured."""
+    latest = {}
+    for record in entries:
+        if record_kind(record) != RECORD_KIND_ALERT:
+            continue
+        key = one_line(record.get("key"))
+        if key not in latest or record["seq"] > latest[key]["seq"]:
+            latest[key] = record
+    rows = []
+    for watcher in watch_panes:
+        row = dict(watcher)
+        record = latest.get(one_line(watcher["key"]))
+        row["outcome"] = one_line(record.get("state")) if record else ""
+        row["seq"] = record["seq"] if record else 0
+        rows.append(row)
+    return rows
+
+
+def cmd_watch(run_id, repo_arg):
+    """Open a pane with NO agent that follows a CI run and writes its outcome to
+    the mailbox, so the foreman learns a PR went red without polling for it.
+
+    A watcher is not a crew type. It has no agent, so it cannot occupy a bucket
+    in the load report, and it is not work the human has to review.
+
+    It gets its own TAB rather than a split of the caller's, and that is not
+    cosmetic: a pane split into the foreman's tab could never be closed without
+    closing the foreman's tab, so nothing could ever retire it. In a tab crew
+    labelled and owns, `crew retire <tab id>` closes both.
+
+    Everything that could refuse happens before anything is created. A pane
+    created and then abandoned is the defect this codebase has paid for twice:
+    an untagged pane nothing can see, and a pane running a command that was
+    never there."""
+    if not RUN_ID_RE.match(str(run_id)):
+        raise CrewError(
+            "%r is not a run id. crew watch takes the numeric id `gh run list` "
+            "prints, not a URL and not a branch. The id is interpolated into a "
+            "command that runs in another pane's shell, so anything else is "
+            "refused rather than quoted and hoped for. Nothing has been created."
+            % run_id)
+    workspace = os.environ.get("HERDR_WORKSPACE_ID")
+    if not workspace:
+        raise CrewError("watch must run inside a herdr pane")
+    ok, detail = _probe(["gh", "--version"])
+    if not ok:
+        raise CrewError(
+            "crew watch needs the gh CLI and it is not usable here (%s). "
+            "Nothing has been created: a pane opened to run a command that is "
+            "not there would sit at a prompt looking exactly like a watcher, "
+            "which is the silence this verb exists to remove." % detail)
+
+    repo_root, repo = resolve_repo(repo_arg)
+    key = watch_key(run_id)
+    # Before the tab, the pane and the tokens exist. herdr truncates a token
+    # value at 80 characters silently, and tag_pane's own check raises only after
+    # there is a pane to leak.
+    for name, value in (("root", repo_root), ("repo", repo), ("key", key)):
+        problem = token_too_long(name, value)
+        if problem:
+            raise CrewError(
+                "%s. Nothing has been created. Watch from a shorter path, or "
+                "pass --repo pointing at one." % problem)
+
+    defs = schema_defs()
+    assert_schema_declares(defs)
+    snap = snapshot()
+    assert_snapshot_shape(snap, defs)
+    refusal = crew_pane_refusal(tokens_in(snap, calling_pane()), "crew watch")
+    if refusal:
+        raise CrewError(refusal)
+    for watcher in watchers(snap):
+        if watcher["run"] == str(run_id):
+            # Not an error: what was asked for is already in place. A second
+            # watcher on one run would write the outcome twice and the foreman
+            # would read one run going red as two.
+            print("run %s is already being watched in pane %s. Nothing has "
+                  "been created. If that watcher is spent, retire it first: "
+                  "crew retire %s"
+                  % (run_id, watcher["pane"], watcher["tab"] or watcher["pane"]))
+            return 0
+
+    tab = herdr("tab", "create", "--workspace", workspace,
+                "--label", crew_tab_label(repo, key), "--cwd", repo_root,
+                "--no-focus")
+    pane = DRY_PANE if tab is None else response_pane_id(
+        tab, ("result", "root_pane", "pane_id"), "tab create")
+    # The TAB id, because a watcher is not a crew member and `crew retire` can
+    # only resolve it by the tab crew labelled. Printing the label, or the pane
+    # id, is a command the human cannot run.
+    tab_id = response_tab_id(tab)
+    retire = ("crew retire %s" % tab_id) if tab_id \
+        else "crew ls, which names the handle to retire it with"
+    # Tag before the command runs, exactly as dispatch tags before agent start:
+    # an untagged pane is invisible to `crew ls` and nothing can retire it.
+    tag_pane(pane, key, repo, WATCH_TYPE, "", repo_root)
+    try:
+        herdr("pane", "run", pane, watch_command(run_id))
+        # Confirmed, not assumed. Text sent to a pane whose shell has not
+        # settled is silently dropped, which is measured behaviour here for
+        # `agent prompt` and would leave a tagged pane that watches nothing.
+        if not DRY_RUN:
+            herdr("pane", "wait-output", pane, "--match",
+                  "%s %s" % (WATCH_STARTED, run_id),
+                  "--timeout", WATCH_START_TIMEOUT_MS)
+    except HerdrError as exc:
+        print("WATCH UNCONFIRMED: the pane exists and is tagged, but the "
+              "watcher did not report itself as started (%s), so nothing may be "
+              "following run %s. Do not read the mailbox's silence as a green "
+              "run. Retire it and try again with %s"
+              % (exc, run_id, retire), file=sys.stderr)
+        return 3
+    print("watching run %s in pane %s (no agent, so it is not crew and not "
+          "load). Its outcome lands in the mailbox whatever it is, pass or "
+          "fail, so read it with crew mail unread. Retire it when it is spent "
+          "with %s" % (run_id, pane, retire))
+    return 0
+
+
+PROJECTS_DIR = os.path.expanduser("~/Documents/Work/projects")
+PROJECT_LOG = "log.md"
+LOG_DONE = "### Done"
+LOG_FOLLOWUPS = "### Follow-ups"
+# Order matters: it is the order the log skill documents, and a digest that
+# reordered the sections of an entry it is only appending to would rewrite it.
+LOG_SECTION_ORDER = (LOG_DONE, LOG_FOLLOWUPS)
+LOG_STATE_SECTION = {"done": LOG_DONE, "needs-input": LOG_FOLLOWUPS}
+# Both spellings. The heading this writes is the bracketed one the log skill
+# mandates, because its own audit greps for it, but existing logs hold entries
+# written the other way and a reader that missed those would write a second
+# heading for a date the file already has.
+LOG_DATE_RE = re.compile(r"^##\s+\[?(\d{4}-\d{2}-\d{2})")
+
+
+def log_date(ts):
+    """A record's date as the log spells it. Local time, because the log is a
+    human's day rather than a UTC one."""
+    return time.strftime("%Y-%m-%d", time.localtime(int(ts)))
+
+
+def log_marker(seq):
+    """What makes an entry re-runnable.
+
+    The mailbox is never pruned and this verb holds no cursor of its own, so
+    `crew log` will be handed records it has already written. The marker is what
+    an existing entry is searched for, which is why it carries the seq and why it
+    ends in a word: `seq 1 on` cannot match inside `seq 12 on`."""
+    return "crew mail seq %d on" % seq
+
+
+def log_bullet(record):
+    """One project-log bullet for one report record, or None for a record that
+    is not project work.
+
+    `duplicate` is not logged. It records a dispatch crew DECLINED, so a log
+    entry claiming it as work would be false. It is counted on stdout instead,
+    because a digest that drops records without saying so is how a digest starts
+    lying.
+
+    msg is collapsed on the way IN as well as on the way out. Records predating
+    that rule are still in the mailbox and nothing stops one being edited in by
+    hand, and a newline here would inject markdown into a git-tracked file."""
+    section = LOG_STATE_SECTION.get(one_line(record.get("state")))
+    if section is None:
+        return None
+    where = one_line(record.get("repo")) or "an unrecorded repo"
+    branch = one_line(record.get("branch"))
+    if branch:
+        where = "%s (branch %s)" % (where, branch)
+    return {
+        "section": section,
+        "marker": log_marker(record["seq"]),
+        "line": "%screw %s in %s %s: %s (%s %s)" % (
+            "- " if section == LOG_DONE else "- [ ] ",
+            one_line(record.get("key")) or "an unrecorded key", where,
+            "reported done" if section == LOG_DONE else "needs input",
+            one_line(record.get("msg")) or "no message",
+            log_marker(record["seq"]), log_date(record.get("ts") or 0)),
+    }
+
+
+def _log_entry_index(lines, date):
+    for index, line in enumerate(lines):
+        found = LOG_DATE_RE.match(line)
+        if found and found.group(1) == date:
+            return index
+    return None
+
+
+def _log_entry_end(lines, index):
+    for after in range(index + 1, len(lines)):
+        if lines[after].startswith("## "):
+            return after
+    return len(lines)
+
+
+def _log_headings_ascend(lines):
+    dates = [found.group(1) for found in
+             (LOG_DATE_RE.match(line) for line in lines) if found]
+    return len(dates) >= 2 and dates == sorted(dates)
+
+
+def _log_entry_block(date, bullets):
+    block = ["## [%s]" % date]
+    for section in LOG_SECTION_ORDER:
+        chosen = [b["line"] for b in bullets if b["section"] == section]
+        if not chosen:
+            # Never a hollow header. The log skill forbids one, and an empty
+            # section reads as work that produced nothing.
+            continue
+        block += ["", section] + chosen
+    return block
+
+
+def _log_insert_entry(lines, block):
+    """Put a new entry where this file puts its newest one.
+
+    The two conventions in use disagree: the project logs in this wiki say
+    newest first and the log skill describes appending at the end. Writing at
+    the wrong end of either produces a log that reads backwards, so the FILE
+    decides. Headings in ascending date order mean append; anything else,
+    including a file with one entry or none, means insert above the first entry,
+    which is what the logs actually on disk do."""
+    first = next((index for index, line in enumerate(lines)
+                  if line.startswith("## ")), None)
+    if first is None or _log_headings_ascend(lines):
+        head = list(lines)
+        while head and not head[-1].strip():
+            head.pop()
+        return (head + [""] + block) if head else block
+    head = lines[:first]
+    while head and not head[-1].strip():
+        head.pop()
+    return (head + ([""] if head else []) + block + [""] + lines[first:])
+
+
+def _log_fold_section(lines, index, section, chosen):
+    """Add bullets to one section of an existing entry, in place.
+
+    Existing lines are never rewritten, only moved further down the file. The
+    section is looked for INSIDE this entry's span, so a `### Done` belonging to
+    another date cannot swallow today's bullets."""
+    end = _log_entry_end(lines, index)
+    at = next((i for i in range(index + 1, end)
+               if lines[i].strip() == section), None)
+    if at is None:
+        tail = end
+        while tail - 1 > index and not lines[tail - 1].strip():
+            tail -= 1
+        return lines[:tail] + ["", section] + chosen + lines[tail:]
+    stop = at + 1
+    while stop < end and not lines[stop].startswith("### "):
+        stop += 1
+    while stop - 1 > at and not lines[stop - 1].strip():
+        stop -= 1
+    return lines[:stop] + chosen + lines[stop:]
+
+
+def merge_log_entry(text, date, bullets):
+    """The log file's text with these bullets folded into `date`'s entry, as
+    (text, number added).
+
+    Append-only in the strict sense: no existing line is rewritten, reordered or
+    dropped, no heading is duplicated, and a bullet whose marker is already in
+    the file is not added again. Nothing added means the ORIGINAL text is
+    returned untouched, so the caller can tell there is nothing to write rather
+    than rewriting a git-tracked file to no effect."""
+    lines = text.splitlines()
+    fresh = [b for b in bullets
+             if not any(b["marker"] in line for line in lines)]
+    if not fresh:
+        return text, 0
+    index = _log_entry_index(lines, date)
+    if index is None:
+        lines = _log_insert_entry(lines, _log_entry_block(date, fresh))
+    else:
+        for section in LOG_SECTION_ORDER:
+            chosen = [b["line"] for b in fresh if b["section"] == section]
+            if chosen:
+                lines = _log_fold_section(lines, index, section, chosen)
+    return "\n".join(lines).rstrip("\n") + "\n", len(fresh)
+
+
+def infer_projects(key):
+    """Every project whose own README or log names this key."""
+    try:
+        names = sorted(os.listdir(PROJECTS_DIR))
+    except OSError as exc:
+        raise CrewError(
+            "cannot read %s (%s), so crew cannot tell which project this key "
+            "belongs to. Name it with --project." % (PROJECTS_DIR, exc))
+    needles = set([key, key.upper()])
+    hits = []
+    for name in names:
+        directory = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(directory):
+            continue
+        for filename in ("README.md", PROJECT_LOG):
+            try:
+                with open(os.path.join(directory, filename)) as handle:
+                    body = handle.read()
+            except (IOError, OSError):
+                continue
+            if any(needle in body for needle in needles):
+                hits.append(name)
+                break
+    return hits
+
+
+def project_log_path(key, project):
+    """The project log this key's reports belong in.
+
+    Named or inferred, and never created. These logs live in a git-tracked wiki
+    repo, so a project directory crew invented would be committed as a project
+    that does not exist.
+
+    Inference is a search for the key in each project's own README and log, which
+    is how the log skill says to map a ticket to a project. More than one match,
+    or none, refuses and names what it found rather than picking: writing the
+    right words into the wrong project's log is worse than writing nothing."""
+    if project:
+        directory = os.path.join(PROJECTS_DIR, project)
+        if not os.path.isdir(directory):
+            raise CrewError(
+                "--project %s is not a directory under %s, and crew will not "
+                "create one: these logs are git tracked, so an invented project "
+                "would be committed as a project that does not exist."
+                % (project, PROJECTS_DIR))
+        return os.path.join(directory, PROJECT_LOG)
+    hits = infer_projects(key)
+    if len(hits) == 1:
+        return os.path.join(PROJECTS_DIR, hits[0], PROJECT_LOG)
+    if not hits:
+        raise CrewError(
+            "no project under %s names %s in its README or log, so crew cannot "
+            "tell where this belongs. Name it with --project <name>."
+            % (PROJECTS_DIR, key))
+    raise CrewError(
+        "%d projects name %s: %s. Crew will not pick one, because the right "
+        "words in the wrong project's log is worse than none. Name it with "
+        "--project <name>." % (len(hits), key, ", ".join(hits)))
+
+
+def describe_worktree(key, records):
+    """Where this key's work is, from the crew member's own tokens if a pane
+    still holds them, and from the records if not.
+
+    Never from cwd. This runs in the foreman's pane, whose checkout is a
+    different one entirely, so cwd would name the wrong tree in a git-tracked
+    file. The path is derived from the root and branch tokens, the same
+    derivation every other reader uses, which is why the tokens store those two
+    rather than a path herdr would truncate.
+
+    The records are the ordinary fallback rather than the edge case: work is
+    logged when it FINISHES, which is exactly when the pane has been retired.
+    Which source produced the answer is named, so a reader can tell."""
+    try:
+        for member in crew_members(snapshot()):
+            if member["key"] == key and member["type"] != "setup":
+                return ("%s, branch %s, worktree %s (from the live pane %s)"
+                        % (member["repo"], member["branch"] or "(none)",
+                           member["worktree"] or "(none)", member["pane"]))
+    except (CrewError, HerdrError, OSError):
+        pass
+    last = records[-1]
+    return ("%s, branch %s (from the records: no live pane holds this key, so "
+            "crew cannot derive the worktree path)"
+            % (one_line(last.get("repo")) or "(no repo)",
+               one_line(last.get("branch")) or "(none)"))
+
+
+def cmd_log(key, project):
+    """Digest one key's own reports into that project's log.md.
+
+    Reports only, and only this key's. An ack is the foreman's bookkeeping and an
+    alert is written ABOUT a pane from outside it, so neither is work this crew
+    member did: a digest that mixed them would credit a CI failure, or the
+    foreman's own cursor, to the crew member as something it landed.
+
+    The file is written by replacing it whole from text this verb built by
+    APPENDING to what was there. A partial write into a git-tracked log is worse
+    than no write, so it goes through a temporary file and one rename."""
+    refusal = crew_pane_refusal(calling_pane_tokens(), "crew log")
+    if refusal:
+        raise CrewError(refusal)
+    wanted = sanitize_name(key)
+    entries = mailbox_entries()
+    records = sorted([e for e in entries
+                      if record_kind(e) == RECORD_KIND_REPORT
+                      and one_line(e.get("key")) == wanted],
+                     key=lambda e: e["seq"])
+    if not records:
+        print("nothing to log: the mailbox holds %d record(s) and none is a "
+              "report from %s. Acks, alerts and other keys are deliberately not "
+              "digested here." % (len(entries), wanted))
+        return 0
+
+    bullets = []
+    declined = 0
+    for record in records:
+        bullet = log_bullet(record)
+        if bullet is None:
+            declined += 1
+        else:
+            bullets.append(bullet)
+    path = project_log_path(wanted, project)
+    print("%s: %d report(s), %s" % (wanted, len(records),
+                                    describe_worktree(wanted, records)))
+    if declined:
+        print("%d declined dispatch(es) not logged: a dispatch crew refused is "
+              "not work this key did." % declined)
+    if not bullets:
+        return 0
+
+    try:
+        with open(path) as handle:
+            before = handle.read()
+    except IOError:
+        before = ""
+    after, added = merge_log_entry(before, log_date(time.time()), bullets)
+    if not added:
+        print("nothing new: every one of those reports is already in %s, "
+              "matched by its mail seq. Nothing written." % path)
+        return 0
+    if DRY_RUN:
+        print("would write %d bullet(s) to %s:" % (added, path))
+        for bullet in bullets:
+            print("  %s" % bullet["line"])
+        return 0
+    mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else None
+    temporary = path + ".crew-tmp"
+    with open(temporary, "w") as handle:
+        handle.write(after)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if mode is not None:
+        os.chmod(temporary, mode)
+    os.replace(temporary, path)
+    print("wrote %d bullet(s) to %s under %s. Re-running adds nothing: each "
+          "bullet carries its mail seq and an entry already holding it is left "
+          "alone." % (added, path, log_date(time.time())))
+    return 0
+
+
+# Every token tag_pane writes. Clearing a subset would leave a pane that still
+# reads as crew's to something, which is the state this verb exists to remove.
+CREW_TOKEN_NAMES = ("crew", "v", "key", "repo", "type", "branch", "root",
+                    "dispatched")
+# The skills crew installs. `herdr` is deliberately not one: it documents the
+# CLI and is useful with no crew in the picture, so uninstalling crew must not
+# take it.
+CREW_SKILLS = ("foreman", "crew-member", "start-crew")
+SKILLS_DIR = os.path.expanduser("~/.claude/skills")
+WORKTREE_MARK = os.path.join(".claude", "worktrees")
+
+
+def _worktree_note(path):
+    """Why a path resolving inside a git worktree matters here.
+
+    `crew` and the guard are symlinks into a worktree of the dotfiles repo, so
+    `git worktree remove` takes out the CLI and the only enforcement of the crew
+    boundary at once, silently, with nothing failing until a crew member is
+    already unguarded. This verb exists partly so that is read here rather than
+    discovered afterwards."""
+    if WORKTREE_MARK in path:
+        return ("resolves inside a git worktree, so removing that worktree "
+                "takes it out silently")
+    return ""
+
+
+def uninstall_blockers(snap):
+    """Why uninstall must not proceed at all.
+
+    A live crew member first. Uninstall removes the mailbox its report lands in,
+    the `crew` it reports THROUGH, and the guard that is the only thing stopping
+    it dispatching paid sessions. Doing that under a running session loses the
+    report and leaves it unable to send another.
+
+    A watcher pane blocks for a mechanical reason: its shell keeps polling and
+    writes through an appender that CREATES ~/.crew when it is missing, so a
+    watcher would quietly rebuild the directory this verb just deleted. Nothing
+    in the snapshot says whether that shell is still running, so presence is
+    refused on rather than liveness, and the remedy is one `crew retire`.
+
+    A crew member's own pane is refused outright. This is the one command whose
+    whole purpose is removing the enforcement of the boundary, so it is the one
+    a crew member most wants. calling_pane is spoofable, which is harmless here:
+    this check can only ever prevent an action."""
+    problems = []
+    live = [m for m in crew_members(snap) if m["agent"]]
+    if live:
+        problems.append(
+            "%d crew member(s) are still live: %s. Nothing has been changed. "
+            "Uninstall removes the mailbox their reports land in, the crew they "
+            "report through, and the guard that stops them dispatching paid "
+            "sessions, so it refuses while any of them is running. Let them "
+            "report, then retire them."
+            % (len(live), ", ".join("%s/%s in %s" % (m["repo"], m["key"],
+                                                    m["pane"]) for m in live)))
+    watching = watchers(snap)
+    if watching:
+        problems.append(
+            "%d watcher pane(s) are still there: %s. Nothing has been changed. "
+            "A watcher's shell keeps polling and writes through an appender "
+            "that recreates %s, so it would rebuild the directory this verb "
+            "deletes. Crew cannot tell a shell still polling from one that "
+            "exited, so it refuses on the pane being there. Retire them first: "
+            "crew retire %s"
+            % (len(watching), ", ".join(w["pane"] for w in watching), CREW_DIR,
+               watching[0]["tab"] or watching[0]["pane"]))
+    refusal = crew_pane_refusal(tokens_in(snap, calling_pane()),
+                                "uninstalling the boundary it works inside")
+    if refusal:
+        problems.append(refusal)
+    return problems
+
+
+def uninstall_steps(snap):
+    """What reversing the install actually means on THIS machine, read off disk
+    rather than assumed.
+
+    Split into what crew will do and what the human does, and the split is not
+    timidity. Unstowing the claude package removes every other skill in it, and
+    the hook registration lives in a settings file crew is not allowed to edit,
+    so both are printed as exact commands and left alone."""
+    steps = []
+    for name in CREW_SKILLS:
+        path = os.path.join(SKILLS_DIR, name)
+        if not os.path.islink(path):
+            if os.path.exists(path):
+                steps.append({
+                    "kind": "manual",
+                    "what": "%s is a real directory, not a link, so crew will "
+                            "not delete it: crew did not create it and cannot "
+                            "show what else is in it" % path,
+                    "command": "rm -r %s" % path})
+            continue
+        target = os.path.realpath(path)
+        steps.append({"kind": "unlink", "path": path,
+                      "what": "remove the %s skill link, which points at %s"
+                              % (name, target),
+                      "note": _worktree_note(target)})
+
+    if os.path.islink(CREW_BIN):
+        target = os.path.realpath(CREW_BIN)
+        if os.path.basename(target) == "crew.py":
+            steps.append({"kind": "unlink", "path": CREW_BIN,
+                          "what": "remove %s, which points at %s"
+                                  % (CREW_BIN, target),
+                          "note": _worktree_note(target)})
+        else:
+            steps.append({
+                "kind": "manual",
+                "what": "%s points at %s, which is not a crew.py, so crew will "
+                        "not remove it" % (CREW_BIN, target),
+                "command": "rm %s" % CREW_BIN})
+    elif os.path.exists(CREW_BIN):
+        steps.append({"kind": "manual",
+                      "what": "%s is a real file, not the install's symlink, so "
+                              "crew will not remove it" % CREW_BIN,
+                      "command": "rm %s" % CREW_BIN})
+
+    if os.path.isdir(CREW_DIR):
+        records = len(mailbox_entries())
+        steps.append({
+            "kind": "rmtree", "path": CREW_DIR,
+            "what": "delete %s and everything in it" % CREW_DIR,
+            "loss": "%d mailbox record(s), every report and alert crew ever "
+                    "wrote, plus any pending dispatch artifact. Unrecoverable."
+                    % records})
+
+    tagged = [m["pane"] for m in crew_members(snap)] + \
+             [w["pane"] for w in watchers(snap)]
+    if tagged:
+        steps.append({
+            "kind": "tokens", "panes": sorted(set(tagged)),
+            "what": "clear crew tokens on %d pane(s): %s"
+                    % (len(set(tagged)), ", ".join(sorted(set(tagged)))),
+            "loss": "those panes stop being recognisable as crew's, so nothing "
+                    "will propose retiring them afterwards"})
+
+    stowed = [os.path.realpath(os.path.join(SKILLS_DIR, name))
+              for name in CREW_SKILLS
+              if os.path.islink(os.path.join(SKILLS_DIR, name))]
+    package = next((t.split(os.sep + "stow-packages" + os.sep)[0]
+                    for t in stowed if os.sep + "stow-packages" + os.sep in t),
+                   None)
+    if package:
+        steps.append({
+            "kind": "manual",
+            "what": "unstow the claude package, which is where crew's skills "
+                    "come from. That removes EVERY other skill in that package "
+                    "too, and the hook file with them, so it is yours to run",
+            "command": 'cd %s/stow-packages && stow -D -t "$HOME" claude'
+                       % package})
+    elif stowed:
+        steps.append({
+            "kind": "manual",
+            "what": "nothing to unstow: crew's skill links resolve outside "
+                    "stow-packages (%s), so removing the links above is the "
+                    "whole of it" % ", ".join(stowed),
+            "command": ""})
+
+    guard = ", ".join(sorted(set(path for _, path, _ in
+                                 _guard_registrations(_settings_data()))))
+    steps.append({
+        "kind": "manual",
+        "what": "remove the PreToolUse hook running %s from %s yourself. Crew "
+                "does not edit that file. Left registered with the file gone, "
+                "crew doctor reports it as dangling and nothing is enforced%s"
+                % (GUARD_HOOK, SETTINGS_PATH,
+                   (", and it currently resolves to %s" % guard) if guard
+                   else ""),
+        "command": ""})
+    return steps
+
+
+def _settings_data():
+    """The settings file as data, or {}. Uninstall only READS it, and a file it
+    cannot parse must not stop the proposal being printed."""
+    try:
+        with open(SETTINGS_PATH) as handle:
+            data = json.load(handle)
+    except (IOError, OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def render_uninstall(steps):
+    lines = ["crew uninstall is a PROPOSAL. Nothing has been changed.",
+             ""]
+    mine = [s for s in steps if s["kind"] != "manual"]
+    theirs = [s for s in steps if s["kind"] == "manual"]
+    if mine:
+        lines.append("crew will do these when you re-run it with --confirm:")
+        for number, step in enumerate(mine, 1):
+            lines.append("  %d. %s" % (number, step["what"]))
+            if step.get("note"):
+                lines.append("     %s" % step["note"])
+            if step.get("loss"):
+                lines.append("     LOSS: %s" % step["loss"])
+    else:
+        lines.append("crew has nothing of its own left to remove here.")
+    if theirs:
+        lines.append("")
+        lines.append("you do these yourself; crew will not:")
+        for number, step in enumerate(theirs, len(mine) + 1):
+            lines.append("  %d. %s" % (number, step["what"]))
+            if step.get("command"):
+                lines.append("     %s" % step["command"])
+    lines.append("")
+    lines.append("This removes the guard, which is the only enforcement of the "
+                 "crew boundary, so do it when no crew is running and not "
+                 "before.")
+    return "\n".join(lines)
+
+
+def perform_uninstall(steps):
+    """Do the steps crew owns. A failure warns and the rest continues.
+
+    The doctrine the pane closes already follow: giving up halfway through a
+    cleanup leaves exactly the debris the cleanup exists to remove, and here it
+    would leave a half-uninstalled crew, which is worse than either end state."""
+    done = True
+    for step in steps:
+        if step["kind"] == "manual":
+            continue
+        if DRY_RUN:
+            print("would %s" % step["what"])
+            continue
+        try:
+            if step["kind"] == "unlink":
+                os.unlink(step["path"])
+                print("removed %s" % step["path"])
+            elif step["kind"] == "rmtree":
+                shutil.rmtree(step["path"])
+                print("removed %s" % step["path"])
+            elif step["kind"] == "tokens":
+                for pane_id in step["panes"]:
+                    args = ["pane", "report-metadata", pane_id,
+                            "--source", "crew"]
+                    for name in CREW_TOKEN_NAMES:
+                        args += ["--clear-token", name]
+                    herdr(*args)
+                    print("cleared crew tokens on %s" % pane_id)
+        except (OSError, HerdrError) as exc:
+            print("could not %s (%s), so it is still there. Carrying on with "
+                  "the rest; finish that one yourself." % (step["what"], exc),
+                  file=sys.stderr)
+            done = False
+    return done
+
+
+def cmd_uninstall(confirm):
+    """Reverse the install: the skill links, the crew symlink, ~/.crew, and the
+    crew tokens on panes.
+
+    It proposes and the human confirms, exactly as retirement does, and for a
+    stronger reason: retirement destroys one session's context, while this
+    destroys every record crew ever wrote AND removes the only enforcement of
+    the boundary. It refuses outright while any crew member is live.
+
+    Two steps are printed and never run: unstowing the claude package, which
+    would take every other skill in it, and the hook registration, which lives
+    in a settings file crew is not allowed to edit."""
+    defs = schema_defs()
+    assert_schema_declares(defs)
+    snap = snapshot()
+    assert_snapshot_shape(snap, defs)
+    blockers = uninstall_blockers(snap)
+    if blockers:
+        raise CrewError("refusing to uninstall. " + " ".join(blockers))
+    steps = uninstall_steps(snap)
+    if not confirm:
+        print(render_uninstall(steps))
+        return 0
+    done = perform_uninstall(steps)
+    manual = [s for s in steps if s["kind"] == "manual"]
+    if manual:
+        print("")
+        print("still yours to do, crew will not:")
+        for step in manual:
+            print("  - %s" % step["what"])
+            if step.get("command"):
+                print("    %s" % step["command"])
     return 0 if done else 3
 
 

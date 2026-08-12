@@ -69,8 +69,9 @@ your peers.
 Never put command output, credentials, ARNs, account ids, tokens, hostnames,
 IP addresses, stack traces or file contents in a mail line. State plus one
 human-readable sentence only. Detail belongs in a file in your worktree, not
-in the mailbox: the mailbox is never pruned, and a later change will digest it
-into a git-tracked project log.
+in the mailbox: the mailbox is never pruned, and `crew log` digests it into a
+git-tracked project log, so your sentence outlives your session and gets
+committed. Write it as the log entry it becomes.
 
 ## Boundaries
 
@@ -176,6 +177,14 @@ So forging an ack no longer hides a fleet; it reports you and loses the reports
 that were already pending. Neither half of that is a trade worth making. Send
 your report.
 
+Three verbs the guard's table does NOT list, and which are still not yours:
+`crew watch`, which opens a pane, `crew log`, which writes the project log, and
+`crew uninstall`, which deletes the mailbox and the guard itself. `crew` refuses
+all three from a pane carrying crew tokens, so you will see a refusal rather than
+a denial. It is a backstop, not enforcement, and the boundary is the same one:
+opening panes and removing the guard are the foreman's and the human's. If you
+think a CI run needs watching, or your work needs logging, say so in a mail line.
+
 So if the guard denies something, that is the answer. Do not look for another
 route to the same effect. Report what you need with `crew mail send` and let
 the foreman or the human act.
@@ -184,11 +193,11 @@ the foreman or the human act.
 
 - Do NOT run `/start-ticket`. It already ran before you existed; your
   worktree and plan are in place.
-- Do NOT write to any project `log.md`. Several crew writing to one log
-  interleaves, and the mailbox already holds your report. Nothing digests it
-  into a project log yet: that is a later change, and the foreman is forbidden
-  to write files at all. Do not paper over that gap by writing the log
-  yourself.
+- Do NOT write to any project `log.md`, and do not run `crew log`. Several crew
+  writing to one log interleaves, and the mailbox already holds your report.
+  `crew log <key>` digests those reports into the project log, deterministically
+  and append-only, and it is the foreman's to run or the human's. Your one line
+  in the mailbox IS your log entry; write it well and leave the file alone.
 - Do NOT run `/finish-work`. Report `done` and stop. It would delete the
   worktree the foreman is still tracking.
 

@@ -167,6 +167,18 @@ Say these only if relevant, and only once per session:
   session has exited keeps its pane and the tab it was dispatched into, and they
   accumulate. `crew ls` names what is retirable and the foreman proposes `crew
   retire <name>`; the user runs it. Nothing retires anything on its own.
+- **CI is the one thing that reports without being asked.** `crew watch <run-id>`
+  opens a pane with no agent that follows a GitHub Actions run and writes its
+  outcome to the mailbox, red or green, so a failed PR arrives in `crew mail
+  unread` instead of waiting to be noticed. It is worth offering once a crew
+  member reports `done` with a PR open. A watcher is not crew: no agent, no load
+  bucket, its own section in `crew ls`.
+- **A crew member's report becomes the project log entry.** `crew log <key>`
+  digests that key's mailbox reports into
+  `~/Documents/Work/projects/<project>/log.md`, appending and never rewriting,
+  and it is safe to re-run. Crew members are forbidden to write that file
+  themselves, so this is how the CLAUDE.md logging rule gets satisfied for work a
+  crew member did.
 
 ## Related
 
