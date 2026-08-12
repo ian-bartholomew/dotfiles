@@ -123,7 +123,7 @@ def program_name(token):
 
 
 def forbidden_reason(command):
-    """Two passes, because neither alone is enough.
+    r"""Two passes, because neither alone is enough.
 
     The first version matched raw text with patterns like `\bcrew\s+dispatch`.
     That is bypassed by `.py`, which sits between the name and the space:

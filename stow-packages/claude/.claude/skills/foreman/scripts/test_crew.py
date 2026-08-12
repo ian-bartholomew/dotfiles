@@ -2675,33 +2675,347 @@ class TestGuardClassifiesMonitorLikeBash(unittest.TestCase):
         self.assertTrue(called)
 
 
+# A hook fixture whose tables name tools the real hook does not. A fixture that
+# reused SendMessage and Monitor would pass just as well if the check ignored the
+# fixture and read the real ~/.claude/hooks/crew-guard.py, and a fixture that
+# cannot falsify its own assertion is how this build already shipped a test that
+# proved nothing.
+GUARD_FIXTURE_TABLES = ('FORBIDDEN_TOOLS = {"FixtureSend": "why"}\n'
+                        'COMMAND_FIELDS = {"Bash": "command",\n'
+                        '                  "FixtureWatch": "command"}\n')
+GUARD_FIXTURE_TOOLS = ("Bash", "FixtureSend", "FixtureWatch")
+GUARD_FIXTURE_MATCHER = "Bash|FixtureSend|FixtureWatch"
+
+# The matcher the SHIPPED hook needs. Spelled out, not read from the real
+# settings file, so this pins what the live matcher has to be without depending
+# on how this laptop happens to be configured.
+SHIPPED_GUARD_MATCHER = "Bash|Monitor|SendMessage"
+SHIPPED_GUARD_TOOLS = ("Bash", "Monitor", "SendMessage")
+
+
+class _GuardWorld(object):
+    """A settings file and a guard hook that the test owns outright."""
+
+    def __init__(self, root):
+        self.root = root
+        self.settings = os.path.join(root, "settings.json")
+        self.hook = os.path.join(root, "hooks", crew.GUARD_HOOK)
+
+    def write_hook(self, tables=GUARD_FIXTURE_TABLES, mode=0o755):
+        with open(self.hook, "w") as handle:
+            handle.write("#!/usr/bin/env python3\n" + tables)
+        os.chmod(self.hook, mode)
+
+    def write_settings(self, matcher=GUARD_FIXTURE_MATCHER, command=None,
+                       entries=None):
+        if entries is None:
+            entries = [{"matcher": matcher,
+                        "hooks": [{"type": "command",
+                                   "command": self.hook if command is None
+                                              else command}]}]
+        self.write_raw(json.dumps({"hooks": {"PreToolUse": entries}}))
+
+    def write_raw(self, text):
+        with open(self.settings, "w") as handle:
+            handle.write(text)
+
+    def status(self):
+        return crew.guard_status(self.settings)
+
+
+@contextlib.contextmanager
+def _guard_world():
+    """A settings file and a hook file entirely under the test's control.
+
+    No test here reads or writes the real ~/.claude/settings.json. That file
+    belongs to the machine, so a suite that read it would pass or fail on how
+    this laptop is configured, and the case this check exists to catch, a matcher
+    that omits a tool, could not be written down at all."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "hooks"))
+        yield _GuardWorld(tmp)
+
+
+def _doctor_output(settings_path, protocol=None):
+    """crew.doctor() with every external probe faked and the settings path under
+    the test's control, as (exit code, stdout)."""
+    if protocol is None:
+        protocol = crew.HERDR_VERIFIED_PROTOCOLS[-1]
+
+    def fake_probe(argv):
+        if argv[:2] == ["herdr", "--version"]:
+            return True, "herdr 9.9.9"
+        if argv[:3] == ["herdr", "api", "schema"]:
+            return True, "protocol: %d" % protocol
+        if argv[:2] == ["claude", "--help"]:
+            return True, "--append-system-prompt --continue --model"
+        raise AssertionError("unexpected probe: %s" % argv)
+
+    out = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(crew, "_probe", side_effect=fake_probe), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "CREW_DIR", tmp), \
+             mock.patch.object(crew, "MAILBOX",
+                               os.path.join(tmp, "mailbox.jsonl")), \
+             mock.patch.object(crew, "SETTINGS_PATH", settings_path), \
+             contextlib.redirect_stdout(out):
+            code = crew.doctor()
+    return code, out.getvalue()
+
+
+class TestDoctorChecksTheGuardIsArmed(unittest.TestCase):
+    """crew-guard.py can act only on the tools the PreToolUse matcher hands it,
+    and that matcher lives in a file this repo neither ships nor mirrors. Two
+    waves widened the hook's tables one tool at a time, so an under-matched hook
+    is not hypothetical: it is inert, and it looks armed."""
+
+    def test_a_fully_covering_matcher_passes(self):
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings()
+            summary, problems = world.status()
+        self.assertEqual(problems, [])
+        for tool in GUARD_FIXTURE_TOOLS:
+            self.assertIn(tool, summary)
+
+    def test_a_matcher_missing_a_tool_fails_and_names_the_missing_tools(self):
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings(matcher="Bash")
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertEqual(len(problems), 1, problems)
+        # The whole missing list, and only it: Bash IS delivered, so naming it
+        # here would send the human to widen a matcher that already covers it.
+        self.assertTrue(problems[0].startswith(
+            "crew-guard is registered but INERT for FixtureSend, FixtureWatch:"),
+            problems[0])
+        self.assertIn("Widen the matcher", problems[0])
+        self.assertIn("/hooks", problems[0])
+
+    def test_the_required_tools_come_from_the_hook_and_not_from_doctor(self):
+        # The anti-drift property, stated as a test: a tool added to the hook's
+        # own table must show up as missing without doctor being told about it.
+        # A second list inside doctor would pass this suite and fail here.
+        with _guard_world() as world:
+            world.write_hook(tables=GUARD_FIXTURE_TABLES.replace(
+                '{"FixtureSend": "why"}',
+                '{"FixtureSend": "why", "FixtureExtra": "why"}'))
+            world.write_settings(matcher=GUARD_FIXTURE_MATCHER)
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertIn("FixtureExtra", problems[0])
+
+    def test_no_settings_file_fails_as_not_registered(self):
+        with _guard_world() as world:
+            world.write_hook()
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("NOT registered", problems[0])
+        self.assertIn(world.settings, problems[0])
+        self.assertIn("/hooks", problems[0])
+
+    def test_a_pretooluse_hook_that_is_not_the_guard_is_not_a_registration(self):
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings(command="/usr/local/bin/other-hook.py")
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertIn("NOT registered", problems[0])
+
+    def test_a_dangling_hook_path_fails(self):
+        with _guard_world() as world:
+            world.write_settings()
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("dangling", problems[0])
+        self.assertIn(world.hook, problems[0])
+
+    def test_a_hook_that_is_not_executable_fails(self):
+        with _guard_world() as world:
+            world.write_hook(mode=0o644)
+            world.write_settings()
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("not executable", problems[0])
+        self.assertIn("chmod +x", problems[0])
+
+    def test_a_hook_run_through_an_interpreter_needs_no_executable_bit(self):
+        # Registered as `python3 <hook>`, the executable bit is not what decides,
+        # and a preflight that failed here would be red for no missing
+        # enforcement at all.
+        with _guard_world() as world:
+            world.write_hook(mode=0o644)
+            world.write_settings(command="python3 " + world.hook)
+            summary, problems = world.status()
+        self.assertEqual(problems, [])
+        self.assertIn(world.hook, summary)
+
+    def test_malformed_json_fails_rather_than_raising(self):
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_raw('{"hooks": {"PreToolUse": [')
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("could not be read as JSON", problems[0])
+
+    def test_a_settings_file_of_the_wrong_shape_fails_rather_than_raising(self):
+        # Valid JSON, nothing crew expects underneath it. A preflight that
+        # tracebacks cannot report, so every shape has to land on a message.
+        for text in ("[]", '"nope"', '{"hooks": "nope"}',
+                     '{"hooks": {"PreToolUse": "nope"}}',
+                     '{"hooks": {"PreToolUse": [null]}}',
+                     '{"hooks": {"PreToolUse": [{"hooks": [{"command": 3}]}]}}'):
+            with self.subTest(text=text):
+                with _guard_world() as world:
+                    world.write_hook()
+                    world.write_raw(text)
+                    summary, problems = world.status()
+                self.assertIsNone(summary)
+                self.assertIn("NOT registered", problems[0])
+
+    def test_a_match_all_matcher_covers_every_tool(self):
+        # Claude Code's own spellings for every tool. Reporting these as missing
+        # coverage would be a false red on a correctly armed hook.
+        for entries in ([{"matcher": "", "hooks": None}],
+                        [{"matcher": "*", "hooks": None}],
+                        [{"hooks": None}]):
+            with self.subTest(entries=entries):
+                with _guard_world() as world:
+                    world.write_hook()
+                    entry = dict(entries[0])
+                    entry["hooks"] = [{"type": "command",
+                                       "command": world.hook}]
+                    world.write_settings(entries=[entry])
+                    summary, problems = world.status()
+                self.assertEqual(problems, [], problems)
+                self.assertIsNotNone(summary)
+
+    def test_coverage_is_read_the_strict_way_whole_name_only(self):
+        # `Bas` matches part of `Bash`. Claude Code's matcher engine is not
+        # Python's re, so a partial match is reported as not delivered rather
+        # than assumed: the wrong guess here is the one that reads as armed.
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings(matcher="Bas|FixtureSend|FixtureWatch")
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertIn("INERT for Bash", problems[0])
+
+    def test_several_registrations_are_covered_between_them(self):
+        with _guard_world() as world:
+            world.write_hook()
+            hook = [{"type": "command", "command": world.hook}]
+            world.write_settings(entries=[{"matcher": "Bash", "hooks": hook},
+                                          {"matcher": "FixtureSend|FixtureWatch",
+                                           "hooks": hook}])
+            summary, problems = world.status()
+        self.assertEqual(problems, [], problems)
+        self.assertIsNotNone(summary)
+
+    def test_a_dangling_registration_cannot_supply_coverage(self):
+        # The matcher on an entry that runs nothing must not paper over a second
+        # entry that runs the guard on less than it needs.
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings(entries=[
+                {"matcher": GUARD_FIXTURE_MATCHER,
+                 "hooks": [{"type": "command",
+                            "command": os.path.join(world.root, "gone",
+                                                    crew.GUARD_HOOK)}]},
+                {"matcher": "Bash",
+                 "hooks": [{"type": "command", "command": world.hook}]}])
+            summary, problems = world.status()
+        self.assertIsNone(summary)
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("dangling", problems[0])
+        self.assertIn("INERT for FixtureSend, FixtureWatch", problems[1])
+
+    def test_an_unreadable_matcher_pattern_fails_rather_than_raising(self):
+        for matcher in ("Bash|[", ["Bash"]):
+            with self.subTest(matcher=matcher):
+                with _guard_world() as world:
+                    world.write_hook()
+                    world.write_settings(matcher=matcher)
+                    summary, problems = world.status()
+                self.assertIsNone(summary)
+                # One problem, and not a second one naming tools as undelivered:
+                # which tools this matcher delivers is exactly what has just been
+                # reported as unreadable.
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("cannot verify which tools reach crew-guard",
+                              problems[0])
+
+    def test_a_hook_whose_tables_cannot_be_read_fails(self):
+        for tables, expected in (
+                ("FORBIDDEN_TOOLS = 3\nCOMMAND_FIELDS = {}\n",
+                 "does not declare FORBIDDEN_TOOLS as a dict"),
+                ("COMMAND_FIELDS = {}\n",
+                 "does not declare FORBIDDEN_TOOLS as a dict"),
+                ("FORBIDDEN_TOOLS = {} this is not python\n", "SyntaxError"),
+                ("raise RuntimeError('boom')\n", "RuntimeError"),
+                ("import sys\nsys.exit(3)\n", "SystemExit")):
+            with self.subTest(tables=tables):
+                with _guard_world() as world:
+                    world.write_hook(tables=tables)
+                    world.write_settings()
+                    summary, problems = world.status()
+                self.assertIsNone(summary)
+                self.assertIn("cannot verify the PreToolUse matcher",
+                              problems[0])
+                self.assertIn(expected, problems[0])
+
+    def test_the_shipped_hook_needs_exactly_this_matcher(self):
+        # The canary on the real file: the tables in the hook this repo ships
+        # must be covered by the matcher the machine is configured with. Adding a
+        # tool to either table breaks this test, which is the alarm that the
+        # settings matcher has to be widened with it.
+        with _guard_world() as world:
+            world.write_settings(matcher=SHIPPED_GUARD_MATCHER,
+                                 command=CREW_GUARD)
+            summary, problems = world.status()
+        self.assertEqual(problems, [], problems)
+        self.assertEqual(summary, "registered at %s, matcher delivers %s"
+                         % (CREW_GUARD, ", ".join(SHIPPED_GUARD_TOOLS)))
+
+    def test_doctor_fails_and_says_so_when_the_guard_is_under_matched(self):
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings(matcher="Bash")
+            code, out = _doctor_output(world.settings)
+        self.assertEqual(code, 1, out)
+        self.assertIn("INERT for FixtureSend, FixtureWatch", out)
+        self.assertIn("FAIL", out)
+
+    def test_doctor_reports_an_armed_guard(self):
+        # The control, and the wiring: doctor has to be the one calling this, or
+        # every case above passes while the preflight stays silent.
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings()
+            _, out = _doctor_output(world.settings)
+        self.assertIn("guard: registered at %s" % world.hook, out)
+        self.assertNotIn("INERT", out)
+
+
 class TestDoctorFailsClosedOnProtocolDrift(unittest.TestCase):
     """herdr self-updates, and the whole design rests on five MEASURED
     behaviours. An unverified protocol must fail the preflight, because the
     foreman skill is told to stop on a red doctor."""
 
     def _doctor(self, protocol):
-        def fake_probe(argv):
-            if argv[:2] == ["herdr", "--version"]:
-                return True, "herdr 9.9.9"
-            if argv[:3] == ["herdr", "api", "schema"]:
-                return True, "protocol: %d" % protocol
-            if argv[:2] == ["claude", "--help"]:
-                return True, "--append-system-prompt --continue --model"
-            raise AssertionError("unexpected probe: %s" % argv)
-
-        out = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(crew, "_probe", side_effect=fake_probe), \
-                 mock.patch.object(crew, "schema_defs", return_value=DEFS), \
-                 mock.patch.object(crew, "snapshot",
-                                   return_value=_snap([], [])), \
-                 mock.patch.object(crew, "CREW_DIR", tmp), \
-                 mock.patch.object(crew, "MAILBOX",
-                                   os.path.join(tmp, "mailbox.jsonl")), \
-                 contextlib.redirect_stdout(out):
-                code = crew.doctor()
-        return code, out.getvalue()
+        # The guard world is green here so this stays a test about the protocol,
+        # and so that nothing in this class reads the real settings file.
+        with _guard_world() as world:
+            world.write_hook()
+            world.write_settings()
+            return _doctor_output(world.settings, protocol)
 
     def test_an_unverified_protocol_makes_doctor_fail(self):
         code, out = self._doctor(99)

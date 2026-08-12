@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import warnings
 
 # Protocols whose behaviour has been MEASURED, not assumed. herdr self-updates,
 # so this will go stale: 0.7.5 shipped 17 and 0.8.0 shipped 19 mid-build. Do not
@@ -41,6 +42,18 @@ BUCKETS = {
 # false positive in the one surface that must never lie.
 SCHEMA_OPTIONAL_PANE_FIELDS = ("tokens",)
 SCHEMA_OPTIONAL_AGENT_FIELDS = ("name", "terminal_title_stripped")
+
+# crew-guard.py is the only enforcement of a boundary that is otherwise pure
+# convention, and it can act only on the tools the PreToolUse matcher hands it.
+# That matcher lives in a file this repo neither ships nor mirrors, so the hook's
+# tables and the matcher drift apart silently, and an under-matched hook is inert
+# while every doc still calls it the enforcement. doctor reads the required tools
+# out of the hook itself; a list here would be the same drift one layer up.
+SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+GUARD_HOOK = "crew-guard.py"
+GUARD_TABLES = ("FORBIDDEN_TOOLS", "COMMAND_FIELDS")
+GUARD_RELOAD = ("then open /hooks or restart Claude Code, because a hook change "
+                "is not live until then")
 
 
 class HerdrError(Exception):
@@ -229,6 +242,11 @@ def doctor():
     if os.path.exists(shadow):
         problems.append("%s shadows the stowed herdr skill" % shadow)
 
+    summary, guard_issues = guard_status(SETTINGS_PATH)
+    if summary:
+        print("guard: %s" % summary)
+    problems.extend(guard_issues)
+
     if not os.environ.get("HERDR_ENV"):
         print("note: not running inside a herdr pane; pane-scoped verbs will not work")
 
@@ -261,6 +279,213 @@ def _probe(argv):
     if not text:
         return False, "%s produced no output" % label
     return True, text
+
+
+def _guard_token(command):
+    """The crew-guard.py path a settings hook command runs, and whether it runs
+    that file directly rather than through an interpreter. None when the command
+    is not the guard at all."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for index, token in enumerate(tokens):
+        if os.path.basename(token) == GUARD_HOOK:
+            return os.path.expandvars(os.path.expanduser(token)), index == 0
+    return None
+
+
+def _guard_registrations(data):
+    """(matcher, path, runs_directly) for every PreToolUse hook that runs the
+    guard.
+
+    Tolerant of any shape under `hooks`, because crew does not own this file and
+    a preflight that raises on a surprise cannot report one."""
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    entries = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    found = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        listed = entry.get("hooks")
+        for hook in listed if isinstance(listed, list) else []:
+            command = hook.get("command") if isinstance(hook, dict) else None
+            token = _guard_token(command) if isinstance(command, str) else None
+            if token:
+                found.append((entry.get("matcher"), token[0], token[1]))
+    return found
+
+
+def _guard_tools(path):
+    """The tool names the matcher must deliver, read FROM the hook: the union of
+    its two tables plus Bash, as (tools, error).
+
+    Executed rather than parsed. A parse recreates this check's own bug one layer
+    up: a table entry written in a form the parse does not recognise reads as a
+    tool that needs no covering, and doctor then passes a matcher that is short.
+    Executing cannot under-report, and every way it can fail says so out loud.
+    The hook's own work stays behind __main__, so a name other than __main__ here
+    runs none of it.
+
+    Compiled and exec'd rather than imported because import caches bytecode
+    beside the source, and doctor must not leave a __pycache__ in the dotfiles
+    checkout that the registered hook path resolves into.
+
+    Bash is required whatever the tables say, because the hook's FORBIDDEN
+    command table exists for the shell and a matcher that stopped delivering Bash
+    would silence all of it.
+    """
+    namespace = {"__name__": "crew_guard_tables", "__file__": path}
+    try:
+        with open(path) as handle:
+            source = handle.read()
+        # doctor reports on crew, not on the hook's lint. A compile warning from
+        # a file doctor merely reads would print as if it were a doctor finding,
+        # and SyntaxWarning is shown by default. A real SyntaxError still raises.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            exec(compile(source, path, "exec"), namespace)
+    except (Exception, SystemExit) as exc:
+        # The path comes from a settings file crew does not own, so this runs
+        # code of unknown shape: any failure has to be reportable, not raised.
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    tools = set(["Bash"])
+    for name in GUARD_TABLES:
+        table = namespace.get(name)
+        if not isinstance(table, dict):
+            return None, "%s does not declare %s as a dict" % (path, name)
+        tools.update(str(key) for key in table)
+    return sorted(tools), None
+
+
+def _matcher_pattern(matcher):
+    """A PreToolUse matcher as (pattern, error), where a pattern of None delivers
+    every tool.
+
+    A matcher is a pattern and not a list, so this compiles it rather than
+    comparing text. It is read the strict way, whole name only: Claude Code's
+    engine is not Python's `re`, so a pattern that matches part of a tool name is
+    reported as not delivering it rather than assumed to be delivered. A missing,
+    empty or `*` matcher is Claude Code's own spelling of every tool.
+    """
+    if matcher is None:
+        return None, None
+    if not isinstance(matcher, str):
+        return None, "matcher %r is not a string" % (matcher,)
+    if matcher.strip() in ("", "*"):
+        return None, None
+    try:
+        return re.compile(matcher), None
+    except re.error as exc:
+        return None, "matcher %r is not a readable pattern: %s" % (matcher, exc)
+
+
+def guard_status(settings_path):
+    """Whether crew-guard.py is armed, as (summary, problems).
+
+    Three failures with three different remedies: not registered at all, so
+    nothing is enforced; registered at a path that cannot run, which enforces
+    nothing either; and registered with a matcher that omits a tool the hook can
+    act on, which is the dangerous one because it looks armed.
+
+    What this cannot prove: it reads one settings file, so a registration in a
+    project, local or enterprise file is invisible to it; and matching a pattern
+    here is not proof that Claude Code delivers the tool, only that the pattern
+    names it.
+    """
+    try:
+        with open(settings_path) as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None, ["crew-guard is NOT registered: there is no %s, so nothing "
+                      "enforces the crew boundary and a crew member can dispatch "
+                      "paid sessions. Add a PreToolUse hook running %s with a "
+                      "matcher covering every tool its FORBIDDEN_TOOLS and "
+                      "COMMAND_FIELDS name, plus Bash, %s."
+                      % (settings_path, GUARD_HOOK, GUARD_RELOAD)]
+    except (OSError, ValueError) as exc:
+        return None, ["crew-guard cannot be shown to be registered: %s could not "
+                      "be read as JSON (%s). Claude Code loads no hooks from a "
+                      "settings file it cannot parse, so read this as nothing "
+                      "enforced. Repair the file, %s."
+                      % (settings_path, exc, GUARD_RELOAD)]
+
+    registrations = _guard_registrations(data)
+    if not registrations:
+        return None, ["crew-guard is NOT registered: %s has no PreToolUse hook "
+                      "running %s, so nothing enforces the crew boundary and a "
+                      "crew member can dispatch paid sessions. This check reads "
+                      "that file alone, so a registration in a project or local "
+                      "settings file is invisible to it. Add the entry with a "
+                      "matcher covering every tool the hook's FORBIDDEN_TOOLS "
+                      "and COMMAND_FIELDS name, plus Bash, %s."
+                      % (settings_path, GUARD_HOOK, GUARD_RELOAD)]
+
+    problems = []
+    live = []
+    for matcher, hook_path, runs_directly in registrations:
+        if not os.path.exists(hook_path):
+            problems.append("crew-guard's registration in %s is dangling: %s "
+                            "does not exist, so the PreToolUse entry enforces "
+                            "nothing. Point it at the stowed %s, or re-stow the "
+                            "claude package, %s."
+                            % (settings_path, hook_path, GUARD_HOOK,
+                               GUARD_RELOAD))
+        elif runs_directly and not os.access(hook_path, os.X_OK):
+            # Only when settings runs the file itself. Registered behind an
+            # interpreter, the executable bit is not what decides.
+            problems.append("crew-guard at %s is not executable, so the "
+                            "PreToolUse entry in %s enforces nothing. chmod +x "
+                            "that file, %s."
+                            % (hook_path, settings_path, GUARD_RELOAD))
+        else:
+            live.append((matcher, hook_path))
+    if not live:
+        return None, problems
+
+    tools = set()
+    for hook_path in dict.fromkeys(path for _, path in live):
+        found, error = _guard_tools(hook_path)
+        if error:
+            problems.append("doctor cannot verify the PreToolUse matcher: "
+                            "crew-guard's own tool tables could not be read "
+                            "from %s (%s)." % (hook_path, error))
+        else:
+            tools.update(found)
+    if not tools:
+        return None, problems
+
+    patterns = []
+    unreadable = False
+    for matcher, _ in live:
+        pattern, error = _matcher_pattern(matcher)
+        if error:
+            unreadable = True
+            problems.append("doctor cannot verify which tools reach crew-guard: "
+                            "%s in %s. Use an alternation such as Bash|Monitor, "
+                            "%s." % (error, settings_path, GUARD_RELOAD))
+        else:
+            patterns.append(pattern)
+    # Naming missing tools off an unreadable matcher would assert what has just
+    # been reported as unknown. It is already a FAIL, and the tools it does
+    # deliver are reportable once the pattern can be read.
+    missing = [] if unreadable else [
+        tool for tool in sorted(tools)
+        if not any(p is None or p.fullmatch(tool) for p in patterns)]
+    if missing:
+        problems.append("crew-guard is registered but INERT for %s: the "
+                        "PreToolUse matcher (%s) in %s does not deliver those "
+                        "tools, and the hook can act only on what the matcher "
+                        "delivers, so the registration looks armed and is not. "
+                        "Widen the matcher to cover them, %s."
+                        % (", ".join(missing),
+                           ", ".join(repr(m) for m, _ in live),
+                           settings_path, GUARD_RELOAD))
+
+    if problems:
+        return None, problems
+    return ("registered at %s, matcher delivers %s"
+            % (live[0][1], ", ".join(sorted(tools)))), []
 
 
 def crew_members(snap):

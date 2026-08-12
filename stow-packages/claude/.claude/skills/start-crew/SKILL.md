@@ -150,9 +150,10 @@ Say these only if relevant, and only once per session:
   recovery".
 - **The guard hook needs a fresh session to take effect.** If `crew-guard` was
   installed during this session, it is not live until `/hooks` is opened or
-  Claude restarts. Nothing in this build registers the hook, and `crew doctor`
-  does not check that it is registered, so a green preflight says nothing about
-  it. Confirm it in `/hooks`. Until it is live, nothing stops a crew member
+  Claude restarts. Nothing in this build registers the hook. `crew doctor` checks
+  that it is registered and that the PreToolUse matcher covers every tool it can
+  act on, but that reads the settings file, not this session, so confirm a
+  just-installed hook in `/hooks`. Until it is live, nothing stops a crew member
   dispatching more paid sessions.
 - **Dispatched panes and tabs are not cleaned up for you.** A crew member whose
   session has exited keeps its pane and the tab it was dispatched into, and they

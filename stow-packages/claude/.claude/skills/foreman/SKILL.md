@@ -203,12 +203,15 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
 - **`crew mail unread` is unbounded.** `crew peek` is capped at 200 lines; the
   mailbox is not capped at all, so it is the one path that can flood your
   context. Ack what you report.
-- **A green `crew doctor` does not mean the guard hook is live.** Nothing in
-  this build registers the `crew-guard` PreToolUse hook, and doctor does not
-  check that it is registered, so a fresh stow has the file present and never
-  invoked. Whether it is live here depends on this machine's own settings, which
-  crew cannot see: confirm it in `/hooks` rather than assuming either way. Until
-  it is live, nothing stops a crew member dispatching paid sessions.
+- **`crew doctor` checks that the guard is armed, and still cannot prove it is
+  live.** Doctor fails if the `crew-guard` PreToolUse hook is not registered, if
+  the path it names does not exist or is not executable, or if the matcher omits
+  a tool the hook can act on, and it names the missing tools. Nothing in this
+  build writes that registration for you. What a green guard line does not prove:
+  a settings change is not live until `/hooks` is opened or Claude restarts, and
+  doctor reads `~/.claude/settings.json` alone, so a registration in a project or
+  local settings file reads as absent. While the guard line is red, nothing stops
+  a crew member dispatching paid sessions.
 
 ## Rules
 
