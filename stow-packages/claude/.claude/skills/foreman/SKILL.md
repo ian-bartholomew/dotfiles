@@ -66,6 +66,9 @@ Always lead with load, grouped by repo:
   working    fes-config-ops         fandevx-3499       implementer  wQ:pT
 ```
 
+`crew ls` also names what is retirable, in its own sections after the table.
+Report those as a proposal, never as an action: see Retirement below.
+
 Report what `crew ls` actually printed. Its rows end in a pane id, not free
 text, so do not append a reason of your own invention. Nothing detects a
 stalled or dead crew member yet, and `blocked` appears only if herdr itself
@@ -100,6 +103,15 @@ opening a second setup pane.
 
 For a ticketless slug there is no ticket to fetch, so no setup pane appears,
 nothing needs answering, and dispatch completes in this one call.
+
+**Dispatch a JIRA key in UPPERCASE.** `crew ls` prints the sanitised lowercase
+form, so re-dispatching what you read there is the one spelling that is wrong:
+lowercase is not recognised as a ticket, and it would branch off HEAD with no
+`/start-ticket` and no plan. Dispatch refuses it and names the uppercase
+spelling; use that rather than working around it.
+
+The success line names the branch and the worktree as well as the pane. Report
+them: a dispatch into the wrong tree looks exactly like a correct one otherwise.
 
 Exit codes are the same for every verb, so you can rely on them:
 
@@ -140,10 +152,30 @@ the human confirm.
 A crew member closing itself after its output is in the mailbox is fine. That
 is different.
 
-There is no `crew retire` verb yet, and that is deliberate. Proposing IS the
-whole action: name which crew are retirable and why, then stop. Do not reach
-for `herdr pane close` or any other direct call to finish the job yourself.
-If the human confirms, they close it, or they tell you to.
+`crew retire <name>` exists, and it does not change that rule: print the exact
+command and stop. Do not run it, and do not reach for `herdr pane close`. If the
+human confirms, they run it, or they tell you to.
+
+```bash
+crew retire <key|pane id|tab id>   # propose it; the human runs it
+```
+
+`crew ls` names what is retirable, so propose from that rather than from your
+own reading of the load table:
+
+- **crew panes no agent occupies.** The session is gone; the pane and the tab it
+  was dispatched into are not. Retiring closes both.
+- **tabs crew created holding no agent.** A dispatch that failed before it
+  tagged the pane leaves an untagged pane, which nothing else can see, so these
+  are matched by the tab label and named by tab id.
+
+A pane that still has an agent is never retired, and `crew retire` refuses it.
+herdr cannot tell a finished session from one waiting on the human, so ask the
+crew member to close itself once its report is in the mailbox, or let the human
+close the pane.
+
+Exit 3 from `crew retire` can mean a partial cleanup: it says what it closed and
+what it could not, and a close it could not do is left for the human.
 
 ## Known gaps in this build
 
@@ -162,6 +194,12 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
   key in a second repo discards the first repo's completed setup, and that repo
   then has to pay for another setup session. Finish one repo's dispatch of a
   key before starting the same key elsewhere.
+- **An untagged pane is invisible except by its tab label.** A dispatch that
+  failed before it tagged the pane leaves one carrying no tokens, and crew
+  recognises it as crew only through the label of the tab it sits in. If herdr
+  stops reporting tabs, those go unreported: `crew ls` then proposes fewer
+  retirements than there are, never more. Say what it printed and let the human
+  look at the window.
 - **`crew mail unread` is unbounded.** `crew peek` is capped at 200 lines; the
   mailbox is not capped at all, so it is the one path that can flood your
   context. Ack what you report.

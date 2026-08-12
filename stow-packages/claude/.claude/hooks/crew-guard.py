@@ -21,6 +21,7 @@ all. Blocking the invocation stops the accident. Nothing here stops the intent.
 import json
 import os
 import shlex
+import subprocess
 import sys
 
 # (program, verb tuple, why). Each spends money, steers another session, or
@@ -36,6 +37,8 @@ FORBIDDEN = (
     ("crew", ("dispatch",),
      "dispatching spends a paid session, and only the foreman dispatches"),
     ("crew", ("nudge",), "nudging steers another session"),
+    ("crew", ("retire",),
+     "retiring closes a pane and a tab, which is the human's to confirm"),
     ("crew", ("mail", "ack"), "only the foreman acknowledges mail"),
     ("crew", ("claim-foreman",), "only the foreman claims the foreman name"),
     ("herdr", ("agent", "start"), "starting an agent spends a paid session"),
@@ -108,16 +111,69 @@ def forbidden_reason(command):
     return None
 
 
-def is_crew_session(payload):
-    """A crew member works inside <repo>/.claude/worktrees/<branch>.
+SNAPSHOT_TIMEOUT = 5
 
-    Deliberately conservative: if the cwd is unknown, treat the session as NOT
-    crew and allow. A guard that blocks the human's own shell on ambiguity would
-    be turned off within the hour, and an unenforced boundary is what this
-    mitigates rather than a sandbox it replaces.
+
+def pane_crew_token():
+    """Whether the pane hosting this session carries crew's own `crew=true`
+    token: True, False, or None when that cannot be established.
+
+    The pane token is the record this design calls authoritative, and it is the
+    only signal that sees the setup pane. `start_setup` splits that pane with
+    `--cwd <repo root>`, so the cwd test below reads an ordinary checkout while
+    the pane is tagged `crew=true, type=setup` and hosts a live paid session
+    that can dispatch, close panes and prompt peers. It is also the session most
+    exposed to untrusted input, because `/start-ticket` pulls JIRA descriptions
+    and comments into its context.
+
+    The same token fixes the opposite error, where any ordinary session that
+    happened to be in a worktree was classified as crew.
+
+    None means unknown, not false: no pane id, no herdr on PATH, a socket that
+    does not answer, or a pane the snapshot does not list. The caller then falls
+    back to the cwd test, so an unreadable snapshot from a crew worktree still
+    denies. A crew member that strips HERDR_PANE_ID lands on that same fallback,
+    and one that also leaves its worktree is the determined evasion this
+    module's docstring already concedes.
     """
-    cwd = payload.get("cwd") or ""
-    return WORKTREE_MARKER in cwd
+    pane_id = os.environ.get("HERDR_PANE_ID", "")
+    if not pane_id:
+        return None
+    try:
+        proc = subprocess.run(["herdr", "api", "snapshot"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=SNAPSHOT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        panes = json.loads(proc.stdout)["result"]["snapshot"]["panes"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    for pane in panes:
+        if pane.get("pane_id") == pane_id:
+            return (pane.get("tokens") or {}).get("crew") == "true"
+    return None
+
+
+def is_crew_session(payload):
+    """Membership from the pane token, falling back to the cwd.
+
+    The cwd test alone is wrong in both directions: it misses the setup pane,
+    which is crew by design and sits at the repo root, and it claims any session
+    working in any worktree.
+
+    Still deliberately conservative where nothing can be established: with no
+    token and no worktree cwd, treat the session as NOT crew and allow. A guard
+    that blocks the human's own shell on ambiguity would be turned off within
+    the hour, and an unenforced boundary is what this mitigates rather than a
+    sandbox it replaces.
+    """
+    token = pane_crew_token()
+    if token is not None:
+        return token
+    return WORKTREE_MARKER in (payload.get("cwd") or "")
 
 
 def main():
@@ -128,12 +184,15 @@ def main():
 
     if payload.get("tool_name") != "Bash":
         return 0
-    if not is_crew_session(payload):
-        return 0
 
+    # The command is classified BEFORE membership, because membership now costs
+    # a herdr round trip and this hook runs on every Bash call. A command that
+    # is not forbidden is allowed for crew and human alike, so the round trip
+    # would buy nothing; ordering it second keeps the ordinary call decided by
+    # string work alone.
     command = (payload.get("tool_input") or {}).get("command") or ""
     why = forbidden_reason(command)
-    if why:
+    if why and is_crew_session(payload):
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -142,7 +201,9 @@ def main():
                     "crew-guard: %s. This session is a crew member, working in "
                     "%s. Report what you need with `crew mail send` and let the "
                     "foreman or the human act."
-                    % (why, payload.get("cwd", "a worktree"))
+                    # The token path can deny a session whose cwd is unknown or
+                    # is an ordinary checkout, so this cannot assume a worktree.
+                    % (why, payload.get("cwd") or "an unreported directory")
                 ),
             }
         }))

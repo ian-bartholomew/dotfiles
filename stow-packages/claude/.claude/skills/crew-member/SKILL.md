@@ -24,6 +24,12 @@ crew mail send --key <your-key> needs-input "one sentence on what you need"
 Never send both. The foreman treats your line as a single signal, and two
 contradictory lines are worse than none.
 
+`done` and `needs-input` are the only states you can send. Anything else is
+refused, because the state is the one part of your report the foreman reads as a
+machine value rather than as prose. Everything you want to say goes in the
+sentence, on one line: newlines are collapsed out of every field, so a second
+line cannot be smuggled into the foreman's terminal.
+
 Then confirm it landed. `crew mail send` exits 0 on success. A nonzero exit
 means your report did not reach the foreman: retry once, and if it still
 fails, say so in your session and stop. Do not close a pane whose report
@@ -38,7 +44,10 @@ state from outside yet: there is no watchdog. Do not try to pre-announce it.
 The same is true if your process dies outright (OOM, a signal, a crash): that
 does not read as idle forever. Your pane loses its agent, and `crew ls`
 buckets an agent-less pane to `recover`, not `awaiting`, so the foreman can
-tell the difference.
+tell the difference. Verified: an agent exited with its pane left alive kept
+every one of its tokens, so the pane is still recognisably yours and `crew ls`
+reported it as needing recovery. Your pane and its tab then stay until someone
+retires them, which is the foreman's to propose and the human's to run.
 
 Never put command output, credentials, ARNs, account ids, tokens, hostnames,
 IP addresses, stack traces or file contents in a mail line. State plus one
@@ -67,9 +76,9 @@ Never force-push. Never merge. The human merges.
 
 ## The guard stops accidents, not intent
 
-A PreToolUse hook denies you `crew dispatch`, `crew nudge`, `crew mail ack`,
-`crew claim-foreman`, and the `herdr` verbs that start, steer, relocate or
-close another session. It denies them at both layers, `herdr agent ...` and
+A PreToolUse hook denies you `crew dispatch`, `crew nudge`, `crew retire`,
+`crew mail ack`, `crew claim-foreman`, and the `herdr` verbs that start, steer,
+relocate or close another session. It denies them at both layers, `herdr agent ...` and
 the `herdr pane ...` equivalents, because `pane send-keys` reaches the same
 effect as `agent send-keys` and `pane report-metadata` can erase the tokens
 crew treats as the authoritative record of who owns what.

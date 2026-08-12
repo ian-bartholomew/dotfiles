@@ -276,6 +276,12 @@ def crew_members(snap):
             ctype = "unknown-v%s" % tokens.get("v", "none")
         status = agent.get("agent_status", "unknown")
         members.append({
+            # Absence from the agent list, never a status: an agent-less pane
+            # reports agent_status `unknown`, and so does an agent herdr cannot
+            # classify, so the status cannot tell the two apart. The bucket
+            # keeps calling both `recover`, which is right for a foreman
+            # reading load; this field is what retirement is allowed to act on.
+            "agent": pane_has_agent(snap, pane["pane_id"]),
             "name": agent.get("name") or "(unnamed)",
             "key": tokens.get("key", "(no key)"),
             "repo": tokens.get("repo", "(no repo)"),
@@ -309,7 +315,72 @@ def untagged_agents(snap):
     return out
 
 
-def render_ls(members, untagged):
+# A tab crew created is labelled `<repo>/<sanitised key>`. The key half is
+# whatever sanitize_name produces, which always starts with a letter.
+CREW_TAB_LABEL_RE = re.compile(r"^[^/]+/[a-z][a-z0-9_-]*$")
+
+
+def crew_tab_label(repo, key):
+    """The label dispatch gives the tab it creates for a crew member."""
+    return "%s/%s" % (repo, sanitize_name(key))
+
+
+def is_crew_tab_label(label):
+    return bool(CREW_TAB_LABEL_RE.match(label))
+
+
+def tab_panes(snap, tab_id):
+    return [p for p in snap["panes"] if p.get("tab_id") == tab_id]
+
+
+def tab_holds_only(snap, tab_id, pane_ids):
+    """Whether this tab holds exactly these panes and nothing crew cannot see.
+
+    A tab whose pane_count exceeds the panes the snapshot lists is NOT held by
+    them alone: crew cannot prove a pane it cannot see is agent-less, so the tab
+    is left alone rather than closed on a guess. A tab missing from the tabs
+    list entirely is treated the same way, so a herdr that stops reporting tabs
+    makes crew close fewer things rather than more."""
+    seen = sorted(p["pane_id"] for p in tab_panes(snap, tab_id))
+    if seen != sorted(pane_ids):
+        return False
+    for tab in snap.get("tabs") or []:
+        if tab.get("tab_id") == tab_id:
+            return (tab.get("pane_count") or len(seen)) == len(seen)
+    return False
+
+
+def orphan_crew_tabs(snap):
+    """Tabs crew created that hold no agent at all.
+
+    `crew dispatch` creates one tab per crew member and nothing removed it, so
+    they accumulate: four were found from earlier testing, each holding one dead
+    pane, and each carrying NO tokens. Tokens DO survive an agent's exit,
+    measured: an agent exited with its pane alive left all eight intact. So a
+    tokenless orphan is not an exited session, it is a dispatch that failed
+    before tag_pane ran, and the only record crew has of creating it is the tab
+    LABEL. Matching on the label is what makes those retirable at all.
+
+    Occupancy is read off the agent list, never off a status. `tabs` carries an
+    agent_status too, and an agent-less tab reports `unknown` there exactly as
+    an unclassifiable agent would."""
+    out = []
+    for tab in snap.get("tabs") or []:
+        tab_id = tab.get("tab_id")
+        if not tab_id or not is_crew_tab_label(tab.get("label") or ""):
+            continue
+        panes = [p["pane_id"] for p in tab_panes(snap, tab_id)]
+        if any(pane_has_agent(snap, pane_id) for pane_id in panes):
+            continue
+        if not tab_holds_only(snap, tab_id, panes):
+            continue
+        out.append({"tab": tab_id, "label": tab.get("label") or "",
+                    "panes": panes})
+    out.sort(key=lambda t: t["tab"])
+    return out
+
+
+def render_ls(members, untagged, orphan_tabs=None):
     counts = {"working": 0, "awaiting": 0, "blocked": 0, "recover": 0}
     for m in members:
         counts[m["bucket"]] += 1
@@ -326,6 +397,24 @@ def render_ls(members, untagged):
         lines.append("%d untagged (not crew):" % len(untagged))
         for u in untagged:
             lines.append("  %-8s %-10s %s" % (u["status"], u["pane"], u["title"]))
+    # A cleanup verb nobody knows to run does not help, so the accumulation is
+    # reported here, where the foreman already looks.
+    spent = [m for m in members if not m["agent"]]
+    if spent:
+        lines.append("")
+        lines.append("%d crew pane(s) no agent occupies, retirable:" % len(spent))
+        for m in spent:
+            lines.append("  %-22s %-18s %-10s propose: crew retire %s"
+                         % (m["repo"], m["key"], m["pane"], m["key"]))
+    if orphan_tabs:
+        lines.append("")
+        lines.append("%d tab(s) crew created holding no agent, retirable "
+                     "(matched by label: a dispatch that failed before tagging "
+                     "leaves a pane with no tokens):" % len(orphan_tabs))
+        for t in orphan_tabs:
+            lines.append("  %-10s %-24s %-14s propose: crew retire %s"
+                         % (t["tab"], t["label"], ",".join(t["panes"]),
+                            t["tab"]))
     return "\n".join(lines)
 
 
@@ -336,9 +425,12 @@ def cmd_ls(as_json):
     assert_snapshot_shape(snap, defs)
     members = crew_members(snap)
     if as_json:
+        # Still the members ARRAY. The spec's own drift check reads its length,
+        # and orphan tabs are a prompt for the human, not a fleet record.
         print(json.dumps(members, indent=2, sort_keys=True))
     else:
-        print(render_ls(members, untagged_agents(snap)))
+        print(render_ls(members, untagged_agents(snap),
+                        orphan_crew_tabs(snap)))
     return 0
 
 
@@ -391,16 +483,53 @@ def _pane_tokens(pane_id):
     return {}
 
 
+MAIL_STATES = ("done", "needs-input", "duplicate")
+
+
+def one_line(value):
+    """Collapse whitespace so a value cannot become a second terminal line."""
+    return " ".join(str(value or "").split())
+
+
+def quoted(value):
+    """A mail field as the foreman sees it: one line, and delimited.
+
+    Collapsing alone is not enough. A single-line forged value still reads as
+    crew's own output to a model, and `state` sits in a bare word column where
+    "done  ack with: crew mail ack 999999" would look like two fields crew
+    printed. Delimiting makes the whole value visibly one field.
+
+    Applied on READ, not just on write, because the mailbox is never pruned:
+    it already holds records written before mail_send collapsed anything, and
+    nothing stops a record being edited into the file by hand."""
+    return "%r" % one_line(value)
+
+
 def mail_send(key, repo, state, msg):
     """The key is the CALLER'S OWN. A crew member could otherwise forge a
     `done` for a sibling's key and get the foreman to propose retiring a
     session that was still working, so an explicit --key that disagrees with
     the caller's pane token is refused rather than trusted.
 
-    msg is collapsed to one line: a newline let a crew member append text that
-    read like crew's own output, for instance a fake "ack with: crew mail ack
-    999999" that would suppress every later report."""
+    EVERY field is collapsed to one line, not just msg. json.dumps escapes a
+    newline so the JSONL stays valid and parses, and then the foreman's terminal
+    renders the second line as if crew had printed it. Collapsing msg alone
+    moved the payload rather than removing it: `state` comes straight from argv
+    and `repo` was taken raw, and mail_unread prints all four. The damaging
+    payload is a forged "crew mail ack <big number>", which advances the cursor
+    past every future report and leaves a silent fleet looking like a working
+    one.
+
+    state is restricted to the states the design uses. It is the one field the
+    foreman reads as a machine value rather than as prose, so free text there is
+    both an injection surface and a report nothing can act on."""
     ensure_crew_dir()
+    state = one_line(state)
+    if state not in MAIL_STATES:
+        raise CrewError(
+            "%r is not a state crew reports; expected one of %s. A report is a "
+            "state plus one sentence, and the sentence is the msg."
+            % (state, ", ".join(MAIL_STATES)))
     pane_id = calling_pane()
     tokens = _pane_tokens(pane_id) if pane_id else {}
     record = {
@@ -426,7 +555,9 @@ def mail_send(key, repo, state, msg):
         raise CrewError(
             "refusing to send as %r: this pane is crew member %r. A report must "
             "name the sender's own key." % (sanitize_name(key), own))
-    record["msg"] = " ".join(str(msg).split())
+    for field, value in list(record.items()):
+        if isinstance(value, str):
+            record[field] = one_line(value)
     if DRY_RUN:
         print("would append to %s: %s" % (MAILBOX, json.dumps(record, sort_keys=True)))
         return 0
@@ -464,9 +595,10 @@ def mail_unread():
         entries, unreadable = read_entries(handle.readlines())
     fresh, new_cursor, missing = select_unread(entries, _read_cursor())
     for record in fresh:
-        print("%s  %-12s %-22s %-12s %s" % (
-            record["seq"], record["state"], record.get("repo", ""),
-            record.get("key", ""), record.get("msg", "")))
+        print("%s  %-14s %-24s %-14s %s" % (
+            record["seq"], quoted(record.get("state", "")),
+            quoted(record.get("repo", "")),
+            one_line(record.get("key", "")), quoted(record.get("msg", ""))))
     if not fresh:
         print("no new mail")
     if unreadable or missing:
@@ -559,7 +691,8 @@ def mail_ack(seq):
 
 def _run(args):
     if not args:
-        print("usage: crew <doctor|claim-foreman|ls|dispatch|peek|nudge|mail> [args]", file=sys.stderr)
+        print("usage: crew <doctor|claim-foreman|ls|dispatch|peek|nudge|retire|"
+              "mail> [args]", file=sys.stderr)
         return 2
     verb = args[0]
     if verb == "doctor":
@@ -606,6 +739,12 @@ def _run(args):
             return 2
         name = require_positional(args[1], "nudge name")
         return cmd_nudge(name, " ".join(args[2:]))
+    if verb == "retire":
+        if len(args) < 2:
+            print("usage: crew retire <name|key|pane id|tab id>",
+                  file=sys.stderr)
+            return 2
+        return cmd_retire(require_positional(args[1], "retire name"))
     if verb == "mail":
         sub = args[1] if len(args) > 1 else ""
         if sub == "send":
@@ -682,6 +821,27 @@ def contract_pointer(name, ctype, key, repo, worktree):
 TOKEN_VALUE_MAX = 80
 
 
+def token_too_long(name, value):
+    """Why this value cannot be written as a token, or None.
+
+    herdr silently truncates a token VALUE at 80 characters, and the tokens are
+    the authoritative record, so a truncated value is a record that lies.
+    tag_pane refuses to write one, but tag_pane runs after the pane exists: a
+    real dispatch from a 109 character repo root returned exit 3 with exactly
+    the right message, having already run `git worktree add` and `tab create`,
+    and left a pane, a tab and a worktree behind. That pane carried NO tokens,
+    because tag_pane is what raised, so by this design's own rule that an
+    untagged pane is not crew, nothing could ever see or retire it.
+
+    So every value that will become a token is checked through here BEFORE
+    anything is created, and tag_pane's check is the same check, kept as the
+    backstop for a caller that skipped the early one."""
+    if len(value) > TOKEN_VALUE_MAX:
+        return ("%s is %d chars, over herdr's %d limit, and would be silently "
+                "truncated: %r" % (name, len(value), TOKEN_VALUE_MAX, value))
+    return None
+
+
 def worktree_for(root, branch):
     """Derive the worktree path from two short tokens rather than storing the
     path itself. herdr truncates a token VALUE at 80 characters and a real
@@ -746,17 +906,14 @@ def tag_pane(pane_id, key, repo, ctype, branch, root):
     if root:
         args += ["--token", "root=%s" % root]
 
-    # herdr silently truncates a token VALUE at 80 characters. Tokens are the
-    # authoritative record here, so a truncated value is a record that lies.
-    # Refuse to write one rather than discover it later.
+    # The backstop. cmd_dispatch checks these values before it creates
+    # anything, because by the time this raises there is a pane to leak.
     for i in range(0, len(args)):
         if args[i] == "--token":
             name, _, value = args[i + 1].partition("=")
-            if len(value) > TOKEN_VALUE_MAX:
-                raise CrewError(
-                    "token %s is %d chars, over herdr's %d limit, and would be "
-                    "silently truncated: %r"
-                    % (name, len(value), TOKEN_VALUE_MAX, value))
+            problem = token_too_long(name, value)
+            if problem:
+                raise CrewError("token %s" % problem)
     herdr(*args)
 
 
@@ -885,6 +1042,28 @@ def is_ticket(key):
     return bool(JIRA_KEY_RE.match(key))
 
 
+def wrong_case_ticket(key):
+    """The uppercase spelling of a JIRA-shaped key given in another case, or
+    None.
+
+    JIRA_KEY_RE is uppercase only and is_ticket is exact case, so
+    `fandevx-3511` is not a ticket and takes the SLUG path: plain_worktree
+    branches off the main checkout's HEAD and a paid session starts with no
+    /start-ticket, no ticket payload and no plan, at exit 0, and the crew member
+    is then told to read a plan that does not exist.
+
+    It is reachable because the foreman never sees the raw key again.
+    crew_members stores sanitize_name'd keys, render_ls prints that lowercase
+    form and the exit 5 line prints the stored one, so a foreman re-dispatching
+    a key it read out of `crew ls` uses the spelling that breaks. While the
+    first pane lives find_member catches it at exit 5; once that pane is
+    retired, which is the normal end state, nothing does."""
+    if is_ticket(key):
+        return None
+    upper = key.upper()
+    return upper if JIRA_KEY_RE.match(upper) else None
+
+
 def plain_worktree(key, repo_root):
     """Worktree for a ticketless slug, at the same convention path."""
     name = sanitize_name(key)
@@ -918,6 +1097,42 @@ def _start_agent(args, tries=8, delay=3):
             if "agent_pane_busy" not in str(exc) or attempt == tries - 1:
                 raise
             time.sleep(delay)
+
+
+# Measured 4.04s on a real dispatch, so this is 10x headroom rather than a
+# guess. It is bounded because the whole dispatch has to finish inside Claude
+# Code's own Bash timeout (120s default): agent start retries up to 24s and the
+# delivery confirmation adds 15s, so 45s here leaves the call comfortably short.
+READY_TIMEOUT_MS = "45000"
+
+
+def _wait_ready(name, tries=5, delay=2):
+    """Wait for a freshly started agent to be ready for input. True if it is.
+
+    `agent_pane_busy` is a check on the SHELL, not on the agent. Measured on a
+    real dispatch: `agent start` returned at 0.54s, the agent first appeared at
+    3.51s with status `unknown`, still booting, and reached `idle` at 4.04s. The
+    `agent prompt` fired in between went into a REPL that was not accepting
+    input yet and was SILENTLY DROPPED. The session sat at an empty prompt box,
+    the working-or-blocked confirmation could not succeed because an agent that
+    received no prompt settles at idle, and dispatch reported exit 6 having paid
+    for a session that got no work. The same text delivered fine by `crew nudge`
+    afterwards, so the remedy worked and the delivery did not.
+
+    Readiness comes from herdr's own signal: `idle` is documented as ready for
+    input, and `unknown` is deliberately not accepted because that is the state
+    the booting agent reported. agent_not_found is retried, because the agent is
+    not registered the moment `agent start` returns."""
+    for attempt in range(tries):
+        try:
+            herdr("agent", "wait", name, "--until", "idle",
+                  "--timeout", READY_TIMEOUT_MS)
+            return True
+        except HerdrError as exc:
+            if "agent_not_found" not in str(exc) or attempt == tries - 1:
+                return False
+            time.sleep(delay)
+    return False
 
 
 def dispatch_artifact_path(key):
@@ -1095,13 +1310,11 @@ def read_dispatch_artifact(key, repo, repo_root):
         raise CrewError(
             "%s names branch %r, which %s, so it cannot name a worktree "
             "directory. %s" % (artifact, branch, problem, ARTIFACT_DISCARDED))
-    if len(branch) > TOKEN_VALUE_MAX:
+    problem = token_too_long("branch", branch)
+    if problem:
         clear_dispatch_artifact(key)
-        raise CrewError(
-            "%s names branch %r, %d chars, over herdr's %d limit, so the token "
-            "recording it would be silently truncated. %s"
-            % (artifact, branch, len(branch), TOKEN_VALUE_MAX,
-               ARTIFACT_DISCARDED))
+        raise CrewError("%s names a branch that cannot be recorded: %s. %s"
+                        % (artifact, problem, ARTIFACT_DISCARDED))
 
     # Containment is not enough: <root>/tmp/wt is inside the repo, and the
     # tokens written from it derive <root>/.claude/worktrees/wt, a path that
@@ -1122,14 +1335,15 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     artifact-ready path for a ticket and the inline path for a slug: once a
     worktree exists there is no interactive step left either way."""
     tab = herdr("tab", "create", "--workspace", workspace,
-                "--label", "%s/%s" % (repo, sanitize_name(key)),
+                "--label", crew_tab_label(repo, key),
                 "--cwd", worktree, "--no-focus")
     pane = DRY_PANE if tab is None else tab["result"]["root_pane"]["pane_id"]
 
     # Tag before agent.start. Tokens are authoritative, so an untagged
     # pane is invisible to ls; a tag that failed afterwards would leave a
     # live session unowned and burning shared quota.
-    tag_pane(pane, key, repo, ctype, branch_for(repo_root, worktree), repo_root)
+    branch = branch_for(repo_root, worktree)
+    tag_pane(pane, key, repo, ctype, branch, repo_root)
 
     live = set(a.get("name") for a in snap["agents"] if a.get("name"))
     name = pick_name(key, live)
@@ -1141,6 +1355,16 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     # A planner is an ordinary session told to plan. It must NOT run in
     # plan mode: that blocks bash, so it could never send its own report.
     _start_agent(start)
+
+    # Never prompt a session that is still booting: the text is dropped and the
+    # dispatch pays for a session that receives no work. A timeout here is not
+    # fatal, because prompting anyway is no worse than what this replaced and
+    # the confirmation below still catches a non-delivery as exit 6.
+    if not _wait_ready(name):
+        print("%s did not report ready for input within %ss, so its assignment "
+              "is being sent to a session that may still be starting. If the "
+              "confirmation below fails, resend with: crew nudge %s \"<text>\""
+              % (name, int(READY_TIMEOUT_MS) // 1000, name), file=sys.stderr)
 
     duty = {
         "implementer": "Read the plan in your worktree, then implement it.",
@@ -1174,7 +1398,11 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
               "\"<text>\"" % (name, name), file=sys.stderr)
         return 6
 
-    print("dispatched %s as %s in pane %s" % (key, name, pane))
+    # Names the branch and the worktree, not just the key: a dispatch into the
+    # wrong tree looked identical to a correct one, and the tree is the whole
+    # question when --repo is wrong or an artifact came from another checkout.
+    print("dispatched %s as %s in pane %s on branch %s in %s"
+          % (key, name, pane, branch, worktree))
     return 0
 
 
@@ -1183,6 +1411,16 @@ def cmd_dispatch(key, ctype, repo, model):
         raise CrewError(
             "%r is a crew type, not a key. Did you mean --type %s?"
             % (key, sanitize_name(key)))
+    upper = wrong_case_ticket(key)
+    if upper:
+        raise CrewError(
+            "%r is JIRA shaped but not uppercase, so it is refused rather than "
+            "dispatched as a slug: the slug path branches off HEAD with no "
+            "/start-ticket, no ticket and no plan, and a paid session at exit "
+            "0. Dispatch %s if that is the ticket. If it is genuinely a "
+            "free-form slug, name it so it is not JIRA shaped, for instance "
+            "%s, because <letters>-<digits> alone cannot be told apart from a "
+            "key." % (key, upper, key + "-slug"))
     if ctype not in MODEL_BY_TYPE:
         raise CrewError("unknown type %r; expected one of %s"
                         % (ctype, ", ".join(sorted(MODEL_BY_TYPE))))
@@ -1192,6 +1430,19 @@ def cmd_dispatch(key, ctype, repo, model):
 
     repo_root, repo = resolve_repo(repo)
     model = model or MODEL_BY_TYPE[ctype]
+
+    # Before a worktree, a tab or a pane exists. Measured: a dispatch from a 109
+    # character repo root refused correctly but only inside tag_pane, by which
+    # time `git worktree add` and `tab create` had run, and it left an UNTAGGED
+    # pane behind, which by this design's own rule nothing can see or retire.
+    for name, value in (("root", repo_root), ("repo", repo)):
+        problem = token_too_long(name, value)
+        if problem:
+            raise CrewError(
+                "%s. Nothing has been created. Dispatch from a shorter path, or "
+                "pass --repo pointing at one: crew records the repo root as a "
+                "pane token and derives every worktree path from it."
+                % problem)
 
     ensure_crew_dir()
     lock_path = os.path.join(CREW_DIR, "dispatch-%s.lock" % sanitize_name(key))
@@ -1300,6 +1551,147 @@ def cmd_nudge(name, text):
     herdr("agent", "prompt", name, text)
     print("nudged %s" % name)
     return 0
+
+
+def pane_tab(snap, pane_id):
+    for pane in snap["panes"]:
+        if pane["pane_id"] == pane_id:
+            return pane.get("tab_id") or ""
+    return ""
+
+
+def retire_target(snap, name):
+    """The one thing `crew retire <name>` names.
+
+    A dead crew member cannot be named by its agent name: herdr clears the name
+    when the agent exits, which is exactly the case retirement exists for, so
+    crew_members reports it as `(unnamed)`. The key token, the pane id and the
+    tab id all outlive the agent, so any of them names a target.
+
+    A tab is only ever a target if its label is one crew gives a tab it created.
+    Without that, `crew retire <any tab id>` would close the human's own tab."""
+    labelled = []
+    for member in crew_members(snap):
+        if name in (member["name"], member["pane"]) \
+                or member["key"] == sanitize_name(name):
+            labelled.append(("member", member,
+                             "crew member %s/%s in pane %s"
+                             % (member["repo"], member["key"], member["pane"])))
+    for tab in snap.get("tabs") or []:
+        if tab.get("tab_id") != name:
+            continue
+        if not is_crew_tab_label(tab.get("label") or ""):
+            raise CrewError(
+                "tab %s is labelled %r, which is not the label crew gives a tab "
+                "it creates, so crew will not close it."
+                % (name, tab.get("label") or ""))
+        labelled.append(("tab", tab, "tab %s (%s)" % (name, tab.get("label"))))
+    if not labelled:
+        raise CrewError(
+            "nothing named %r: no crew member with that name, key or pane, and "
+            "no tab crew created with that id. `crew ls` names what there is."
+            % name)
+    if len(labelled) > 1:
+        raise CrewError(
+            "%r names %d things: %s. Name a pane id or a tab id, which are "
+            "unique." % (name, len(labelled),
+                         "; ".join(text for _, _, text in labelled)))
+    kind, payload, _ = labelled[0]
+    return kind, payload
+
+
+def _close_or_warn(kind, target_id):
+    """A close that fails warns and the caller carries on.
+
+    Aborting is how the setup-pane close became the thing that wedged a key, and
+    a retire that gives up after the pane leaves behind the tab it exists to
+    remove."""
+    try:
+        herdr(kind, "close", target_id)
+    except HerdrError as exc:
+        print("could not close %s %s (%s), so it is still there. Carrying on "
+              "with the rest of the cleanup; close it yourself."
+              % (kind, target_id, exc), file=sys.stderr)
+        return False
+    print("closed %s %s." % (kind, target_id))
+    return True
+
+
+def cmd_retire(name):
+    """Close a spent crew member's pane and the tab dispatch created for it.
+
+    Dispatched panes and their tabs outlived their sessions and nothing ever
+    removed them, so they accumulated, in two forms: a member whose session
+    exited keeps its pane and all its tokens, so it is named by its key, and a
+    dispatch that failed before tag_pane leaves an untagged pane that only its
+    tab label identifies, so it is named by that tab id.
+
+    Retirement is still PROPOSED by the foreman and run by the human; this verb
+    only means the human has something to run other than raw herdr.
+
+    It can never take out live work: the calling pane is refused, a pane an
+    agent still occupies is refused whatever its status, and a tab that holds
+    anything else is left alone. A close that fails warns and the rest of the
+    cleanup continues."""
+    defs = schema_defs()
+    assert_schema_declares(defs)
+    snap = snapshot()
+    assert_snapshot_shape(snap, defs)
+    kind, payload = retire_target(snap, name)
+    me = calling_pane()
+
+    if kind == "member":
+        panes = [payload["pane"]]
+        tab_id = pane_tab(snap, payload["pane"])
+        what = "crew member %s/%s" % (payload["repo"], payload["key"])
+    else:
+        tab_id = payload["tab_id"]
+        panes = [p["pane_id"] for p in tab_panes(snap, tab_id)]
+        what = "tab %s (%s)" % (tab_id, payload.get("label"))
+        if not tab_holds_only(snap, tab_id, panes):
+            raise CrewError(
+                "tab %s holds panes this snapshot does not list, so crew cannot "
+                "show that nothing in it is live. Close it yourself if you know "
+                "it is spent." % tab_id)
+
+    if me and me in panes:
+        raise CrewError(
+            "%s is the pane this command is running in, so nothing has been "
+            "closed: that would kill this session. Close it yourself once you "
+            "no longer need it." % me)
+    occupied = [p for p in panes if pane_has_agent(snap, p)]
+    if occupied:
+        raise CrewError(
+            "%s still has an agent in %s, so nothing has been closed. herdr "
+            "cannot tell a finished session from one waiting on you, so an "
+            "occupied pane is never retired: `crew peek` it, let it close "
+            "itself once its report is in the mailbox, or close the pane "
+            "yourself." % (what, ", ".join(occupied)))
+
+    print("retiring %s." % what)
+    done = True
+    for pane_id in panes:
+        done = _close_or_warn("pane", pane_id) and done
+
+    if not tab_id:
+        return 0 if done else 3
+    if not tab_holds_only(snap, tab_id, panes):
+        others = [p["pane_id"] for p in tab_panes(snap, tab_id)
+                  if p["pane_id"] not in panes]
+        print("tab %s is not held by %s alone, so it is left alone.%s"
+              % (tab_id, "that pane" if len(panes) == 1 else "those panes",
+                 (" It also holds %s." % ", ".join(others)) if others else
+                 " Crew cannot account for every pane in it."))
+        return 0 if done else 3
+    # Re-read rather than assume: whether closing a tab's last pane takes the
+    # tab with it is herdr's own behaviour, and crew asserting either way would
+    # warn on a clean retire or leave the tab behind.
+    if any(tab.get("tab_id") == tab_id
+           for tab in (snapshot().get("tabs") or [])):
+        done = _close_or_warn("tab", tab_id) and done
+    else:
+        print("tab %s went with its last pane." % tab_id)
+    return 0 if done else 3
 
 
 def main(argv):

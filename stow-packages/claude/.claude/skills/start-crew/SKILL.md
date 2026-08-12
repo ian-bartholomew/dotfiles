@@ -154,13 +154,10 @@ Say these only if relevant, and only once per session:
   does not check that it is registered, so a green preflight says nothing about
   it. Confirm it in `/hooks`. Until it is live, nothing stops a crew member
   dispatching more paid sessions.
-- **This skill cannot be run from inside a worktree.** The guard hook decides
-  who is a crew member by testing whether the cwd contains
-  `.claude/worktrees`, as a substring, so any ordinary session in any worktree
-  is classified as crew and denied `crew dispatch` and `crew claim-foreman`.
-  Start the foreman from the repo root, or anywhere outside a worktree. If
-  those two commands are being denied and the session is not crew, this is
-  why.
+- **Dispatched panes and tabs are not cleaned up for you.** A crew member whose
+  session has exited keeps its pane and the tab it was dispatched into, and they
+  accumulate. `crew ls` names what is retirable and the foreman proposes `crew
+  retire <name>`; the user runs it. Nothing retires anything on its own.
 
 ## Related
 
