@@ -29,8 +29,9 @@ Present a brief summary of the ticket to the user before proceeding.
 Create an isolated git worktree for this work:
 
 - Detect the current git repository from the working directory
-- Create a new branch named `{ticket-key}/{slugified-summary}` (e.g. `FANDEVX-2505/submit-aws-account-request`)
+- Create a new branch named `{ticket-key}-{slugified-summary}` (e.g. `FANDEVX-2505-submit-aws-account-request`)
   - Slugify the summary: lowercase, replace spaces with hyphens, remove special characters, truncate to 50 chars
+  - Separate the key from the slug with a hyphen, not a slash. This is the convention in CLAUDE.md, and a slash makes the branch a nested directory once a worktree is derived from it
 - Use the `using-git-worktrees` skill from superpowers to create the worktree safely
 - If the worktree skill is not available, fall back to manual `git worktree add` commands
 
