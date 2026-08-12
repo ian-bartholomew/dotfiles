@@ -3565,3 +3565,130 @@ exit 5 line and `crew retire`, so cover that an implementer and a reviewer on on
 key are listed and retired independently, and that a reviewer never triggers
 setup. Do not run a real `crew dispatch`, no mutating herdr verb, do not touch a
 pane, and do not modify `~/.claude/settings.json`.
+
+---
+
+## Wave 10: three parallel workstreams
+
+Three independent pieces, built concurrently. They share one file, so the
+interface they all touch is fixed HERE and no workstream may change it. Build
+against this contract rather than against each other.
+
+### The shared contract, fixed, do not renegotiate
+
+A mailbox record today has `v, seq, ts, key, repo, pane, branch, state, msg`,
+and `select_unread` returns everything with `seq` above a cursor held in
+`~/.crew/cursor`.
+
+Records gain ONE field, `kind`, with exactly three values:
+
+| kind | written by | carries | vocabulary |
+| --- | --- | --- | --- |
+| `report` | a crew member, via `crew mail send` | the existing fields | `MAIL_STATES`, unchanged |
+| `ack` | the foreman, via `crew mail ack` | `upto`, the highest acked seq | n/a |
+| `alert` | the watchdog | the existing fields plus its own state | its own, NOT `MAIL_STATES` |
+
+Rules every workstream obeys:
+
+- **A record with no `kind` is a `report`.** The live mailbox already holds 41
+  such records and they must keep working untouched.
+- **Every reader filters by `kind`.** A reader that does not is a defect: an ack
+  or an alert appearing in a crew digest, or an alert counted as a self-report,
+  is exactly the confusion this field prevents.
+- `MAIL_STATES` stays the validated vocabulary for `report` only. Do not widen
+  it for alerts. The reason `alert` exists is that a crew member cannot report
+  `blocked` about itself, so `blocked` must not become something it can claim.
+- Only workstream A changes the record writer, the reader, or the cursor. B and C
+  code against this table and do not touch those functions.
+
+### Workstream A: make the ack tamper-evident
+
+`crew mail ack` is denied to a crew member, but the effect is not. Measured from
+a genuine crew pane: `crew mail ack 999999` is denied while
+`echo 999999 > ~/.crew/cursor` is allowed, as are `tee`, the `Write` tool, and
+`rm` of the guard itself. `_read_cursor` reads an integer and `select_unread`
+returns only records above it, so a forged value marks every pending AND future
+report as read. The foreman then sees an empty mailbox, and its own skill treats a
+silent fleet as a working one. The damage is not an error, it is confident
+silence.
+
+Fix: stop storing the cursor as a mutable integer in a separate file. The ack
+becomes an append-only `ack` record in the mailbox, and the effective cursor is
+DERIVED as the highest `upto` across ack records. Forging is still possible,
+because a same-user process can append to any file it can write, but it stops
+being invisible: the forged record is permanent, carries the pane that wrote it,
+and can be compared against the foreman.
+
+So `crew mail unread` must also report tampering rather than only resisting it.
+An ack record whose pane is not the foreman's, or which carries no pane at all as
+a shell redirect would, is evidence. Surface a count and the offending seqs, and
+say plainly what it means. Detection is the whole point of the change; leave it
+out and this buys nothing.
+
+Migration: the live `~/.crew/cursor` may exist and holds a real position. Treat it
+as a floor once, write one ack record recording that position, and thereafter
+ignore the file. Do not lose the 41 existing records, and do not re-deliver them.
+
+Be honest in the docs about what this does and does not achieve. It converts a
+silent, unbounded compromise into a loud, bounded one. It does not make the
+mailbox tamper-proof, and a design that claims otherwise is worse than one that
+admits it.
+
+### Workstream B: crew watch, crew log, crew uninstall
+
+Three verbs the spec lists and never built.
+
+`crew watch <run-id>` opens a pane with NO agent that follows a CI run and
+appends its outcome to the mailbox, so the foreman learns a PR went red without
+polling. A watcher is not a crew type: it has no agent, so it cannot occupy a
+bucket in the load report, and `crew ls` reports watchers in their own section.
+It must cover every terminal outcome, not just success, because a watcher that
+matches only the success signal goes silent through a failure and silence reads as
+still running.
+
+`crew log <key>` digests that key's mailbox records into the project log, reading
+the worktree from the `worktree` derivation rather than cwd. Filter to
+`kind == "report"` for that key. This automates the project logging rule, so match
+the existing log conventions rather than inventing a format.
+
+`crew uninstall` reverses the install: unstow, remove the `~/.local/bin/crew`
+symlink, drop `~/.crew`, and clear crew tokens. It is DESTRUCTIVE and it removes
+the only enforcement of the boundary, so it proposes and the human confirms,
+exactly as retirement does, and it REFUSES outright while any crew member is
+live. It also matters more than it looks: `crew` and the guard currently symlink
+into a git worktree, so removing that worktree silently takes out both, and
+uninstall is the sanctioned way to avoid discovering that by accident.
+
+### Workstream C: the watchdog
+
+`crew watchdog`, one long-lived pane with no agent. It exists because three
+failure modes share one signal and NONE can be self-reported: blocked at a
+permission prompt, stalled while nominally working, and dead. A blocked crew
+member cannot tell anyone it is blocked; being stuck is the problem.
+
+Input is herdr's state-change events, `events.wait --match
+pane.agent_status_changed`. It writes `alert` records, never `report`.
+
+State is persisted to `~/.crew/watchdog.state` as
+`{pane: (state_change_seq, first_seen_ts, emitted_flags)}`, plus a heartbeat.
+Persisted rather than in memory for a specific reason: without it, a watchdog
+crash wipes every stall timer and the restart declares every running pane stalled
+at once. A pane absent from the state file is treated as NEWLY SEEN, never as
+stalled. Emitted flags exist so one stall does not alert on every event.
+
+It must not alert on its own pane, must not treat a pane it has never seen as
+stalled, and must survive herdr restarting under it. `agent_status` of `unknown`
+does NOT mean absent, which is measured and recorded earlier in this plan: only
+absence from the snapshot's agent list means no agent.
+
+### Constraints, all workstreams
+
+Existing tests must pass and each new test must fail if its behaviour is removed.
+Mutation-check the NEW behaviour you add; do not re-run a full matrix over the
+whole suite, which is what made the previous waves slow. Report the mutation per
+new test.
+
+Do not run a real `crew dispatch`, do not run `crew nudge` or `crew retire`
+against a live pane, do not run a mutating herdr verb, and do not touch a pane.
+Do not modify `~/.claude/settings.json`. Report your integration points precisely,
+because three streams are merging into one file.
