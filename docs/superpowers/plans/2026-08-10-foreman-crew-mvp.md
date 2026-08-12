@@ -3400,3 +3400,65 @@ silent, and report the mutation per test.
 The settings change is the user's own config and is authorised for this wave
 only: edit `~/.claude/settings.json` to change the `PreToolUse` matcher, change
 nothing else in that file, and confirm the file still parses as JSON afterwards.
+
+---
+
+## Hardening wave 8
+
+One item, and it is the one that decides whether the guard is enforcement or
+decoration.
+
+### W8-1 (Important): nothing checks that the guard is actually armed
+
+`crew-guard.py` can only act on a tool the `PreToolUse` matcher delivers to it.
+The matcher lives in `~/.claude/settings.json`, which this repo does not ship and
+does not mirror, so the hook's tables and the matcher can drift apart silently.
+When they do, the hook is INERT while every doc and every skill still describes
+it as the enforcement. Two waves widened those tables one tool at a time, so this
+drift is not hypothetical; it is the same defect class as the waves that preceded
+it.
+
+The pre-PR review raised the neighbouring half of this: `crew doctor` checks the
+protocol, the claude CLI flags, `~/.local/bin/crew`, directory modes and a
+shadowed skill, but never whether the only enforcement of the trust boundary is
+registered. Both halves are one check.
+
+Fix: `crew doctor` must verify that the guard is registered AND that the matcher
+covers every tool the hook can act on. Derive the required tool list FROM THE HOOK
+rather than restating it, so the two cannot drift: the hook already declares
+`FORBIDDEN_TOOLS` and `COMMAND_FIELDS`, and their union plus `Bash` is exactly
+what the matcher must deliver. A second hardcoded list in `doctor` would recreate
+the bug one layer up.
+
+Report distinctly, because the remedies differ:
+
+- no settings file, or no `PreToolUse` hook pointing at `crew-guard.py`: the
+  guard is not registered and nothing is enforced.
+- registered, but the matcher omits a tool the hook can act on: name the missing
+  tools. This is the dangerous case, because it looks armed.
+- the hook file named in settings does not exist or is not executable: a dangling
+  registration enforces nothing.
+
+Treat all three as FAIL rather than a warning. `doctor` is the design's
+fail-closed gate and the foreman skill already halts on a red preflight; a
+warning that can be scrolled past is exactly how a silent hole survives. Say what
+to do in each message, including that a hook change needs `/hooks` or a restart
+before it is live, which is already documented elsewhere.
+
+Be careful about two things. The matcher is a pattern, not a literal list, so
+decide how to test coverage honestly and say what your check cannot prove; an
+alternation is the form in use, but do not assume it is the only legal form.
+And `doctor` must not crash on a settings file that is absent, unreadable or not
+valid JSON, since a fresh machine has none: that is the not-registered case, not
+an exception.
+
+### Constraints
+
+Every existing test passes, a green run prints nothing, and each new test must
+fail if its behaviour is removed. Cover at minimum: fully covered matcher passes;
+a matcher missing one tool fails and names it; no settings file fails; a dangling
+hook path fails; malformed JSON fails rather than raising. Point the check at a
+settings path the tests control, so no test reads or writes the real file.
+Report the mutation per test. Do not run a real `crew dispatch`, no mutating herdr
+verb, do not touch a pane, and do not modify `~/.claude/settings.json` in this
+wave: it is already correct, and this check exists to verify it.
