@@ -3462,3 +3462,106 @@ settings path the tests control, so no test reads or writes the real file.
 Report the mutation per test. Do not run a real `crew dispatch`, no mutating herdr
 verb, do not touch a pane, and do not modify `~/.claude/settings.json` in this
 wave: it is already correct, and this check exists to verify it.
+
+---
+
+## Hardening wave 9
+
+The four defects left open after the pre-PR review, plus one piece of dead code.
+Each was re-confirmed in the current tree before being written down here.
+
+### W9-1 (Important): --type reviewer has no working path
+
+`find_member` matches on root and key and ignores type, so dispatching a reviewer
+at a key a live implementer holds returns exit 5. The foreman skill then tells the
+human to report the resume command rather than dispatching again, and that command
+resumes the implementer, so the review never happens. Both skills advertise
+`--type reviewer` as a working action.
+
+The other two routes are worse. Retiring the implementer and re-dispatching the
+ticket key goes back through setup, so every review costs another paid Opus setup
+session and another round of the human answering `/start-ticket`. Working around
+exit 5 with a slug creates a fresh branch off HEAD, so the reviewer is told not to
+change code in a worktree that does not contain the work, and it reviews nothing
+and reports done.
+
+Fix: make the crew member identity (root, key, type) rather than (root, key), so a
+reviewer can coexist with the implementer whose work it reviews. A reviewer at an
+existing key MUST reuse that key's existing worktree and MUST NOT go through
+setup, because the worktree already exists and the point of the reviewer is to
+read what is in it. So a reviewer dispatch on a key that already has a member is
+not a setup path at all, which also keeps it away from the artifact, and no
+second paid setup session is spent.
+
+Watch three knock-ons rather than discovering them later:
+
+- The per-key dispatch lock is keyed on the key alone. Leave it that way. Two
+  dispatches on one key serialising is correct even when their types differ.
+- The dispatch artifact is keyed on the key alone. A reviewer must not consume or
+  delete it, because the implementer's setup may still be legitimately pending.
+- The reviewer and the implementer now share one worktree, which is a real
+  hazard: two live sessions in one checkout. The reviewer contract already says
+  not to change code, and that is now load-bearing rather than advisory. Say so
+  in `crew-member/SKILL.md`, and give the reviewer a findings filename that
+  cannot collide with the implementer's work. The claim that a crew member writes
+  into "your own worktree" is false for a reviewer and must be corrected.
+
+If a reviewer is dispatched at a key with NO existing member, there is nothing to
+review. Refuse it and say why, rather than creating a worktree.
+
+### W9-2 (Important): a notification failure turns exit 5 into exit 3
+
+The duplicate refusal calls `mail_send` unguarded before `return 5`. That call
+makes a second herdr round trip and writes to disk, so a socket failure, a
+mailbox `OSError`, or a caller pane whose own key token disagrees turns the
+documented exit 5 into exit 3, after the "already dispatched" line has already
+printed. The foreman then follows the exit 3 branch, which is report and stop,
+instead of the exit 5 branch.
+
+Fix: the refusal's exit code must not depend on a side-effect notification.
+Contain the failure, report that the notification failed if it did, and still
+return 5. The same reasoning applies anywhere else an exit code is decided before
+a notification is sent; check for other instances rather than fixing only this
+one.
+
+### W9-3 (Important): a herdr response shape change is a traceback
+
+`split["result"]["pane"]["pane_id"]` and `tab["result"]["root_pane"]["pane_id"]`
+are chained raw, and `main` catches `HerdrError`, `CrewError`,
+`ValueError`/`IndexError` and `OSError`, but not `KeyError` or `TypeError`. So a
+response shape change exits 1, which is undocumented, with a traceback and a pane
+already created. The snapshot and schema readers already guard exactly this, so
+the gap is an inconsistency rather than a decision.
+
+Fix: read those two the way the snapshot reader already reads its fields, so a
+shape change becomes a `HerdrError` and exit 3 with a message naming what was
+missing. herdr is a pre-1.0 self-updating tool and this is the third defect
+caused by trusting its response shape, so prefer one helper over two rescues.
+
+### W9-4 (Important): the foreman skill states a falsehood about exit codes
+
+`foreman/SKILL.md` says "Exit codes are the same for every verb, so you can rely
+on them", then lists codes that are verb specific: 4 comes only from
+`crew mail ack`, and 5, 6 and 7 come only from `crew dispatch`. This file
+instructs a live agent, so as written it invites the foreman to expect a 7 from
+`crew peek`, which cannot happen, or a 5 from `nudge`.
+
+Fix: say which verb produces each code. Keep the codes that genuinely are
+universal, 0, 2 and 3, described as such.
+
+### W9-5 (Minor): dead code
+
+`repo_root_for` has no call site outside its own definition. A test documents it
+as deliberately retained. Either give it a caller or delete it and the test, and
+say which you chose and why: a helper kept alive only by its own test reads as
+used.
+
+### Constraints
+
+Every existing test passes, a green run prints nothing, and each new test must
+fail if its behaviour is removed. Report the mutation per test. Pay particular
+attention to W9-1's tests: identity changes touch `find_member`, `crew ls`, the
+exit 5 line and `crew retire`, so cover that an implementer and a reviewer on one
+key are listed and retired independently, and that a reviewer never triggers
+setup. Do not run a real `crew dispatch`, no mutating herdr verb, do not touch a
+pane, and do not modify `~/.claude/settings.json`.
