@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -22,6 +23,35 @@ HERDR_VERIFIED_PROTOCOLS = (17, 19)
 CREW_DIR = os.path.expanduser("~/.crew")
 MAILBOX = os.path.join(CREW_DIR, "mailbox.jsonl")
 CURSOR = os.path.join(CREW_DIR, "cursor")
+
+WATCHDOG_STATE_FILE = "watchdog.state"
+WATCHDOG_HEARTBEAT_FILE = "watchdog.heartbeat"
+WATCHDOG_LOCK_FILE = "watchdog.lock"
+
+# The watchdog's OWN vocabulary, deliberately separate from MAIL_STATES. The
+# reason an `alert` record exists at all is that a crew member cannot report
+# `blocked` about itself: it is mid-turn at a permission prompt and can run
+# nothing. Widening MAIL_STATES with these would hand a crew member the ability
+# to claim exactly the states only an outside observer can establish.
+WATCHDOG_STATES = ("blocked", "stalled", "dead")
+
+WATCHDOG_TICK_SECONDS = 30
+WATCHDOG_STALL_SECONDS = 900
+# No single tick may credit more than this much elapsed time towards a stall.
+# The tick is 30s and can be woken earlier, so a gap over two minutes means the
+# loop was NOT running: the laptop slept, the clock stepped, or the process was
+# stopped. Crediting that gap as time a crew member sat unchanged is how a lid
+# opening declares the whole fleet stalled at once, which is the same storm the
+# persisted state exists to prevent.
+WATCHDOG_MAX_STEP_SECONDS = 120
+# And a stall is never declared on a single observation.
+WATCHDOG_STALL_MIN_TICKS = 2
+WATCHDOG_HEARTBEAT_STALE_TICKS = 3
+# The process name a live Claude Code session presents. Measured on herdr 0.8.0:
+# `pane process-info` reports it with argv0 `claude` while `name` carries the
+# VERSION string ("2.1.228"), so matching on `name` would match a number that
+# changes with every Claude Code release.
+AGENT_PROCESS = "claude"
 
 DRY_RUN = False
 
@@ -262,6 +292,24 @@ def doctor():
         problems.append("%s is not mode 700" % CREW_DIR)
     if os.path.exists(MAILBOX) and oct(os.stat(MAILBOX).st_mode & 0o777) != oct(0o600):
         problems.append("%s is not mode 600" % MAILBOX)
+
+    # Fresh or absent-by-design passes; stale FAILS. Absent means the human
+    # chose to run no watchdog. Stale means one was started and has stopped
+    # reconciling, so the fleet has looked watched while nothing was.
+    age = heartbeat_age(time.time())
+    if age is None:
+        print("watchdog: not running, no heartbeat. Nothing detects a blocked, "
+              "stalled or dead crew member; that is a choice, not a fault.")
+    elif age > WATCHDOG_TICK_SECONDS * WATCHDOG_HEARTBEAT_STALE_TICKS:
+        problems.append(
+            "the watchdog heartbeat %s is %ds old, over %d ticks, so a watchdog "
+            "was started and has stopped reconciling. Nothing is detecting "
+            "blocked, stalled or dead crew members. Restart it with `crew "
+            "watchdog`, or delete that file if you meant to stop it."
+            % (watchdog_path(WATCHDOG_HEARTBEAT_FILE), int(age),
+               WATCHDOG_HEARTBEAT_STALE_TICKS))
+    else:
+        print("watchdog: alive, last reconcile %ds ago" % int(age))
 
     shadow = os.path.expanduser("~/.claude/skills/herdr.md")
     if os.path.exists(shadow):
@@ -647,7 +695,7 @@ def retire_handle(members, member):
     return member["key"]
 
 
-def render_ls(members, untagged, orphan_tabs=None):
+def render_ls(members, untagged, orphan_tabs=None, watchdog=None):
     counts = {"working": 0, "awaiting": 0, "blocked": 0, "recover": 0}
     for m in members:
         counts[m["bucket"]] += 1
@@ -655,6 +703,10 @@ def render_ls(members, untagged, orphan_tabs=None):
         counts["working"], counts["awaiting"], counts["blocked"])]
     if counts["recover"]:
         lines[0] += " / %d need recovery" % counts["recover"]
+    # Directly under the counts, not in a section at the bottom. A dead watchdog
+    # makes those counts mean less than they appear to, so it belongs where the
+    # foreman cannot read the load without reading it.
+    lines.extend(watchdog or [])
     lines.append("")
     for m in members:
         lines.append("  %-10s %-22s %-18s %-12s %s" % (
@@ -698,7 +750,8 @@ def cmd_ls(as_json):
         print(json.dumps(members, indent=2, sort_keys=True))
     else:
         print(render_ls(members, untagged_agents(snap),
-                        orphan_crew_tabs(snap)))
+                        orphan_crew_tabs(snap),
+                        watchdog_report(time.time())))
     return 0
 
 
@@ -957,10 +1010,587 @@ def mail_ack(seq):
     return 0
 
 
+def watchdog_alert(member, condition, msg):
+    """Append ONE `alert` record for one pane and one condition.
+
+    `alert`, never `report`. A report is a crew member's own claim about itself,
+    and blocked, stalled and dead are precisely the three states a crew member
+    cannot claim: it is stuck, and being stuck is the problem. So this does not
+    go through mail_send and its vocabulary is not MAIL_STATES.
+
+    Every string field is collapsed to one line for the same reason mail_send
+    collapses them. The foreman renders these in its terminal, and a value
+    carrying a newline reads as a second line crew printed."""
+    ensure_crew_dir()
+    if condition not in WATCHDOG_STATES:
+        raise CrewError("%r is not a watchdog condition; expected one of %s"
+                        % (condition, ", ".join(WATCHDOG_STATES)))
+    record = {
+        "v": 1,
+        "kind": "alert",
+        "ts": int(time.time()),
+        "key": member.get("key", ""),
+        "repo": member.get("repo", ""),
+        "pane": member.get("pane", ""),
+        "branch": member.get("branch", ""),
+        "state": condition,
+        "msg": msg,
+    }
+    for field, value in list(record.items()):
+        if isinstance(value, str):
+            record[field] = one_line(value)
+    if DRY_RUN:
+        print("would append to %s: %s"
+              % (MAILBOX, json.dumps(record, sort_keys=True)))
+        return record
+    with _locked(MAILBOX, "a+") as handle:
+        handle.seek(0)
+        entries, _ = read_entries(handle.readlines())
+        record["seq"] = next_seq(entries)
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(MAILBOX, 0o600)
+    return record
+
+
+def watchdog_notify(alerts):
+    """ONE notification per tick, naming the count.
+
+    During a fleet-wide quota exhaustion every crew member stalls at once, and
+    one notification per pane is how a signal worth having becomes noise the
+    human mutes. The mailbox still carries one record per pane.
+
+    Syntax measured against herdr 0.8.0: `herdr notification show <TITLE>
+    --body <TEXT>`. There is no pane argument, so the notification cannot carry
+    attribution and does not pretend to; the mailbox is where the detail is."""
+    counts = {}
+    for _, condition, _ in alerts:
+        counts[condition] = counts.get(condition, 0) + 1
+    body = ", ".join("%d %s" % (counts[c], c)
+                     for c in WATCHDOG_STATES if c in counts)
+    try:
+        herdr("notification", "show", "crew: %d alert(s)" % len(alerts),
+              "--body", "%s. Read them with crew mail unread." % body)
+    except HerdrError as exc:
+        print("watchdog: notification not shown (%s). The alerts are in the "
+              "mailbox regardless." % exc, file=sys.stderr)
+
+
+def watchdog_path(name):
+    """A watchdog file, resolved from CREW_DIR at CALL time.
+
+    MAILBOX and CURSOR are bound at import, and every test that touches them has
+    to remember to redirect each one by name. These are derived instead, so
+    redirecting CREW_DIR is enough and nothing in the watchdog can quietly read
+    or write the real ~/.crew from a test."""
+    return os.path.join(CREW_DIR, name)
+
+
+def read_watchdog_state(path=None):
+    """The persisted per-pane state, as {pane: {seq, revision, last_seen,
+    stalled_for, ticks, flags}}.
+
+    Persisted rather than held in memory for one specific reason: without it a
+    watchdog crash wipes every stall timer, and the restart declares every
+    running pane stalled at once.
+
+    Anything unreadable, whether the whole file or one entry, reads as ABSENT.
+    That is the safe direction and it is the whole handling of a corrupt or
+    truncated file: a pane missing from this map is NEWLY SEEN, and a newly seen
+    pane can never be stalled, so a damaged state file costs detection latency
+    and never produces a false alert. The same applies to a file written by an
+    older shape of this record.
+
+    Two fields differ from the design, and each replaces something that does not
+    survive contact with the machine:
+
+    - revision sits beside state_change_seq. Measured on herdr 0.8.0, the seq
+      moves only when an agent changes STATUS, so an agent working productively
+      for an hour holds one seq the whole time and a seq-only test would call it
+      stalled. revision tracks terminal output, so requiring both to be frozen
+      is the difference between "nothing is happening at all" and "no status
+      transition happened".
+    - stalled_for accumulates, rather than the design's `now - first_seen_ts`.
+      A subtraction credits wall clock that passed while the watchdog was not
+      running, so a laptop resuming after eight hours asleep would report every
+      working pane stalled in one tick."""
+    path = path or watchdog_path(WATCHDOG_STATE_FILE)
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (IOError, OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for pane, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            out[str(pane)] = {
+                "seq": int(entry["seq"]),
+                "revision": int(entry["revision"]),
+                "last_seen": float(entry["last_seen"]),
+                "stalled_for": float(entry["stalled_for"]),
+                "ticks": int(entry.get("ticks", 1)),
+                "flags": [str(f) for f in entry.get("flags") or []],
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def write_watchdog_state(state, path=None):
+    """Atomic. A partial write is how this file becomes the corrupt one
+    read_watchdog_state has to tolerate, and the loop writes it every tick, so
+    the odds of being killed mid-write are not small."""
+    path = path or watchdog_path(WATCHDOG_STATE_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(state, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def touch_heartbeat(now, path=None):
+    """Record that a reconcile COMPLETED. The epoch is written into the file
+    rather than left to mtime so a test can drive it from an injected clock and
+    so a filesystem with coarse timestamps cannot blur two ticks together."""
+    path = path or watchdog_path(WATCHDOG_HEARTBEAT_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write("%d\n" % int(now))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def heartbeat_age(now, path=None):
+    """Seconds since the watchdog last completed a reconcile, or None when there
+    is no heartbeat at all.
+
+    Absent is NOT stale. Running no watchdog is a legitimate configuration and
+    the two need different messages: absent means nothing was ever watching,
+    stale means something was and has stopped, which is the worse of the two
+    because the fleet looked watched.
+
+    A heartbeat whose contents cannot be read falls back to its mtime rather
+    than reading as absent, so a truncated write still reports an age."""
+    path = path or watchdog_path(WATCHDOG_HEARTBEAT_FILE)
+    try:
+        with open(path) as handle:
+            stamp = int(handle.read().strip() or 0)
+    except (IOError, OSError):
+        return None
+    except ValueError:
+        try:
+            stamp = int(os.stat(path).st_mtime)
+        except OSError:
+            return None
+    age = now - stamp
+    # A clock that stepped backwards reads as fresh rather than as a negative
+    # age. Declaring the watchdog stale because the clock moved would be a
+    # false alarm about the thing that reports false alarms.
+    return 0.0 if age < 0 else float(age)
+
+
+def watchdog_report(now, tick=None, path=None):
+    """The line `crew ls` prints about the watchdog itself.
+
+    Nothing watches the watchdog, so this does. A watchdog that has died looks
+    exactly like a healthy fleet from the load table alone, which is the failure
+    the whole component exists to prevent, so this line is printed whether or
+    not there is anything else to report."""
+    tick = tick or WATCHDOG_TICK_SECONDS
+    age = heartbeat_age(now, path)
+    if age is None:
+        return ["watchdog: NOT RUNNING (no heartbeat). Nothing detects a "
+                "blocked, stalled or dead crew member. Start one in a pane "
+                "with: crew watchdog"]
+    if age > tick * WATCHDOG_HEARTBEAT_STALE_TICKS:
+        return ["watchdog: STALE, last reconcile %ds ago, over %d ticks. It is "
+                "running blind or gone, so treat blocked, stalled and dead as "
+                "unmonitored." % (int(age), WATCHDOG_HEARTBEAT_STALE_TICKS)]
+    return ["watchdog: alive, last reconcile %ds ago" % int(age)]
+
+
+def watchdog_members(snap):
+    """Crew members carrying the two agent fields the stall test needs.
+
+    crew_members deliberately does not carry state_change_seq or revision: it
+    feeds `crew ls --json`, which the spec's own drift check reads, and every
+    other caller compares members for identity rather than for freshness. So
+    the watchdog joins them on here instead of widening that record.
+
+    An untagged pane is not crew by definition, so only what crew_members
+    returns is the watchdog's business."""
+    agents = dict((a["pane_id"], a) for a in snap["agents"])
+    out = []
+    for member in crew_members(snap):
+        agent = agents.get(member["pane"], {})
+        row = dict(member)
+        row["seq"] = int(agent.get("state_change_seq") or 0)
+        row["revision"] = int(agent.get("revision") or 0)
+        out.append(row)
+    return out
+
+
+def pane_agent_alive(pane_id, agent=AGENT_PROCESS):
+    """True, False, or None when herdr cannot say.
+
+    None is not False, and the difference is the whole point. `dead` is the one
+    condition with no second opinion behind it, so an unreadable answer must
+    never be reported as a dead crew member: a false dead alert is how the human
+    learns to ignore the watchdog.
+
+    Measured on herdr 0.8.0: `herdr pane process-info --pane <id>` works. The
+    spec recorded that `--pane`, `--target`, `--id` and a positional were all
+    rejected on 2026-08-10 and that a direct socket call might be needed; that
+    gap is closed, and the CLI is used rather than the socket. On an older herdr
+    the call fails, which returns None here and emits nothing.
+
+    The match is on argv0 and argv[0], never on `name`: a live session reports
+    argv0 `claude` while `name` carries the Claude Code version string, so
+    matching name would match a number that changes every release. cmdline is
+    the third fallback because the schema declares all three nullable."""
+    try:
+        payload = herdr("pane", "process-info", "--pane", pane_id,
+                        read_only=True)
+    except HerdrError:
+        return None
+    info = payload.get("result") if isinstance(payload, dict) else None
+    info = info.get("process_info") if isinstance(info, dict) else None
+    processes = info.get("foreground_processes") if isinstance(info, dict) else None
+    if not isinstance(processes, list) or not processes:
+        # An empty list is not proof the agent is gone: herdr reports no
+        # foreground process for a pane it cannot inspect either.
+        return None
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        argv = process.get("argv") if isinstance(process.get("argv"), list) else []
+        cmdline = str(process.get("cmdline") or "").split()
+        for candidate in (process.get("argv0"),
+                          argv[0] if argv else None,
+                          cmdline[0] if cmdline else None):
+            if candidate and os.path.basename(str(candidate)) == agent:
+                return True
+    return False
+
+
+def watchdog_message(member, condition, stalled_for):
+    """One line, no command output, no paths beyond the pane id. These records
+    are permanent and get digested into a git-tracked project log."""
+    if condition == "blocked":
+        return ("herdr reports this pane blocked, which a crew member cannot "
+                "report about itself. Look at pane %s." % member["pane"])
+    if condition == "stalled":
+        return ("no agent state change and no terminal output for %d minutes "
+                "while herdr still reports it working. Peek it before assuming "
+                "a quota stall." % int(stalled_for // 60))
+    return ("herdr still lists an agent for this pane but no %s process runs in "
+            "it, so the session is gone while the pane reads as idle."
+            % AGENT_PROCESS)
+
+
+def watchdog_tick(members, state, now, own_pane, stall_seconds, liveness):
+    """Decide, from a reconciled snapshot, what is newly wrong. It mutates
+    `state` and returns [(member, condition, msg)]; it performs no I/O and reads
+    no clock, which is what makes every rule below testable directly.
+
+    The rules each exist because of a way this goes wrong:
+
+    - The watchdog never alerts on its OWN pane. It is the one pane guaranteed
+      to be sitting in a loop rather than working.
+    - A pane absent from `state` is NEWLY SEEN and cannot be stalled. Both its
+      accumulated time and its tick count say so, so a wiped or corrupt state
+      file costs latency rather than producing a storm of false stalls.
+    - Occupancy is read off `member["agent"]`, which pane_has_agent derives from
+      absence in the snapshot's agent LIST. An agent_status of `unknown` means
+      an agent herdr cannot classify, not an absent one, so a status check here
+      would call every unclassifiable session dead.
+    - `dead` suppresses the other two. A dead session's status is frozen at
+      whatever it last was, so reporting it as stalled as well is noise about
+      one fact.
+    - A flag is cleared as soon as its condition stops holding, so one stall
+      produces one alert and a recurrence later produces another."""
+    alerts = []
+    seen = set()
+    for member in members:
+        pane = member["pane"]
+        if own_pane and pane == own_pane:
+            continue
+        if not member["agent"]:
+            # No agent occupies it. `crew ls` already reports that pane as
+            # retirable and it is the ordinary end state of a finished crew
+            # member, so alerting here would fire on every normal completion.
+            continue
+        seen.add(pane)
+        fresh = {"seq": member["seq"], "revision": member["revision"],
+                 "last_seen": now, "stalled_for": 0.0, "ticks": 1, "flags": []}
+        entry = state.get(pane)
+        if entry is None:
+            entry = fresh
+            state[pane] = entry
+        elif (entry["seq"] != member["seq"]
+                or entry["revision"] != member["revision"]):
+            entry.update(fresh)
+        else:
+            step = now - entry["last_seen"]
+            # Negative means the clock stepped back and nothing is owed;
+            # over the cap means the loop was not running for that gap.
+            step = 0.0 if step < 0 else min(step, WATCHDOG_MAX_STEP_SECONDS)
+            entry["stalled_for"] += step
+            entry["last_seen"] = now
+            entry["ticks"] += 1
+
+        if liveness(pane) is False:
+            conditions = ["dead"]
+        else:
+            conditions = []
+            if member["status"] == "blocked":
+                conditions.append("blocked")
+            elif (member["status"] == "working"
+                    and entry["stalled_for"] >= stall_seconds
+                    and entry["ticks"] >= WATCHDOG_STALL_MIN_TICKS):
+                conditions.append("stalled")
+        for condition in conditions:
+            if condition in entry["flags"]:
+                continue
+            entry["flags"].append(condition)
+            alerts.append((member, condition,
+                           watchdog_message(member, condition,
+                                            entry["stalled_for"])))
+        entry["flags"] = [f for f in entry["flags"] if f in conditions]
+
+    # A snapshot that parsed is the authority on which panes exist, so anything
+    # else is gone and its timer would otherwise accumulate forever. A snapshot
+    # that did NOT parse never reaches here: watchdog_pass skips the tick and
+    # keeps every timer.
+    for gone in [p for p in state if p not in seen]:
+        del state[gone]
+    return alerts
+
+
+def watchdog_pass(own_pane, stall_seconds, now=None, liveness=None,
+                  state_path=None):
+    """One reconcile: read herdr, decide, record, notify. Returns
+    (panes, alerts, ok).
+
+    ok is False when herdr could not be read, and the caller must NOT advance
+    the heartbeat then. A heartbeat that keeps ticking while nothing can be
+    decided makes `crew ls` report a healthy watchdog that is in fact blind,
+    which is the exact failure this component exists to prevent.
+
+    The same fail-closed assertions `crew ls` uses, for the same reason: under
+    schema drift crew_members returns nothing, and a watchdog watching an empty
+    fleet is indistinguishable from a quiet one.
+
+    The mailbox record is written BEFORE the state file. A duplicate alert after
+    a crash is a nuisance; a flag persisted for an alert that was never recorded
+    is a condition nobody is ever told about. An append that fails drops its
+    flag so the next tick tries again."""
+    now = time.time() if now is None else now
+    liveness = pane_agent_alive if liveness is None else liveness
+    try:
+        defs = schema_defs()
+        assert_schema_declares(defs)
+        snap = snapshot()
+        assert_snapshot_shape(snap, defs)
+    except (CrewError, HerdrError) as exc:
+        print("watchdog: herdr is not readable (%s), so nothing was decided "
+              "this tick, the heartbeat is NOT advanced and every stall timer "
+              "is kept." % exc, file=sys.stderr)
+        return [], [], False
+
+    members = watchdog_members(snap)
+    state = read_watchdog_state(state_path)
+    alerts = watchdog_tick(members, state, now, own_pane, stall_seconds,
+                           liveness)
+    recorded = []
+    for member, condition, msg in alerts:
+        try:
+            watchdog_alert(member, condition, msg)
+        except (CrewError, HerdrError, OSError, ValueError) as exc:
+            print("watchdog: %s on %s was NOT recorded in the mailbox (%s), so "
+                  "it will be retried next tick"
+                  % (condition, member["pane"], exc), file=sys.stderr)
+            flags = state.get(member["pane"], {}).get("flags")
+            if flags and condition in flags:
+                flags.remove(condition)
+            continue
+        recorded.append((member, condition, msg))
+    write_watchdog_state(state, state_path)
+    if recorded:
+        watchdog_notify(recorded)
+    return [m["pane"] for m in members], recorded, True
+
+
+def _json_frame(line):
+    try:
+        frame = json.loads(line.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return frame if isinstance(frame, dict) else None
+
+
+def _await_status_event(path, pane_ids, deadline):
+    """True when herdr reports an agent status change on one of these panes
+    before the deadline. Never raises."""
+    request = {"id": "crew-watchdog", "method": "events.subscribe",
+               "params": {"subscriptions": [
+                   {"type": "pane.agent_status_changed", "pane_id": pane}
+                   for pane in sorted(set(pane_ids))]}}
+    conn = None
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(max(0.1, deadline - time.monotonic()))
+        conn.connect(path)
+        conn.sendall((json.dumps(request) + "\n").encode())
+        buffered = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            conn.settimeout(remaining)
+            chunk = conn.recv(65536)
+            if not chunk:
+                return False
+            buffered += chunk
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                frame = _json_frame(line)
+                if frame is None:
+                    continue
+                # A pane that closed between the snapshot and this call answers
+                # pane_not_found, which ends the subscription rather than the
+                # watchdog: the next snapshot drops that pane.
+                if frame.get("error"):
+                    return False
+                if frame.get("event") == "pane_agent_status_changed":
+                    return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def wait_for_status_change(pane_ids, timeout_s, socket_path=None):
+    """Block until a crew pane changes agent status, or the tick elapses. True
+    if an event woke it.
+
+    The plan specified `events.wait --match pane.agent_status_changed`. Measured
+    against herdr 0.8.0, that interface does not exist in any spelling:
+
+    - There is NO `herdr events` CLI subcommand at all. `herdr api` exposes
+      `snapshot` and `schema` only, and `herdr events --help` prints the
+      top-level help and exits 0, so an unverified call would have looked
+      like it worked.
+    - `events.wait` and `events.subscribe` are socket methods. For
+      `pane_agent_status_changed`, `events.wait` REQUIRES both a pane_id and the
+      exact agent_status to wait for, so it can only answer "tell me when THIS
+      pane reaches THIS state"; the subscription form requires a pane_id too.
+      Both were confirmed live: omitting pane_id returns
+      `invalid_request: missing field pane_id`.
+
+    So there is no fleet-wide status stream to wait on, and this subscribes per
+    pane to the panes the last snapshot already showed. It is only an
+    accelerator: the snapshot reconcile is the authority, a stall is the ABSENCE
+    of events and could never be waited for, and every failure here degrades to
+    sleeping out the tick. A watchdog whose wait raises stops watching, which is
+    the failure this component exists to prevent."""
+    deadline = time.monotonic() + timeout_s
+    woken = False
+    path = socket_path or os.environ.get("HERDR_SOCKET_PATH", "")
+    if path and pane_ids:
+        woken = _await_status_event(path, pane_ids, deadline)
+    remaining = deadline - time.monotonic()
+    if not woken and remaining > 0:
+        time.sleep(remaining)
+    return woken
+
+
+def _claim_watchdog_lock(path=None):
+    """One watchdog, or none.
+
+    Two would each alert on the same condition, and a doubled alert during a
+    fleet-wide stall is exactly the noise that gets the watchdog ignored. The
+    lock is non-blocking so a second invocation says so and exits, rather than
+    waiting on a pane that never ends."""
+    path = path or watchdog_path(WATCHDOG_LOCK_FILE)
+    handle = open(path, "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        handle.close()
+        raise CrewError(
+            "another crew watchdog already holds %s. One is enough, and two "
+            "would alert twice on every condition. Use the pane that is "
+            "already running it." % path)
+    return handle
+
+
+def _watchdog_interval(flag, value, default):
+    if value is None:
+        return default
+    seconds = int(value)
+    if seconds < 1:
+        raise CrewError("%s must be at least 1 second, got %r" % (flag, value))
+    return seconds
+
+
+def cmd_watchdog(once=False, tick=None, stall=None):
+    """The long-lived loop. One pane, no agent.
+
+    It exists because three failure modes share one signal and none can be
+    self-reported: blocked at a permission prompt, stalled while nominally
+    working, and dead. A blocked crew member cannot tell anyone it is blocked.
+
+    It cannot be a bare blocking wait, because a stall is the ABSENCE of events
+    and a bare wait would never fire for the case it most needs to catch. So the
+    tick is bounded and every tick reconciles against a full snapshot, which is
+    also what makes a dropped event, a herdr restart and the gap before the
+    watchdog started all non-fatal."""
+    tick = _watchdog_interval("--tick", tick, WATCHDOG_TICK_SECONDS)
+    stall = _watchdog_interval("--stall", stall, WATCHDOG_STALL_SECONDS)
+    ensure_crew_dir()
+    guard = _claim_watchdog_lock()
+    own = calling_pane()
+    print("watchdog: tick %ds, stall %ds, own pane %s. Alerts are appended to "
+          "%s as kind=alert; the foreman reads them with crew mail unread."
+          % (tick, stall, own or "(not in a herdr pane)", MAILBOX))
+    if not own:
+        print("watchdog: HERDR_PANE_ID is unset, so this cannot tell which pane "
+              "is its own. Nothing is excluded from the fleet it watches. Run "
+              "it inside a herdr pane.", file=sys.stderr)
+    passes = 0
+    try:
+        while True:
+            passes += 1
+            panes, alerts, ok = watchdog_pass(own, stall)
+            if ok:
+                touch_heartbeat(time.time())
+                print("watchdog: tick %d, %d crew pane(s), %d new alert(s)"
+                      % (passes, len(panes), len(alerts)))
+            if once:
+                return 0 if ok else 3
+            wait_for_status_change(panes, tick)
+    finally:
+        guard.close()
+
+
 def _run(args):
     if not args:
         print("usage: crew <doctor|claim-foreman|ls|dispatch|peek|nudge|retire|"
-              "mail> [args]", file=sys.stderr)
+              "mail|watchdog> [args]", file=sys.stderr)
         return 2
     verb = args[0]
     if verb == "doctor":
@@ -1013,6 +1643,17 @@ def _run(args):
                   file=sys.stderr)
             return 2
         return cmd_retire(require_positional(args[1], "retire name"))
+    if verb == "watchdog":
+        opts = {"--tick": None, "--stall": None}
+        # --once is a bare flag, so it is taken out before take_flag walks the
+        # rest looking for `--flag value` pairs.
+        rest = [a for a in args[1:] if a != "--once"]
+        while rest:
+            flag, value, rest = take_flag(rest, tuple(opts))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            opts[flag] = value
+        return cmd_watchdog("--once" in args, opts["--tick"], opts["--stall"])
     if verb == "mail":
         sub = args[1] if len(args) > 1 else ""
         if sub == "send":

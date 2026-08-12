@@ -3,9 +3,12 @@ import contextlib
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -3886,6 +3889,7 @@ class TestLsPassesOrphanTabsThrough(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "snapshot", return_value=snap), \
+             _wd_dir(), \
              contextlib.redirect_stdout(out):
             self.assertEqual(crew.main(["ls"]), 0)
         self.assertIn("crew retire wV:tC", out.getvalue())
@@ -3896,6 +3900,7 @@ class TestLsPassesOrphanTabsThrough(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "snapshot", return_value=snap), \
+             _wd_dir(), \
              contextlib.redirect_stdout(out):
             self.assertEqual(crew.main(["ls", "--json"]), 0)
         self.assertEqual(len(json.loads(out.getvalue())), 1)
@@ -3917,6 +3922,7 @@ class TestOneKeyWithTwoMembersIsListedAndRetiredIndependently(
         out = io.StringIO()
         with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "snapshot", return_value=snap), \
+             _wd_dir(), \
              contextlib.redirect_stdout(out):
             self.assertEqual(crew.main(list(args)), 0)
         return out.getvalue()
@@ -4178,6 +4184,859 @@ class TestAnUnrecordableTokenIsRefusedBeforeAnythingIsCreated(unittest.TestCase)
                               "b" * (crew.TOKEN_VALUE_MAX + 1), "/root")
             fake.assert_not_called()
         self.assertIn("branch", str(ctx.exception))
+
+
+WD_TOKENS = {"crew": "true", "v": "1", "key": "fandevx-4001",
+             "repo": "fanapp-terraform", "type": "implementer",
+             "branch": "FANDEVX-4001-x", "root": "/repo",
+             "dispatched": "1786000000"}
+
+
+def _wd_snap(specs):
+    """A snapshot of crew panes, from [(pane, status, seq, revision)].
+
+    `status` of None means NO agent occupies that pane, which is the only sound
+    signal for an agent-less pane and is deliberately not a status value: every
+    status, `unknown` included, means an agent is present."""
+    agents, panes = [], []
+    for index, (pane, status, seq, revision) in enumerate(specs):
+        tokens = dict(WD_TOKENS, key="fandevx-40%02d" % index)
+        panes.append(_full_pane(pane, tokens, tab="wQ:t%d" % index))
+        if status is not None:
+            agent = _full_agent(pane, status)
+            agent["state_change_seq"] = seq
+            agent["revision"] = revision
+            agents.append(agent)
+    return _snap(agents, panes)
+
+
+def _wd_members(specs):
+    return crew.watchdog_members(_wd_snap(specs))
+
+
+def _alive(_pane):
+    return True
+
+
+def _unknown_liveness(_pane):
+    return None
+
+
+def _gone(_pane):
+    return False
+
+
+def _tick(members, state, now, own=None, stall=900, liveness=_alive):
+    return crew.watchdog_tick(members, state, now, own, stall, liveness)
+
+
+def _conditions(alerts):
+    return [condition for _, condition, _ in alerts]
+
+
+class _FakeClock(object):
+    """A clock the test advances, so no test waits on wall time. Mirrors the
+    three time functions crew uses."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+        self.slept = []
+
+    def time(self):
+        return self.now
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+@contextlib.contextmanager
+def _wd_dir():
+    """A private CREW_DIR. Every watchdog path derives from it at call time, so
+    this is the whole redirection and no test touches the real ~/.crew."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(crew, "CREW_DIR", tmp), \
+             mock.patch.object(crew, "MAILBOX",
+                               os.path.join(tmp, "mailbox.jsonl")):
+            yield tmp
+
+
+@contextlib.contextmanager
+def _fake_event_socket(frames, record=None):
+    """A stand-in for herdr's socket.
+
+    It accepts one connection, keeps whatever was sent, writes `frames` as
+    newline-delimited JSON, then blocks on a read until the client goes away.
+    Waiting on the client rather than on a timer is what keeps this test free of
+    a real sleep. Every case must therefore end with a frame the reader acts on,
+    or the reader would sit on its own socket timeout."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "herdr.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            try:
+                request = conn.recv(65536)
+                if record is not None:
+                    record.append(request.decode().strip())
+                for frame in frames:
+                    conn.sendall((json.dumps(frame) + "\n").encode())
+                conn.recv(65536)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=serve)
+        thread.daemon = True
+        thread.start()
+        try:
+            yield path
+        finally:
+            server.close()
+            thread.join(timeout=5)
+
+
+class TestWatchdogNeverAlertsOnItsOwnPane(unittest.TestCase):
+    """Its own pane is the one pane guaranteed to be sitting in a loop rather
+    than working, and it is the pane most likely to be tagged by hand."""
+
+    def test_its_own_blocked_pane_produces_nothing(self):
+        state = {}
+        alerts = _tick(_wd_members([("wV:pDog", "blocked", 5, 5)]), state,
+                       1000.0, own="wV:pDog")
+        self.assertEqual(alerts, [])
+        self.assertEqual(state, {})
+
+    def test_another_pane_in_the_same_state_does_alert(self):
+        # The control. Without it the refusal above passes with the whole
+        # blocked branch deleted.
+        alerts = _tick(_wd_members([("wV:pCrew", "blocked", 5, 5)]), {},
+                       1000.0, own="wV:pDog")
+        self.assertEqual(_conditions(alerts), ["blocked"])
+
+
+class TestBlockedAlertsOnceNotOnEveryEvent(unittest.TestCase):
+    """`blocked` is the one condition detectable only from agent_status, and the
+    watchdog sees the same status on every tick for as long as it holds."""
+
+    def test_three_ticks_at_blocked_produce_one_alert(self):
+        members = _wd_members([("wV:pC", "blocked", 5, 5)])
+        state = {}
+        emitted = []
+        for step in range(3):
+            emitted += _tick(members, state, 1000.0 + step * 30)
+        self.assertEqual(_conditions(emitted), ["blocked"])
+
+    def test_a_block_that_clears_and_returns_alerts_again(self):
+        state = {}
+        first = _tick(_wd_members([("wV:pC", "blocked", 5, 5)]), state, 1000.0)
+        _tick(_wd_members([("wV:pC", "working", 6, 5)]), state, 1030.0)
+        second = _tick(_wd_members([("wV:pC", "blocked", 7, 5)]), state, 1060.0)
+        self.assertEqual(_conditions(first + second), ["blocked", "blocked"])
+
+    def test_the_alert_names_the_pane_to_look_at(self):
+        alerts = _tick(_wd_members([("wV:pC", "blocked", 5, 5)]), {}, 1000.0)
+        self.assertIn("wV:pC", alerts[0][2])
+
+
+class TestStalledOnlyAfterItsThreshold(unittest.TestCase):
+    def test_just_under_the_threshold_says_nothing(self):
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        state = {}
+        _tick(members, state, 1000.0)
+        self.assertEqual(_tick(members, state, 1060.0), [])
+
+    def test_over_the_threshold_alerts_exactly_once(self):
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        state = {}
+        now = 1000.0
+        _tick(members, state, now)
+        emitted = []
+        for _ in range(20):
+            now += 60
+            emitted += _tick(members, state, now)
+        self.assertEqual(_conditions(emitted), ["stalled"])
+
+    def test_terminal_output_alone_resets_the_timer(self):
+        # Measured on herdr 0.8.0: state_change_seq moves only on a STATUS
+        # change, so a productively working agent holds one seq for its whole
+        # task. Only revision distinguishes it from a quota stall.
+        state = {}
+        now = 1000.0
+        _tick(_wd_members([("wV:pC", "working", 5, 5)]), state, now)
+        for step in range(20):
+            now += 60
+            members = _wd_members([("wV:pC", "working", 5, 6 + step)])
+            self.assertEqual(_tick(members, state, now), [], "tick %d" % step)
+
+    def test_an_idle_pane_is_never_stalled(self):
+        members = _wd_members([("wV:pC", "idle", 5, 5)])
+        state = {}
+        now = 1000.0
+        _tick(members, state, now)
+        for _ in range(20):
+            now += 60
+            self.assertEqual(_tick(members, state, now), [])
+
+    def test_the_message_names_the_minutes_not_a_command(self):
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        state = {}
+        now = 1000.0
+        _tick(members, state, now)
+        emitted = []
+        for _ in range(20):
+            now += 60
+            emitted += _tick(members, state, now)
+        self.assertIn("minutes", emitted[0][2])
+        self.assertEqual(emitted[0][2], crew.one_line(emitted[0][2]))
+
+
+class TestAPaneNeverSeenIsNotStalled(unittest.TestCase):
+    """A crash wipes every stall timer, so the restart must not read an absent
+    pane as one that has sat unchanged since the beginning of time."""
+
+    def test_the_first_sight_of_a_pane_records_it_and_says_nothing(self):
+        state = {}
+        alerts = _tick(_wd_members([("wV:pC", "working", 5, 5)]), state,
+                       1_000_000.0)
+        self.assertEqual(alerts, [])
+        self.assertEqual(state["wV:pC"]["stalled_for"], 0.0)
+        self.assertEqual(state["wV:pC"]["ticks"], 1)
+
+    def test_a_restart_does_not_declare_every_running_pane_stalled(self):
+        members = _wd_members([("wV:pA", "working", 5, 5),
+                               ("wV:pB", "working", 6, 7),
+                               ("wV:pC", "working", 7, 9)])
+        # The state file is gone, which is exactly what a crash leaves, and the
+        # clock is far past any threshold.
+        alerts = _tick(members, {}, 9_999_999.0)
+        self.assertEqual(alerts, [])
+
+    def test_a_pane_that_left_is_dropped_from_the_state(self):
+        state = {}
+        _tick(_wd_members([("wV:pA", "working", 5, 5),
+                           ("wV:pB", "working", 6, 7)]), state, 1000.0)
+        self.assertEqual(sorted(state), ["wV:pA", "wV:pB"])
+        _tick(_wd_members([("wV:pA", "working", 5, 5)]), state, 1030.0)
+        self.assertEqual(sorted(state), ["wV:pA"])
+
+
+class TestAGapTheLoopDidNotRunCannotProduceAStall(unittest.TestCase):
+    """The stall timer is wall clock because that is the only clock that
+    survives a restart, and a laptop that slept for hours advances it without
+    the loop running at all."""
+
+    def test_one_tick_after_eight_hours_asleep_credits_only_the_cap(self):
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        state = {}
+        _tick(members, state, 1000.0)
+        alerts = _tick(members, state, 1000.0 + 8 * 3600)
+        self.assertEqual(alerts, [])
+        self.assertEqual(state["wV:pC"]["stalled_for"],
+                         float(crew.WATCHDOG_MAX_STEP_SECONDS))
+
+    def test_a_clock_that_stepped_backwards_credits_nothing(self):
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        state = {}
+        _tick(members, state, 1000.0)
+        _tick(members, state, 400.0)
+        self.assertEqual(state["wV:pC"]["stalled_for"], 0.0)
+
+    def test_a_single_observation_is_never_enough(self):
+        # Loaded state whose accumulated time already exceeds the threshold,
+        # but which this watchdog has observed only once.
+        state = {"wV:pC": {"seq": 5, "revision": 5, "last_seen": 1000.0,
+                           "stalled_for": 5000.0, "ticks": 0, "flags": []}}
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        self.assertEqual(_tick(members, state, 1000.0), [])
+
+
+class TestDeadNeedsProofNotAbsence(unittest.TestCase):
+    def test_a_pane_that_lists_an_agent_but_runs_none_is_dead(self):
+        alerts = _tick(_wd_members([("wV:pC", "idle", 5, 5)]), {}, 1000.0,
+                       liveness=_gone)
+        self.assertEqual(_conditions(alerts), ["dead"])
+
+    def test_it_alerts_once_and_not_on_every_tick(self):
+        members = _wd_members([("wV:pC", "idle", 5, 5)])
+        state = {}
+        emitted = []
+        for step in range(3):
+            emitted += _tick(members, state, 1000.0 + step * 30,
+                             liveness=_gone)
+        self.assertEqual(_conditions(emitted), ["dead"])
+
+    def test_an_unreadable_process_list_emits_nothing(self):
+        # None is not False. `dead` has no second opinion behind it, so an
+        # unreadable answer must never be reported as a dead crew member.
+        alerts = _tick(_wd_members([("wV:pC", "idle", 5, 5)]), {}, 1000.0,
+                       liveness=_unknown_liveness)
+        self.assertEqual(alerts, [])
+
+    def test_an_unknown_agent_status_is_still_an_agent_to_judge(self):
+        # Measured and recorded in the plan: `unknown` is an agent herdr cannot
+        # classify, not an absent one. Occupancy is read off the agent LIST, so
+        # a session herdr cannot classify is still watched, and skipping it on
+        # the status would leave the least legible pane in the fleet unwatched.
+        alerts = _tick(_wd_members([("wV:pC", "unknown", 5, 5)]), {}, 1000.0,
+                       liveness=_gone)
+        self.assertEqual(_conditions(alerts), ["dead"])
+
+    def test_an_unknown_status_on_a_live_process_is_not_a_condition(self):
+        alerts = _tick(_wd_members([("wV:pC", "unknown", 5, 5)]), {}, 1000.0)
+        self.assertEqual(alerts, [])
+
+    def test_a_pane_with_no_agent_at_all_is_left_to_crew_ls(self):
+        # crew ls already proposes these as retirable, and it is the ordinary
+        # end state of a finished crew member.
+        state = {}
+        alerts = _tick(_wd_members([("wV:pC", None, 0, 0)]), state, 1000.0,
+                       liveness=_gone)
+        self.assertEqual(alerts, [])
+        self.assertEqual(state, {})
+
+    def test_dead_suppresses_stalled(self):
+        members = _wd_members([("wV:pC", "working", 5, 5)])
+        state = {}
+        now = 1000.0
+        _tick(members, state, now, liveness=_gone)
+        emitted = []
+        for _ in range(20):
+            now += 60
+            emitted += _tick(members, state, now, liveness=_gone)
+        self.assertEqual(_conditions(emitted), [])
+
+
+def _process_info(processes):
+    return {"result": {"process_info": {"pane_id": "wV:pC",
+                                        "foreground_processes": processes}}}
+
+
+class TestPaneAgentAlive(unittest.TestCase):
+    """The liveness read itself. Measured against herdr 0.8.0."""
+
+    def _alive(self, payload):
+        with mock.patch.object(crew, "herdr", return_value=payload):
+            return crew.pane_agent_alive("wV:pC")
+
+    def test_argv0_claude_is_alive(self):
+        self.assertIs(self._alive(_process_info(
+            [{"pid": 1, "name": "2.1.228", "argv0": "claude",
+              "argv": ["claude", "-r"], "cmdline": "claude -r"}])), True)
+
+    def test_an_absolute_argv0_still_matches(self):
+        self.assertIs(self._alive(_process_info(
+            [{"pid": 1, "name": "2.1.228",
+              "argv0": "/opt/homebrew/bin/claude"}])), True)
+
+    def test_the_version_string_in_name_is_not_what_is_matched(self):
+        # `name` carries the Claude Code VERSION, so matching it would match a
+        # number that changes every release.
+        self.assertIs(self._alive(_process_info(
+            [{"pid": 1, "name": "2.1.228", "argv0": "bun",
+              "cmdline": "bun run mcp-server.ts"}])), False)
+
+    def test_cmdline_is_the_last_fallback(self):
+        self.assertIs(self._alive(_process_info(
+            [{"pid": 1, "name": "2.1.228", "cmdline": "claude -r"}])), True)
+
+    def test_an_empty_process_list_is_unknown_not_dead(self):
+        self.assertIsNone(self._alive(_process_info([])))
+
+    def test_a_herdr_error_is_unknown_not_dead(self):
+        # An older herdr rejects --pane outright, which must emit nothing.
+        with mock.patch.object(crew, "herdr",
+                               side_effect=HerdrError("unexpected argument")):
+            self.assertIsNone(crew.pane_agent_alive("wV:pC"))
+
+    def test_an_unshaped_response_is_unknown_not_dead(self):
+        self.assertIsNone(self._alive({"result": {}}))
+
+    def test_the_read_is_marked_read_only_so_dry_run_still_answers(self):
+        with mock.patch.object(crew, "herdr",
+                               return_value=_process_info([])) as fake:
+            crew.pane_agent_alive("wV:pC")
+        self.assertTrue(fake.call_args[1].get("read_only"))
+
+
+class TestWatchdogStateSurvivesACorruptFile(unittest.TestCase):
+    def test_a_truncated_file_reads_as_empty(self):
+        with _wd_dir() as tmp:
+            path = os.path.join(tmp, "watchdog.state")
+            with open(path, "w") as handle:
+                handle.write('{"wV:pC": {"seq": 5, "revi')
+            self.assertEqual(crew.read_watchdog_state(), {})
+
+    def test_a_json_array_reads_as_empty(self):
+        with _wd_dir() as tmp:
+            with open(os.path.join(tmp, "watchdog.state"), "w") as handle:
+                handle.write("[1, 2, 3]")
+            self.assertEqual(crew.read_watchdog_state(), {})
+
+    def test_one_unusable_entry_is_dropped_and_the_rest_survive(self):
+        with _wd_dir() as tmp:
+            with open(os.path.join(tmp, "watchdog.state"), "w") as handle:
+                json.dump({"wV:pA": {"seq": 5},
+                           "wV:pB": {"seq": 6, "revision": 7,
+                                     "last_seen": 1000.0,
+                                     "stalled_for": 12.0, "ticks": 3,
+                                     "flags": ["stalled"]}}, handle)
+            state = crew.read_watchdog_state()
+        self.assertEqual(sorted(state), ["wV:pB"])
+        self.assertEqual(state["wV:pB"]["flags"], ["stalled"])
+
+    def test_a_corrupt_file_produces_no_alert_on_the_next_pass(self):
+        # The safe direction: every pane becomes newly seen, and a newly seen
+        # pane can never be stalled.
+        with _wd_dir() as tmp:
+            with open(os.path.join(tmp, "watchdog.state"), "w") as handle:
+                handle.write("not json at all")
+            snap = _wd_snap([("wV:pA", "working", 5, 5),
+                             ("wV:pB", "working", 6, 6)])
+            with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+                 mock.patch.object(crew, "snapshot", return_value=snap):
+                panes, alerts, ok = crew.watchdog_pass(
+                    "wV:pDog", 900, now=9_999_999.0, liveness=_alive)
+            self.assertTrue(ok)
+            self.assertEqual(alerts, [])
+            self.assertEqual(sorted(panes), ["wV:pA", "wV:pB"])
+            state = crew.read_watchdog_state()
+        self.assertEqual(sorted(state), ["wV:pA", "wV:pB"])
+
+    def test_the_state_file_is_written_whole_and_private(self):
+        with _wd_dir() as tmp:
+            crew.write_watchdog_state({"wV:pA": {"seq": 1, "revision": 2,
+                                                 "last_seen": 3.0,
+                                                 "stalled_for": 0.0,
+                                                 "ticks": 1, "flags": []}})
+            path = os.path.join(tmp, "watchdog.state")
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            self.assertEqual(oct(os.stat(path).st_mode & 0o777), oct(0o600))
+            self.assertEqual(sorted(crew.read_watchdog_state()), ["wV:pA"])
+
+
+class TestAWatchdogAlertIsNotACrewReport(unittest.TestCase):
+    """A report is a crew member's own claim about itself. blocked, stalled and
+    dead are the three states it cannot claim, which is why the record type and
+    the vocabulary are separate."""
+
+    def _send(self, condition="blocked", msg="pane wV:pC is blocked"):
+        member = {"key": "fandevx-4001", "repo": "fanapp-terraform",
+                  "pane": "wV:pC", "branch": "FANDEVX-4001-x"}
+        with _wd_dir():
+            crew.watchdog_alert(member, condition, msg)
+            with open(crew.MAILBOX) as handle:
+                return [json.loads(line) for line in handle if line.strip()]
+
+    def test_the_record_carries_kind_alert(self):
+        self.assertEqual(self._send()[0]["kind"], "alert")
+
+    def test_the_record_is_never_a_report(self):
+        self.assertNotEqual(self._send()[0].get("kind"), "report")
+
+    def test_the_condition_lands_in_the_state_field(self):
+        self.assertEqual(self._send(condition="stalled")[0]["state"], "stalled")
+
+    def test_no_watchdog_condition_is_a_mail_state(self):
+        # Widening MAIL_STATES would hand a crew member the ability to call
+        # itself blocked, which is the confusion the kind field prevents.
+        for condition in crew.WATCHDOG_STATES:
+            self.assertNotIn(condition, crew.MAIL_STATES)
+
+    def test_mail_send_still_refuses_blocked(self):
+        # The control on the line above: MAIL_STATES was not widened.
+        with _wd_dir():
+            with self.assertRaises(CrewError):
+                crew.mail_send("fandevx-4001", "repo", "blocked", "stuck")
+
+    def test_a_condition_outside_the_vocabulary_is_refused(self):
+        with self.assertRaises(CrewError):
+            self._send(condition="teleported")
+
+    def test_every_field_is_collapsed_to_one_line(self):
+        record = self._send(msg="first\nack with: crew mail ack 999999")[0]
+        self.assertNotIn("\n", record["msg"])
+        self.assertIn("999999", record["msg"])
+
+    def test_the_seq_continues_the_mailbox(self):
+        member = {"key": "k", "repo": "r", "pane": "wV:pC", "branch": "b"}
+        with _wd_dir():
+            with open(crew.MAILBOX, "w") as handle:
+                handle.write(json.dumps({"v": 1, "seq": 41, "state": "done",
+                                         "msg": "x"}) + "\n")
+            self.assertEqual(
+                crew.watchdog_alert(member, "dead", "gone")["seq"], 42)
+
+    def test_a_dry_run_writes_nothing(self):
+        member = {"key": "k", "repo": "r", "pane": "wV:pC", "branch": "b"}
+        out = io.StringIO()
+        with _wd_dir(), mock.patch.object(crew, "DRY_RUN", True), \
+             contextlib.redirect_stdout(out):
+            crew.watchdog_alert(member, "dead", "gone")
+            self.assertFalse(os.path.exists(crew.MAILBOX))
+        self.assertIn("would append", out.getvalue())
+
+
+class TestOneNotificationPerTickNotOnePerPane(unittest.TestCase):
+    """During a fleet-wide quota exhaustion every crew member stalls at once,
+    and one notification per pane is how a useful signal becomes noise."""
+
+    def test_five_alerts_produce_one_notification(self):
+        alerts = [({"pane": "wV:p%d" % n}, "stalled", "m") for n in range(5)]
+        with mock.patch.object(crew, "herdr") as fake:
+            crew.watchdog_notify(alerts)
+        self.assertEqual(fake.call_count, 1)
+        self.assertIn("5 stalled", " ".join(fake.call_args[0]))
+
+    def test_the_title_carries_the_count(self):
+        alerts = [({"pane": "wV:p1"}, "blocked", "m"),
+                  ({"pane": "wV:p2"}, "dead", "m")]
+        with mock.patch.object(crew, "herdr") as fake:
+            crew.watchdog_notify(alerts)
+        self.assertIn("crew: 2 alert(s)", " ".join(fake.call_args[0]))
+
+    def test_a_failed_notification_does_not_raise(self):
+        err = io.StringIO()
+        with mock.patch.object(crew, "herdr",
+                               side_effect=HerdrError("no socket")), \
+             contextlib.redirect_stderr(err):
+            crew.watchdog_notify([({"pane": "wV:p1"}, "dead", "m")])
+        self.assertIn("in the mailbox regardless", err.getvalue())
+
+
+class TestWatchdogPassKeepsTheHeartbeatHonest(unittest.TestCase):
+    def _once(self, snap=None, snapshot_error=None, clock=None):
+        clock = clock or _FakeClock()
+        out, err = io.StringIO(), io.StringIO()
+        snapshot = (mock.patch.object(crew, "snapshot",
+                                     side_effect=snapshot_error)
+                    if snapshot_error else
+                    mock.patch.object(crew, "snapshot", return_value=snap))
+        with _wd_dir() as tmp, \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             snapshot, \
+             mock.patch.object(crew, "pane_agent_alive", _alive), \
+             mock.patch.object(crew, "time", clock), \
+             mock.patch.dict(os.environ, {"HERDR_PANE_ID": "wV:pDog"}), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            code = crew.main(["watchdog", "--once"])
+            beat = os.path.exists(os.path.join(tmp, "watchdog.heartbeat"))
+        return code, beat, out.getvalue(), err.getvalue()
+
+    def test_a_good_pass_advances_the_heartbeat(self):
+        code, beat, out, _ = self._once(_wd_snap([("wV:pA", "working", 5, 5)]))
+        self.assertEqual(code, 0)
+        self.assertTrue(beat)
+        self.assertIn("1 crew pane(s)", out)
+
+    def test_an_unreadable_snapshot_does_NOT_advance_the_heartbeat(self):
+        # A heartbeat that keeps ticking while nothing can be decided makes
+        # crew ls report a healthy watchdog that is in fact blind.
+        code, beat, _, err = self._once(snapshot_error=HerdrError("socket gone"))
+        self.assertEqual(code, 3)
+        self.assertFalse(beat)
+        self.assertIn("heartbeat is NOT advanced", err)
+
+    def test_schema_drift_is_not_read_as_a_quiet_fleet(self):
+        code, beat, _, err = self._once(
+            snapshot_error=CrewError("SNAPSHOT UNPARSED: nope"))
+        self.assertEqual(code, 3)
+        self.assertFalse(beat)
+        self.assertIn("UNPARSED", err)
+
+    def test_a_failed_mailbox_append_drops_its_flag_so_it_retries(self):
+        snap = _wd_snap([("wV:pA", "blocked", 5, 5)])
+        with _wd_dir(), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "watchdog_alert",
+                              side_effect=OSError("disk full")), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            _, alerts, ok = crew.watchdog_pass("wV:pDog", 900, now=1000.0,
+                                               liveness=_alive)
+            self.assertTrue(ok)
+            self.assertEqual(alerts, [])
+            self.assertEqual(crew.read_watchdog_state()["wV:pA"]["flags"], [])
+        self.assertIn("will be retried", err.getvalue())
+
+    def test_the_recorded_alert_reaches_the_mailbox(self):
+        snap = _wd_snap([("wV:pA", "blocked", 5, 5)])
+        with _wd_dir(), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "watchdog_notify"):
+            crew.watchdog_pass("wV:pDog", 900, now=1000.0, liveness=_alive)
+            with open(crew.MAILBOX) as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual([(r["kind"], r["state"]) for r in records],
+                         [("alert", "blocked")])
+
+
+class TestNothingWatchesTheWatchdogSoCrewLsDoes(unittest.TestCase):
+    def test_no_heartbeat_at_all_says_not_running(self):
+        with _wd_dir():
+            line = crew.watchdog_report(1000.0)[0]
+        self.assertIn("NOT RUNNING", line)
+        self.assertIn("crew watchdog", line)
+
+    def test_a_fresh_heartbeat_says_alive(self):
+        with _wd_dir():
+            crew.touch_heartbeat(1000.0)
+            self.assertIn("alive", crew.watchdog_report(1010.0)[0])
+
+    def test_a_heartbeat_older_than_a_few_ticks_says_stale(self):
+        with _wd_dir():
+            crew.touch_heartbeat(1000.0)
+            line = crew.watchdog_report(
+                1000.0 + crew.WATCHDOG_TICK_SECONDS
+                * crew.WATCHDOG_HEARTBEAT_STALE_TICKS + 1)[0]
+        self.assertIn("STALE", line)
+        self.assertIn("unmonitored", line)
+
+    def test_absent_and_stale_are_different_messages(self):
+        with _wd_dir():
+            absent = crew.watchdog_report(1000.0)[0]
+            crew.touch_heartbeat(1000.0)
+            stale = crew.watchdog_report(100000.0)[0]
+        self.assertNotEqual(absent, stale)
+
+    def test_a_clock_that_went_backwards_is_not_stale(self):
+        with _wd_dir():
+            crew.touch_heartbeat(9000.0)
+            self.assertIn("alive", crew.watchdog_report(1000.0)[0])
+
+    def test_a_truncated_heartbeat_falls_back_to_its_mtime(self):
+        with _wd_dir() as tmp:
+            path = os.path.join(tmp, "watchdog.heartbeat")
+            with open(path, "w") as handle:
+                handle.write("")
+            self.assertIsNotNone(crew.heartbeat_age(time.time()))
+
+    def test_the_ls_verb_prints_the_watchdog_line(self):
+        # render_ls is exercised directly above, so without this the cmd_ls
+        # argument could be deleted and every other assertion stays green
+        # while `crew ls` said nothing about the watchdog.
+        out = io.StringIO()
+        with _wd_dir(), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=_member_snap()), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(crew.main(["ls"]), 0)
+        self.assertIn("watchdog:", out.getvalue())
+
+    def test_the_line_sits_with_the_counts_not_at_the_bottom(self):
+        rendered = crew.render_ls([], [], None, ["watchdog: alive"]).splitlines()
+        self.assertEqual(rendered[1], "watchdog: alive")
+
+    def test_the_json_roster_is_unchanged_by_this(self):
+        out = io.StringIO()
+        with _wd_dir(), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=_member_snap()), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(crew.main(["ls", "--json"]), 0)
+        self.assertEqual(len(json.loads(out.getvalue())), 1)
+
+
+class TestDoctorReadsTheHeartbeat(unittest.TestCase):
+    """Fresh or absent-by-design passes; stale FAILS. Absent means the human
+    chose to run no watchdog. Stale means one was started and has stopped, so
+    the fleet has looked watched while nothing was."""
+
+    def _doctor(self, beat=None, now=1000.0):
+        def fake_probe(argv):
+            if argv[:2] == ["herdr", "--version"]:
+                return True, "herdr 9.9.9"
+            if argv[:3] == ["herdr", "api", "schema"]:
+                return True, "protocol: %d" % crew.HERDR_VERIFIED_PROTOCOLS[-1]
+            if argv[:2] == ["claude", "--help"]:
+                return True, "--append-system-prompt --continue --model"
+            raise AssertionError("unexpected probe: %s" % argv)
+
+        out = io.StringIO()
+        with _guard_world() as world, _wd_dir():
+            world.write_hook()
+            world.write_settings()
+            if beat is not None:
+                crew.touch_heartbeat(beat)
+            with mock.patch.object(crew, "_probe", side_effect=fake_probe), \
+                 mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+                 mock.patch.object(crew, "snapshot",
+                                   return_value=_snap([], [])), \
+                 mock.patch.object(crew, "SETTINGS_PATH", world.settings), \
+                 mock.patch.object(crew, "time", _FakeClock(now)), \
+                 contextlib.redirect_stdout(out):
+                code = crew.doctor()
+            return code, out.getvalue()
+
+    def test_no_heartbeat_is_not_a_fault(self):
+        _, text = self._doctor()
+        self.assertIn("watchdog: not running", text)
+        self.assertNotIn("watchdog heartbeat", text)
+
+    def test_a_fresh_heartbeat_is_reported_as_alive(self):
+        _, text = self._doctor(beat=990.0)
+        self.assertIn("watchdog: alive", text)
+
+    def test_a_stale_heartbeat_is_a_problem(self):
+        code, text = self._doctor(beat=1000.0, now=1000.0 + 10_000)
+        self.assertEqual(code, 1)
+        self.assertIn("watchdog heartbeat", text)
+        self.assertIn("stopped reconciling", text)
+
+
+class TestWaitForStatusChange(unittest.TestCase):
+    """The plan named `events.wait --match pane.agent_status_changed`. Measured
+    against herdr 0.8.0 there is no `herdr events` CLI at all, and the socket
+    method requires a pane_id, so this waits per pane and the snapshot reconcile
+    stays the authority. Every failure must cost a tick, never the loop."""
+
+    def test_an_unusable_socket_sleeps_out_the_tick(self):
+        clock = _FakeClock()
+        with mock.patch.object(crew, "time", clock):
+            woken = crew.wait_for_status_change(
+                ["wV:pA"], 30, socket_path="/nonexistent/herdr.sock")
+        self.assertFalse(woken)
+        self.assertEqual(clock.slept, [30])
+
+    def test_no_crew_panes_still_sleeps_the_tick(self):
+        clock = _FakeClock()
+        with mock.patch.object(crew, "time", clock):
+            self.assertFalse(crew.wait_for_status_change([], 30,
+                                                         socket_path="/x"))
+        self.assertEqual(clock.slept, [30])
+
+    def test_no_socket_path_at_all_still_sleeps_the_tick(self):
+        clock = _FakeClock()
+        with mock.patch.object(crew, "time", clock), \
+             mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(crew.wait_for_status_change(["wV:pA"], 30))
+        self.assertEqual(clock.slept, [30])
+
+    def test_a_status_event_wakes_it_without_sleeping(self):
+        frames = [{"id": "crew-watchdog",
+                   "result": {"type": "subscription_started"}},
+                  {"event": "pane_agent_status_changed",
+                   "data": {"pane_id": "wV:pA", "workspace_id": "wV",
+                            "agent_status": "blocked"}}]
+        clock = _FakeClock()
+        with _fake_event_socket(frames) as path:
+            with mock.patch.object(crew, "time", clock):
+                woken = crew.wait_for_status_change(["wV:pA"], 30,
+                                                    socket_path=path)
+        self.assertTrue(woken)
+        self.assertEqual(clock.slept, [])
+
+    def test_an_error_frame_falls_back_to_sleeping(self):
+        # A pane that closed between the snapshot and this call answers
+        # pane_not_found, which must end the subscription and not the loop.
+        frames = [{"id": "crew-watchdog:sub:0",
+                   "error": {"code": "pane_not_found", "message": "gone"}}]
+        clock = _FakeClock()
+        with _fake_event_socket(frames) as path:
+            with mock.patch.object(crew, "time", clock):
+                woken = crew.wait_for_status_change(["wV:pA"], 30,
+                                                    socket_path=path)
+        self.assertFalse(woken)
+        self.assertEqual(clock.slept, [30])
+
+    def test_an_unrelated_frame_does_not_wake_it(self):
+        frames = [{"event": "pane_updated", "data": {"type": "pane_updated"}},
+                  {"event": "pane_agent_status_changed",
+                   "data": {"pane_id": "wV:pA", "workspace_id": "wV",
+                            "agent_status": "idle"}}]
+        clock = _FakeClock()
+        with _fake_event_socket(frames) as path:
+            with mock.patch.object(crew, "time", clock):
+                self.assertTrue(crew.wait_for_status_change(
+                    ["wV:pA"], 30, socket_path=path))
+
+    def test_the_subscription_names_every_pane_and_the_measured_type(self):
+        received = []
+        wake = [{"event": "pane_agent_status_changed",
+                 "data": {"pane_id": "wV:pA", "workspace_id": "wV",
+                          "agent_status": "idle"}}]
+        with _fake_event_socket(wake, record=received) as path:
+            clock = _FakeClock()
+            with mock.patch.object(crew, "time", clock):
+                crew.wait_for_status_change(["wV:pB", "wV:pA"], 30,
+                                            socket_path=path)
+        request = json.loads(received[0])
+        self.assertEqual(request["method"], "events.subscribe")
+        self.assertEqual(
+            request["params"]["subscriptions"],
+            [{"type": "pane.agent_status_changed", "pane_id": "wV:pA"},
+             {"type": "pane.agent_status_changed", "pane_id": "wV:pB"}])
+
+
+class TestOneWatchdogAtATime(unittest.TestCase):
+    """Two would each alert on the same condition, and a doubled alert during a
+    fleet-wide stall is exactly the noise that gets the watchdog ignored."""
+
+    def test_a_second_watchdog_is_refused_rather_than_queued(self):
+        with _wd_dir():
+            first = crew._claim_watchdog_lock()
+            try:
+                with self.assertRaises(CrewError) as ctx:
+                    crew._claim_watchdog_lock()
+            finally:
+                first.close()
+            self.assertIn("already holds", str(ctx.exception))
+
+    def test_the_lock_is_released_when_the_first_one_goes(self):
+        with _wd_dir():
+            crew._claim_watchdog_lock().close()
+            crew._claim_watchdog_lock().close()
+
+
+class TestWatchdogArgumentParsing(unittest.TestCase):
+    def test_a_zero_tick_is_refused(self):
+        err = io.StringIO()
+        with _wd_dir(), contextlib.redirect_stderr(err):
+            self.assertEqual(crew.main(["watchdog", "--tick", "0"]), 3)
+        self.assertIn("at least 1 second", err.getvalue())
+
+    def test_a_non_numeric_stall_is_a_bad_argument(self):
+        err = io.StringIO()
+        with _wd_dir(), contextlib.redirect_stderr(err):
+            self.assertEqual(crew.main(["watchdog", "--stall", "soon"]), 2)
+
+    def test_an_unknown_flag_is_refused(self):
+        err = io.StringIO()
+        with _wd_dir(), contextlib.redirect_stderr(err):
+            self.assertEqual(crew.main(["watchdog", "--forever"]), 3)
+        self.assertIn("unexpected argument", err.getvalue())
+
+    def test_once_is_a_bare_flag_and_not_a_value(self):
+        # --once before --tick must not be consumed as --tick's value.
+        out, err = io.StringIO(), io.StringIO()
+        with _wd_dir(), \
+             mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.dict(os.environ, {"HERDR_PANE_ID": "wV:pDog"}), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(
+                crew.main(["watchdog", "--once", "--tick", "5"]), 0)
+        self.assertIn("tick 5s", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_the_usage_line_names_the_verb(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(crew.main([]), 2)
+        self.assertIn("watchdog", err.getvalue())
 
 
 if __name__ == "__main__":
