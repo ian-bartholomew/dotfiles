@@ -130,14 +130,34 @@ honest mistake and the prompt injection, not you.
 
 One limit you should know precisely, because the design claims the mailbox is
 authoritative and this is what that claim rests on. `Write` and `Edit` are not
-gated. `~/.crew/cursor` is a plain integer file, so writing a high number into it
-silences every pending report in the foreman's `crew mail unread`, which is the
-effect `crew mail ack` is denied for. `~/.crew/mailbox.jsonl` can be appended to
-directly, past the lock and past the forgery check in `crew mail send`. The hook
-itself and the settings that install it are ordinary files too. So the mailbox is
-authoritative because you keep it that way. Report through `crew mail send` and
-write files only inside the worktree your system prompt names, which for a
-reviewer is another crew member's and is narrower still: see above.
+gated. `~/.crew/mailbox.jsonl` can be appended to directly, past the lock and
+past the forgery check in `crew mail send`. The hook itself and the settings that
+install it are ordinary files too. So the mailbox is authoritative because you
+keep it that way. Report through `crew mail send` and write files only inside the
+worktree your system prompt names, which for a reviewer is another crew member's
+and is narrower still: see above.
+
+The read position is not a file you can edit any more, and that is worth knowing
+exactly, because the honest version is less useful to you than the old one and
+more useful to everyone else. It used to be a plain integer in `~/.crew/cursor`,
+where a high number silenced every pending and every future report in the
+foreman's `crew mail unread`, which is precisely the effect `crew mail ack` is
+denied for. It is now derived from append-only `ack` records in the mailbox
+itself. Appending one is still possible, and the design does not pretend
+otherwise. What changed is that it is no longer invisible or unbounded:
+
+- The record is permanent. Nothing crew does removes it.
+- It carries the pane that wrote it, and `crew mail unread` names, by seq, every
+  ack that is not the foreman's or that carries no pane at all, and tells the
+  foreman what it means.
+- It cannot mark a report read that was written after it, because its own seq
+  bounds what it can claim.
+- `~/.crew/cursor` is read once, as a floor, and ignored from the first ack
+  record onwards. Writing to it after that does nothing.
+
+So forging an ack no longer hides a fleet; it reports you and loses the reports
+that were already pending. Neither half of that is a trade worth making. Send
+your report.
 
 So if the guard denies something, that is the answer. Do not look for another
 route to the same effect. Report what you need with `crew mail send` and let
