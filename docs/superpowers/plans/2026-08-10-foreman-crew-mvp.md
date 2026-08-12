@@ -3135,3 +3135,89 @@ All existing tests must pass, a green run must print nothing, and every new
 test must fail if its behaviour is removed. Report the mutation per test. Do
 not run a real `crew dispatch`, do not run any mutating herdr verb, and do not
 touch a live pane.
+
+---
+
+## Hardening wave 5
+
+The wave 4 fix for the wedged key introduced an automatic destructive action
+and got its safety condition wrong. Everything else in wave 4 (W4-1, W4-3,
+W4-4) was verified sound and is not in scope here.
+
+### W5-1 (Critical): the close condition treats live agents as spent
+
+`crew.py` closes a setup pane when its agent status is in `("done", "idle",
+"unknown")`. Every one of those means an agent is PRESENT, per herdr's own
+definitions in `~/.claude/skills/herdr/SKILL.md:58`:
+
+- `idle`: "the agent is ready for input"
+- `done`: "the SAME underlying idle state after unseen background work
+  finishes"
+- `unknown`: "an agent is present but Herdr cannot classify it confidently; it
+  does not prove completion"
+
+So the gate closes a live session. This is the modal JIRA path, not a race:
+`/start-ticket` asks the human in prose, at `:22` and `:26`, which settles as
+`idle` or `done` and never as `blocked`. A human part way through answering
+those questions loses the pane, and `start_setup` then spends another paid Opus
+session.
+
+Trimming the list does not fix it. `SETUP_PROMPT` tells the setup agent to
+write its JSON "and stop", and a stopped Claude Code session is still resident,
+so a FINISHED setup agent is also `idle` or `done`. herdr cannot distinguish
+"finished" from "waiting for your answer" by status, which means no status list
+can be the safety condition.
+
+Fix: the only sound signal is that NO agent occupies the pane. Derive it from
+the snapshot, by the pane id being absent from the agent list, the same way the
+`recover` bucket already identifies an agent-less crew pane. Delete the status
+list and the helper built on it rather than narrowing it.
+
+When an agent IS present, do not close anything. Print a message that names the
+pane and states both things the human can do: answer or redo setup in that
+pane, or close that pane themselves and re-run to start fresh. The wedge this
+wave is fixing came from a message that promised something untrue, so the
+replacement must be accurate for both branches, not just the one that acts.
+
+### W5-2 (Critical): dispatch can close the pane it is running in
+
+There is no check that the setup pane is not the caller. Verified by probe: with
+`HERDR_PANE_ID` set to the setup pane, dispatch emits `pane close` for that
+pane. It is reachable because the remedy tells the human to re-run the command,
+and a human shell inside that pane has no hook on it.
+
+Fix: never close the calling pane. Compare against `calling_pane()` and refuse,
+explaining why. `calling_pane()` is documented as spoofable, which is fine here:
+this check only ever prevents an action, so a spoofed value cannot cause a close
+that would not otherwise happen.
+
+### W5-3 (Important): a failed close wedges the key it was meant to unwedge
+
+Verified by probe with the close raising: exit 3 twice and `pane split` never
+runs, which is the exact wedge this fix exists to remove.
+
+Fix: a close that fails must warn and continue to `start_setup`, not abort.
+Leaving a stale pane behind is untidy; refusing to make progress is the bug.
+
+### W5-4 (Important): a SKILL.md states something false on this machine
+
+`foreman/SKILL.md:169` says nothing in this build registers the `crew-guard`
+hook and therefore "nothing stops a crew member dispatching paid sessions".
+The first clause is true of the repo. The second is false here:
+`~/.claude/settings.json` registers the hook and `~/.claude/hooks/crew-guard.py`
+resolves to this branch's file. A live agent reading that will believe it is
+unguarded.
+
+Fix: say precisely what is true. The repo does not register the hook, so a fresh
+stow has it present but not invoked; whether it is live on any given machine
+depends on that machine's settings, and `crew doctor` does not check. Match the
+hedged phrasing already used in `start-crew/SKILL.md:151`.
+
+### Constraints
+
+Keep the wave 4 behaviour that was verified sound. All existing tests pass, a
+green run prints nothing, and every new test must fail if its behaviour is
+removed, INCLUDING a test that the close does not happen while an agent is
+present, and one that the calling pane is never closed. Report the mutation per
+test. Do not run a real `crew dispatch`, do not run any mutating herdr verb, and
+do not touch a live pane.
