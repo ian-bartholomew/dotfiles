@@ -3336,3 +3336,67 @@ Every existing test passes, a green run prints nothing, and each new test must
 fail if its behaviour is removed. Report the mutation per test. Do not run a real
 `crew dispatch`, do not run any mutating herdr verb against a pane that is not
 already dead, and do not touch the pane named `foreman`.
+
+---
+
+## Hardening wave 7
+
+One gap, found by reading the hook while answering a question about what
+agent-to-agent communication the design actually has.
+
+### W7-1 (Important): the guard sees only Bash, so a non-Bash tool bypasses it
+
+`crew-guard.py`'s `main` returns 0 unless `tool_name` is `Bash`, and the
+`PreToolUse` matcher in settings is `Bash` alone. Crew members are full Claude
+Code sessions with the complete tool surface, and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`
+is set globally, so a dispatched crew member has `SendMessage` and `ListAgents`.
+
+`SendMessage` can address another local Claude session. So a crew member can
+message a peer or the foreman directly, outside the mailbox: no seq, no cursor,
+no ack, and nothing in the JSONL that the mailbox digest would ever show. It is
+also the precise shape of the cross-session permission laundering that
+`SendMessage`'s own guidance warns about, since a crew member can ask a peer to
+run the `crew dispatch` it is itself denied.
+
+The design's claim is that a crew member's only outbound channel is
+`crew mail send`. That claim is false while any unguarded tool can carry a
+message.
+
+Fix: give the hook a table of forbidden TOOLS alongside its table of forbidden
+commands, and deny `SendMessage` to a crew session. Keep the existing cost
+ordering: classify by tool name first, which is free, and only then pay for the
+membership round trip. Extend the settings matcher to `Bash|SendMessage`, using
+the alternation form already used elsewhere in that file.
+
+Do NOT over-block. These must stay allowed for a crew member, because the design
+depends on them:
+
+- `Agent` and any subagent-spawning tool. A crew member fanning out subagents is
+  explicitly part of the design; a reviewer crew member does exactly that.
+- `ListAgents`. Discovery is not the boundary; sending is. Denying it buys no
+  safety and breaks a legitimate read.
+- Every ordinary file, search and task tool.
+
+Then enumerate the rest of the tool surface and report, rather than guessing, any
+OTHER non-Bash tool that can reach an effect the guard blocks in Bash. Name them
+in the report even if the fix is deferred, since the point of this wave is that
+the boundary was drawn around one tool by accident. Candidates worth checking
+specifically: anything that schedules future work, triggers a remote or external
+run, or writes to another session.
+
+State the residual limit plainly in `crew-member/SKILL.md` and the wiki's
+enforced-versus-convention section: the guard now covers Bash and `SendMessage`,
+and it still cannot cover a shell it does not see, since `herdr pane run`
+executes where no hook fires at all.
+
+### Constraints
+
+Tests must drive the real hook as a subprocess with real JSON on stdin, covering
+`SendMessage` denied from a crew pane, allowed from a non-crew pane, `Agent` and
+`ListAgents` still allowed from a crew pane, and the Bash behaviour unchanged.
+Removing `SendMessage` from the table must fail a test. Suite stays green and
+silent, and report the mutation per test.
+
+The settings change is the user's own config and is authorised for this wave
+only: edit `~/.claude/settings.json` to change the `PreToolUse` matcher, change
+nothing else in that file, and confirm the file still parses as JSON afterwards.
