@@ -145,6 +145,33 @@ whole action: name which crew are retirable and why, then stop. Do not reach
 for `herdr pane close` or any other direct call to finish the job yourself.
 If the human confirms, they close it, or they tell you to.
 
+## Known gaps in this build
+
+Real, unfixed, and worth knowing before you act on what the tool tells you.
+
+- **A mail report is not authenticated.** `crew mail send` falls back to the
+  caller's `--key` when the pane environment is missing, so a report naming
+  another crew member's key can be forged by a crew member. Treat a surprising
+  report as a claim to check with `crew peek`, not as fact.
+- **Exit 5 can name a session that never existed.** If a dispatch failed
+  between tagging the pane and starting the agent, the key stays tagged and
+  every later dispatch prints a resume command for an agent that was never
+  started. If the human says the resume command lands in an empty session, say
+  so; do not dispatch again on top of it.
+- **The setup artifact is keyed on the ticket key alone.** Dispatching the same
+  key in a second repo discards the first repo's completed setup, and that repo
+  then has to pay for another setup session. Finish one repo's dispatch of a
+  key before starting the same key elsewhere.
+- **`crew mail unread` is unbounded.** `crew peek` is capped at 200 lines; the
+  mailbox is not capped at all, so it is the one path that can flood your
+  context. Ack what you report.
+- **A green `crew doctor` does not mean the guard hook is live.** Nothing in
+  this build registers the `crew-guard` PreToolUse hook, and doctor does not
+  check that it is registered, so a fresh stow has the file present and never
+  invoked. Whether it is live here depends on this machine's own settings, which
+  crew cannot see: confirm it in `/hooks` rather than assuming either way. Until
+  it is live, nothing stops a crew member dispatching paid sessions.
+
 ## Rules
 
 - Every action shells out to `crew`. Never call `herdr` directly.

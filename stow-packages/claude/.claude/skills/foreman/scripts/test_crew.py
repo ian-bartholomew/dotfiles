@@ -725,6 +725,9 @@ class TestDispatchResumesFromArtifact(unittest.TestCase):
 
     def test_a_lingering_setup_pane_is_closed_on_completion(self):
         fake, calls = self._herdr()
+        # HERDR_PANE_ID is pinned: the caller's identity decides whether this
+        # close happens, so inheriting it would make the test depend on which
+        # pane the suite was run from.
         with mock.patch.object(crew, "resolve_repo",
                                return_value=("/fake/repo", "artifact-test")), \
              mock.patch.object(crew, "read_dispatch_artifact",
@@ -734,7 +737,9 @@ class TestDispatchResumesFromArtifact(unittest.TestCase):
              mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
              mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.object(crew, "herdr", side_effect=fake), \
-             mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+             mock.patch.dict(crew.os.environ,
+                             {"HERDR_WORKSPACE_ID": "wTest",
+                              "HERDR_PANE_ID": "wTest:pForeman"}), \
              contextlib.redirect_stdout(io.StringIO()):
             code = crew.main(["dispatch", "FANDEVX-9002", "--type",
                               "implementer", "--repo", "artifact-test"])
@@ -753,7 +758,7 @@ class TestDispatchOpensSetupWithoutBlocking(unittest.TestCase):
                                return_value=("/fake/repo", "setup-test")), \
              mock.patch.object(crew, "read_dispatch_artifact",
                                return_value=None), \
-             mock.patch.object(crew, "find_setup_pane", return_value=None), \
+             mock.patch.object(crew, "find_setup_panes", return_value=[]), \
              mock.patch.object(crew, "start_setup",
                                return_value="wTest:pSetup") as start, \
              mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
@@ -766,14 +771,20 @@ class TestDispatchOpensSetupWithoutBlocking(unittest.TestCase):
         start.assert_called_once()
 
     def test_an_existing_setup_pane_is_reported_not_duplicated(self):
+        # The agent is part of the fixture: a setup pane is only reported
+        # rather than closed while an agent still occupies it, and that is read
+        # off the snapshot, not off the status.
         with mock.patch.object(crew, "resolve_repo",
                                return_value=("/fake/repo", "setup-test")), \
              mock.patch.object(crew, "read_dispatch_artifact",
                                return_value=None), \
-             mock.patch.object(crew, "find_setup_pane",
-                               return_value={"pane": "wTest:pSetup"}), \
+             mock.patch.object(crew, "find_setup_panes",
+                               return_value=[{"pane": "wTest:pSetup",
+                                              "status": "working"}]), \
              mock.patch.object(crew, "start_setup") as start, \
-             mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+             mock.patch.object(crew, "snapshot", return_value=_snap(
+                 [_full_agent("wTest:pSetup", "working", "setup-fandevx-9004")],
+                 [])), \
              mock.patch.object(crew, "schema_defs", return_value=DEFS), \
              mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
              contextlib.redirect_stdout(io.StringIO()) as out:
@@ -798,7 +809,8 @@ class TestSlugDispatchStillCompletesInOneCall(unittest.TestCase):
                                return_value=("/fake/repo", "slug-test")), \
              mock.patch.object(crew, "plain_worktree",
                                return_value="/fake/repo/.claude/worktrees/y"), \
-             mock.patch.object(crew, "find_setup_pane") as setup_lookup, \
+             mock.patch.object(crew, "find_setup_pane") as one_lookup, \
+             mock.patch.object(crew, "find_setup_panes") as set_lookup, \
              mock.patch.object(crew, "start_setup") as start, \
              mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
              mock.patch.object(crew, "schema_defs", return_value=DEFS), \
@@ -808,7 +820,10 @@ class TestSlugDispatchStillCompletesInOneCall(unittest.TestCase):
             code = crew.main(["dispatch", "spike-something", "--type",
                               "implementer", "--repo", "slug-test"])
         self.assertEqual(code, 0)
-        setup_lookup.assert_not_called()
+        # Neither lookup: the single-pane one belongs to the artifact path and
+        # the set belongs to the ticket path, and a slug takes neither.
+        one_lookup.assert_not_called()
+        set_lookup.assert_not_called()
         start.assert_not_called()
 
 
@@ -1207,9 +1222,47 @@ def _write_artifact(key, worktree, repo, branch=None, text=None):
     return path
 
 
-def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False):
+CALLER_PANE = "wTest:pForeman"
+
+
+def _setup_panes_snap(repo_root, key, panes):
+    """A snapshot carrying one or more setup panes for a single key.
+
+    `panes` is [(pane_id, status or None)], where None means no agent occupies
+    that pane. Order is the snapshot's own and it is load-bearing: the stale
+    empty pane goes FIRST in the case that made this a money bug, because
+    acting on the first match is what sent dispatch at the wrong pane."""
+    tokens = {"crew": "true", "v": "1", "key": crew.sanitize_name(key),
+              "repo": "repo", "root": repo_root, "type": "setup"}
+    agents = [_full_agent(pane, status,
+                          ("setup-%s-%d" % (crew.sanitize_name(key), i))[:32])
+              for i, (pane, status) in enumerate(panes) if status is not None]
+    return _snap(agents, [_full_pane(pane, tokens) for pane, _ in panes])
+
+
+def _setup_pane_snap(repo_root, key, status="idle", pane="wTest:pSetup",
+                     agent=True):
+    """A snapshot that CONTAINS the setup pane for this key.
+
+    The default empty snapshot is what let "the key is not bricked" pass while
+    the key was in fact bricked: with no setup pane in the fixture, dispatch
+    never reached the branch that returned exit 7 forever.
+
+    `agent=False` is the only state in which that pane is safe to close. With an
+    agent in it, whatever its status, a session is present: `status` then only
+    decides what the refusal reports, not whether it refuses."""
+    return _setup_panes_snap(repo_root, key,
+                             [(pane, status if agent else None)])
+
+
+def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False,
+                  snap=None, close_error=None, caller=CALLER_PANE):
     """crew.main(["dispatch", ...]) with herdr faked. Returns
-    (code, herdr calls, stdout, stderr)."""
+    (code, herdr calls, stdout, stderr).
+
+    HERDR_PANE_ID is always set, never inherited: the caller's identity now
+    decides whether a pane is closed, so a suite run from inside a herdr pane
+    would otherwise vary with which pane it ran in."""
     calls = []
 
     def fake_herdr(*args, **kwargs):
@@ -1219,17 +1272,21 @@ def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False):
                 raise tab_error
             return {"result": {"root_pane": {"pane_id": "wTest:pW3"}}}
         if args[:2] == ("pane", "split"):
-            return {"result": {"pane": {"pane_id": "wTest:pSetup"}}}
+            return {"result": {"pane": {"pane_id": "wTest:pSetup2"}}}
+        if args[:2] == ("pane", "close") and close_error is not None:
+            raise close_error
         return {"ok": True}
 
     out, err = io.StringIO(), io.StringIO()
     with mock.patch.object(crew, "resolve_repo",
                            return_value=(repo_root, repo_name)), \
-         mock.patch.object(crew, "snapshot", return_value=_snap([], [])), \
+         mock.patch.object(crew, "snapshot",
+                           return_value=_snap([], []) if snap is None else snap), \
          mock.patch.object(crew, "schema_defs", return_value=DEFS), \
          mock.patch.object(crew, "herdr", side_effect=fake_herdr), \
          mock.patch.object(crew, "DRY_RUN", dry), \
-         mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest"}), \
+         mock.patch.dict(crew.os.environ, {"HERDR_WORKSPACE_ID": "wTest",
+                                          "HERDR_PANE_ID": caller}), \
          contextlib.redirect_stdout(out), \
          mock.patch.object(crew.sys, "stderr", err):
         code = crew.main(["dispatch", key, "--type", "implementer"])
@@ -1363,10 +1420,16 @@ class TestArtifactMustBeForThisRepo(unittest.TestCase):
     exist and both `crew ls` and the resume line printed that path."""
 
     def test_another_repo_is_refused_discarded_and_then_set_up_fresh(self):
+        # The setup pane that wrote the artifact is IN the fixture. Without it
+        # this test claimed the key was not bricked while it was: the second
+        # call found the finished setup pane and returned exit 7 forever.
+        # Its agent has gone, which is the only state dispatch will close
+        # automatically; one still occupying the pane is reported instead.
         with _repo_world() as (_, repo_root, worktree):
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9120", agent=False)
             artifact = _write_artifact("FANDEVX-9120", worktree, "other-repo")
             code, calls, _, err = _run_dispatch("FANDEVX-9120", repo_root,
-                                                "repo")
+                                                "repo", snap=spent)
             self.assertEqual(code, 3)
             self.assertIn("other-repo", err)
             self.assertFalse(any(c[:2] == ("tab", "create") for c in calls),
@@ -1376,7 +1439,7 @@ class TestArtifactMustBeForThisRepo(unittest.TestCase):
 
             # And the key is not bricked: the next call starts setup again.
             code, calls, _, err = _run_dispatch("FANDEVX-9120", repo_root,
-                                                "repo")
+                                                "repo", snap=spent)
             self.assertEqual(code, 7, err)
             self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
 
@@ -1424,15 +1487,17 @@ class TestArtifactMustBeForThisRepo(unittest.TestCase):
 
     def test_unparseable_json_is_refused_discarded_and_set_up_fresh(self):
         with _repo_world() as (_, repo_root, _worktree):
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9123", agent=False)
             artifact = _write_artifact("FANDEVX-9123", None, None,
                                        text="{not json at all")
-            code, calls, _, _ = _run_dispatch("FANDEVX-9123", repo_root, "repo")
+            code, calls, _, _ = _run_dispatch("FANDEVX-9123", repo_root, "repo",
+                                              snap=spent)
             self.assertEqual(code, 3)
             self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
             self.assertFalse(os.path.exists(artifact))
 
             code, calls, _, err = _run_dispatch("FANDEVX-9123", repo_root,
-                                                "repo")
+                                                "repo", snap=spent)
             self.assertEqual(code, 7, err)
             self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
 
@@ -1529,15 +1594,16 @@ class TestArtifactBranchMustDeriveTheWorktree(unittest.TestCase):
                 read_dispatch_artifact("FANDEVX-9133", "repo", repo_root)
             self.assertFalse(os.path.exists(artifact))
 
-    def test_a_branch_with_a_separator_is_refused(self):
-        # Built so the derivation would round-trip: only the single-component
-        # rule can refuse it.
+    def test_an_interior_separator_is_accepted(self):
+        # /start-ticket mandates <TICKET>/<slug>, so refusing this refused
+        # every JIRA dispatch after a paid setup session had been spent.
         with _repo_world() as (_, repo_root, _worktree):
             nested = os.path.join(repo_root, ".claude", "worktrees", "a", "b")
             os.makedirs(nested)
             _write_artifact("FANDEVX-9134", nested, "repo", branch="a/b")
-            with self.assertRaises(CrewError):
-                read_dispatch_artifact("FANDEVX-9134", "repo", repo_root)
+            self.assertEqual(
+                read_dispatch_artifact("FANDEVX-9134", "repo", repo_root),
+                nested)
 
     def test_a_pardir_branch_is_refused(self):
         # Also round-trips: <root>/.claude/worktrees/.. resolves to
@@ -1560,6 +1626,533 @@ class TestArtifactBranchMustDeriveTheWorktree(unittest.TestCase):
             self.assertFalse(any(c[:2] == ("tab", "create") for c in calls),
                              "the branch must be refused before a pane exists")
             self.assertFalse(os.path.exists(artifact))
+
+
+class TestBranchPathProblem(unittest.TestCase):
+    """Components are inspected rather than the string scanned for a
+    substring, so `..` is caught while `feat..ure`, a legal branch name, is
+    not."""
+
+    def test_a_start_ticket_branch_is_fine(self):
+        self.assertIsNone(crew.branch_path_problem(
+            "FANDEVX-2505/submit-aws-account-request"))
+
+    def test_two_dots_inside_a_component_are_fine(self):
+        self.assertIsNone(crew.branch_path_problem("feat..ure"))
+        self.assertIsNone(crew.branch_path_problem("release/1.2.3"))
+
+    def test_empty_is_refused(self):
+        self.assertIsNotNone(crew.branch_path_problem(""))
+
+    def test_absolute_is_refused(self):
+        self.assertIn("absolute", crew.branch_path_problem("/abs/branch"))
+
+    def test_a_leading_separator_is_refused(self):
+        self.assertIsNotNone(crew.branch_path_problem("/leading"))
+
+    def test_a_trailing_separator_is_refused(self):
+        self.assertIsNotNone(crew.branch_path_problem("trailing/"))
+
+    def test_a_doubled_separator_is_refused(self):
+        self.assertIsNotNone(crew.branch_path_problem("a//b"))
+
+    def test_a_pardir_component_is_refused_anywhere(self):
+        self.assertIsNotNone(crew.branch_path_problem(".."))
+        self.assertIsNotNone(crew.branch_path_problem("../escape"))
+        self.assertIsNotNone(crew.branch_path_problem("a/../../b"))
+        self.assertIsNotNone(crew.branch_path_problem("a/.."))
+
+    def test_a_curdir_component_is_refused(self):
+        self.assertIsNotNone(crew.branch_path_problem("."))
+        self.assertIsNotNone(crew.branch_path_problem("a/./b"))
+
+
+class TestNestedStartTicketBranch(unittest.TestCase):
+    """/start-ticket mandates <TICKET>/<slug> and SETUP_PROMPT tells the setup
+    agent to run exactly that skill, so a correct setup agent always produced a
+    branch dispatch always refused: one paid setup session per attempt, then
+    exit 7 forever."""
+
+    BRANCH = "FANDEVX-2505/submit-aws-account-request"
+
+    def test_the_real_start_ticket_branch_derives_its_nested_worktree(self):
+        with _repo_world(branch=self.BRANCH) as (_, repo_root, worktree):
+            _write_artifact("FANDEVX-2505", worktree, "repo",
+                            branch=self.BRANCH)
+            derived = read_dispatch_artifact("FANDEVX-2505", "repo", repo_root)
+            expected = os.path.join(repo_root, ".claude", "worktrees",
+                                    "FANDEVX-2505",
+                                    "submit-aws-account-request")
+        self.assertEqual(derived, expected)
+        self.assertEqual(derived, worktree)
+
+    def test_branch_for_inverts_worktree_for(self):
+        self.assertEqual(
+            crew.branch_for("/repo", worktree_for("/repo", self.BRANCH)),
+            self.BRANCH)
+
+    def test_the_pane_token_records_the_whole_branch(self):
+        # tag_pane took os.path.basename(worktree), so a nested branch was
+        # recorded as its last component alone. The tokens are the
+        # authoritative record every later reader recomputes the path from, so
+        # crew ls, crew peek and the exit 5 resume line would all print a
+        # directory that does not exist.
+        with _repo_world(branch=self.BRANCH) as (_, repo_root, worktree):
+            _write_artifact("FANDEVX-2505", worktree, "repo",
+                            branch=self.BRANCH)
+            code, calls, _, err = _run_dispatch("FANDEVX-2505", repo_root,
+                                                "repo")
+        self.assertEqual(code, 0, err)
+        tags = [c for c in calls if c[:2] == ("pane", "report-metadata")]
+        self.assertEqual(len(tags), 1)
+        self.assertIn("branch=%s" % self.BRANCH, tags[0])
+
+
+class TestArtifactBranchComponentsAreRefused(unittest.TestCase):
+    """Each of these round-trips through worktree_for, so the derived-path
+    check accepts it and only the component check refuses it."""
+
+    def test_a_pardir_escape_is_refused(self):
+        # <root>/.claude/worktrees/../escape resolves to <root>/.claude/escape,
+        # which is inside the repo and can exist.
+        with _repo_world() as (_, repo_root, _worktree):
+            escape = os.path.join(repo_root, ".claude", "escape")
+            os.makedirs(escape)
+            artifact = _write_artifact("FANDEVX-9137", escape, "repo",
+                                       branch="../escape")
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9137", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_an_interior_pardir_is_refused(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            target = os.path.join(repo_root, ".claude", "b")
+            os.makedirs(target)
+            artifact = _write_artifact("FANDEVX-9138", target, "repo",
+                                       branch="a/../../b")
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9138", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_a_trailing_separator_is_refused(self):
+        # realpath drops the trailing separator, so same_path accepts this.
+        with _repo_world(branch="trailing") as (_, repo_root, worktree):
+            artifact = _write_artifact("FANDEVX-9139", worktree, "repo",
+                                       branch="trailing/")
+            with self.assertRaises(CrewError):
+                read_dispatch_artifact("FANDEVX-9139", "repo", repo_root)
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_an_absolute_branch_is_refused_as_a_branch(self):
+        # An absolute branch also fails the derived-path check, so the message
+        # is what pins WHICH guard refused it.
+        with _repo_world(branch="ok") as (_, repo_root, worktree):
+            _write_artifact("FANDEVX-9141", worktree, "repo", branch="/abs")
+            with self.assertRaises(CrewError) as ctx:
+                read_dispatch_artifact("FANDEVX-9141", "repo", repo_root)
+        self.assertIn("absolute path", str(ctx.exception))
+
+
+class TestOnlyAnEmptySetupPaneIsClosed(unittest.TestCase):
+    """A rejected artifact left a setup pane behind, and dispatch reached
+    find_setup_pane first and returned exit 7 naming it forever. Closing it
+    automatically fixed that and introduced a worse bug: the close fired on
+    agent status ("done", "idle", "unknown"), and every one of those means an
+    agent is PRESENT, so the modal JIRA path closed the live session a human was
+    answering /start-ticket in and then paid for another one.
+
+    No status list can be the condition. A finished setup agent has written its
+    JSON and stopped, and a stopped session is still resident, so it reads as
+    idle or done exactly like a human's live one. Only absence from the agent
+    list distinguishes them."""
+
+    def test_a_pane_no_agent_occupies_is_closed_and_setup_starts_again(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9152", agent=False)
+            code, calls, out, err = _run_dispatch("FANDEVX-9152", repo_root,
+                                                  "repo", snap=spent)
+        self.assertEqual(code, 7, err)
+        self.assertIn(("pane", "close", "wTest:pSetup"), calls)
+        self.assertTrue(any(c[:2] == ("pane", "split") for c in calls),
+                        "the documented remedy is that re-running starts "
+                        "setup again")
+        self.assertIn("wTest:pSetup", out)
+
+    def test_a_done_agent_is_present_so_nothing_is_closed(self):
+        # done is "the SAME underlying idle state after unseen background work
+        # finishes", so the session is there and may be a human mid-answer.
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9150", status="done")
+            code, calls, out, err = _run_dispatch("FANDEVX-9150", repo_root,
+                                                  "repo", snap=live)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls),
+                         "closing a pane an agent occupies destroys a live "
+                         "paid session")
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls),
+                         "a second setup pane is a second paid session")
+        self.assertIn("wTest:pSetup", out)
+
+    def test_an_idle_agent_is_present_so_nothing_is_closed(self):
+        # /start-ticket asks the human in prose, which settles as idle. This is
+        # the modal JIRA path, not a race.
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9151", status="idle")
+            code, calls, _, err = _run_dispatch("FANDEVX-9151", repo_root,
+                                                "repo", snap=live)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls))
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_an_unknown_agent_is_present_so_nothing_is_closed(self):
+        # unknown means herdr cannot classify the agent confidently. It does
+        # NOT prove completion, and crew reads absence from the agent list, so
+        # an agent herdr cannot classify still counts as present.
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9156",
+                                    status="unknown")
+            code, calls, _, err = _run_dispatch("FANDEVX-9156", repo_root,
+                                                "repo", snap=live)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls))
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_a_working_setup_pane_is_reported_and_nothing_is_closed(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9153",
+                                    status="working")
+            code, calls, out, err = _run_dispatch("FANDEVX-9153", repo_root,
+                                                  "repo", snap=live)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls),
+                         "a setup agent still working has unsaved context and "
+                         "a prompt the human is answering")
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls),
+                         "a second setup pane is a second paid session")
+        self.assertIn("wTest:pSetup", out)
+        self.assertIn("working", out)
+
+    def test_a_status_crew_does_not_know_leaves_the_pane_alone(self):
+        # herdr self-updates. A status added later must not read as closable:
+        # the pane still has an agent in it whatever the new word is.
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9155",
+                                    status="teleported")
+            code, calls, _, err = _run_dispatch("FANDEVX-9155", repo_root,
+                                                "repo", snap=live)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls))
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_a_blocked_setup_pane_is_also_left_alone(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9154",
+                                    status="blocked")
+            code, calls, _, err = _run_dispatch("FANDEVX-9154", repo_root,
+                                                "repo", snap=live)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls))
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_the_refusal_states_both_things_the_human_can_do(self):
+        # The wedge this replaced came from a message that promised something
+        # untrue, so the branch that acts on nothing must still leave the human
+        # a way forward: act in that pane, or close it and re-run.
+        with _repo_world() as (_, repo_root, _worktree):
+            live = _setup_pane_snap(repo_root, "FANDEVX-9157", status="idle")
+            _, _, out, _ = _run_dispatch("FANDEVX-9157", repo_root, "repo",
+                                         snap=live)
+        self.assertIn("wTest:pSetup", out)
+        self.assertIn("redo setup there", out)
+        self.assertIn("close that pane yourself", out)
+        self.assertIn("re-run this command", out)
+
+
+class TestDispatchNeverClosesItsOwnPane(unittest.TestCase):
+    """Nothing stopped dispatch closing the pane it was running in. It is
+    reachable because every remedy tells the human to re-run this command, and
+    a human shell inside the setup pane has no hook on it: with HERDR_PANE_ID
+    set to the setup pane, dispatch emitted a close for that pane."""
+
+    def test_the_calling_pane_is_not_closed_before_setup_restarts(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9160", agent=False)
+            code, calls, out, err = _run_dispatch("FANDEVX-9160", repo_root,
+                                                  "repo", snap=spent,
+                                                  caller="wTest:pSetup")
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls),
+                         "closing the calling pane kills the session running "
+                         "this command")
+        self.assertTrue(any(c[:2] == ("pane", "split") for c in calls),
+                        "refusing the close must not also refuse progress")
+        self.assertIn("running in", out)
+
+    def test_the_calling_pane_is_not_closed_on_the_artifact_path(self):
+        with _repo_world() as (_, repo_root, worktree):
+            _write_artifact("FANDEVX-9161", worktree, "repo")
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9161", agent=False)
+            code, calls, _, err = _run_dispatch("FANDEVX-9161", repo_root,
+                                                "repo", snap=spent,
+                                                caller="wTest:pSetup")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls))
+        self.assertTrue(any(c[:2] == ("tab", "create") for c in calls),
+                        "the dispatch the human already paid setup for must "
+                        "still complete")
+
+    def test_another_pane_is_still_closed(self):
+        # The control: the check must refuse only the caller, or it would have
+        # quietly disabled the close entirely.
+        with _repo_world() as (_, repo_root, _worktree):
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9162", agent=False)
+            code, calls, _, err = _run_dispatch("FANDEVX-9162", repo_root,
+                                                "repo", snap=spent,
+                                                caller="wTest:pForeman")
+        self.assertEqual(code, 7, err)
+        self.assertIn(("pane", "close", "wTest:pSetup"), calls)
+
+
+class TestEverySetupPaneForTheKeyIsHandled(unittest.TestCase):
+    """Refusing to close the calling pane means a key can end up with two panes
+    carrying the setup token: the human re-runs the command from the spent setup
+    pane they are sitting in, that one stays, and a second opens. Acting on the
+    first match then closed the stale pane and opened a THIRD, paying for
+    another Opus session while the live setup agent was still working.
+
+    The stale pane is first in every fixture here, because first-match order is
+    exactly what made this a money bug."""
+
+    STALE = "wTest:pStale"
+    LIVE = "wTest:pLive"
+
+    def test_one_occupied_pane_stops_the_close_even_when_it_is_not_first(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            snap = _setup_panes_snap(repo_root, "FANDEVX-9180",
+                                     [(self.STALE, None), (self.LIVE, "idle")])
+            code, calls, out, err = _run_dispatch("FANDEVX-9180", repo_root,
+                                                  "repo", snap=snap)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls),
+                         "an agent occupying ANY setup pane for this key means "
+                         "no pane is safe to close")
+        self.assertFalse(any(c[:2] == ("pane", "split") for c in calls),
+                         "a second setup pane while one is live is a second "
+                         "paid session")
+        self.assertIn(self.LIVE, out)
+        self.assertNotIn(self.STALE, out,
+                         "naming the empty pane sends the human to a pane with "
+                         "no prompt in it while the live session is elsewhere")
+        self.assertIn("no agent occupies is closed on that same re-run", out,
+                      "the leftover empty pane must be accounted for without "
+                      "being offered as somewhere to act")
+
+    def test_two_empty_panes_are_both_closed_and_setup_starts(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            snap = _setup_panes_snap(repo_root, "FANDEVX-9181",
+                                     [(self.STALE, None), (self.LIVE, None)])
+            code, calls, _, err = _run_dispatch("FANDEVX-9181", repo_root,
+                                                "repo", snap=snap)
+        self.assertEqual(code, 7, err)
+        self.assertIn(("pane", "close", self.STALE), calls)
+        self.assertIn(("pane", "close", self.LIVE), calls,
+                      "an orphan left behind is what the next call reaches for "
+                      "instead of the live pane")
+        self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_the_calling_pane_is_still_never_closed_among_several(self):
+        # The caller is FIRST here, so the test also pins that a refused close
+        # does not abandon the rest of the cleanup: the stale pane behind it
+        # still has to go, or the next call reaches for it.
+        with _repo_world() as (_, repo_root, _worktree):
+            snap = _setup_panes_snap(repo_root, "FANDEVX-9182",
+                                     [("wTest:pSetup", None),
+                                      (self.STALE, None)])
+            code, calls, _, err = _run_dispatch("FANDEVX-9182", repo_root,
+                                                "repo", snap=snap,
+                                                caller="wTest:pSetup")
+        self.assertEqual(code, 7, err)
+        self.assertNotIn(("pane", "close", "wTest:pSetup"), calls,
+                         "cleaning up the set must not start closing the pane "
+                         "this command is running in")
+        self.assertIn(("pane", "close", self.STALE), calls)
+        self.assertTrue(any(c[:2] == ("pane", "split") for c in calls))
+
+    def test_two_occupied_panes_are_both_named(self):
+        # The message has to be true for the whole set, not just the first one
+        # found, or it sends the human to one live pane and hides the other.
+        with _repo_world() as (_, repo_root, _worktree):
+            snap = _setup_panes_snap(repo_root, "FANDEVX-9183",
+                                     [(self.STALE, "working"),
+                                      (self.LIVE, "idle")])
+            code, calls, out, err = _run_dispatch("FANDEVX-9183", repo_root,
+                                                  "repo", snap=snap)
+        self.assertEqual(code, 7, err)
+        self.assertFalse(any(c[:2] == ("pane", "close") for c in calls))
+        self.assertIn(self.STALE, out)
+        self.assertIn(self.LIVE, out)
+        self.assertIn("those panes", out)
+
+
+class TestAFailedCloseStillStartsSetup(unittest.TestCase):
+    """A close that raised aborted the whole call: exit 3 twice and `pane
+    split` never running, which is the exact wedge the close was added to
+    remove. A stale pane left behind is untidy; refusing to make progress is
+    the bug."""
+
+    def test_a_close_that_raises_warns_and_setup_starts_anyway(self):
+        with _repo_world() as (_, repo_root, _worktree):
+            spent = _setup_pane_snap(repo_root, "FANDEVX-9165", agent=False)
+            code, calls, _, err = _run_dispatch(
+                "FANDEVX-9165", repo_root, "repo", snap=spent,
+                close_error=HerdrError("pane_not_found"))
+        self.assertEqual(code, 7, err)
+        self.assertTrue(any(c[:2] == ("pane", "split") for c in calls),
+                        "a failed close must not stop the setup it was "
+                        "clearing the way for")
+        self.assertIn("pane_not_found", err)
+        self.assertIn("wTest:pSetup", err)
+
+
+class TestEveryRejectionStatesTheTrueRemedy(unittest.TestCase):
+    """Every rejection used to end "re-run this command to start setup again",
+    and re-running did not start setup: it returned exit 7 on the spent setup
+    pane. The remedy is now true, and it is stated once so no path can drift
+    back to promising something else."""
+
+    def test_the_remedy_names_both_outcomes(self):
+        # The condition is occupancy, not status: an agent still in the pane is
+        # left alone whatever herdr calls its state, so the remedy must not
+        # promise a close that depends on the agent being "still working".
+        self.assertIn("starts setup again", crew.ARTIFACT_DISCARDED)
+        self.assertIn("closed", crew.ARTIFACT_DISCARDED)
+        self.assertIn("no agent occupies", crew.ARTIFACT_DISCARDED)
+        self.assertIn("left alone", crew.ARTIFACT_DISCARDED)
+        self.assertNotIn("still working", crew.ARTIFACT_DISCARDED)
+
+    def test_every_refusal_carries_it(self):
+        with _repo_world() as (tmp, repo_root, worktree):
+            outside = os.path.join(tmp, "elsewhere")
+            os.makedirs(outside)
+            gone = os.path.join(repo_root, ".claude", "worktrees", "gone")
+            cases = [
+                ("unreadable JSON",
+                 dict(worktree=None, repo=None, text="{not json")),
+                ("another repo", dict(worktree=worktree, repo="other-repo")),
+                ("outside the repo", dict(worktree=outside, repo="repo")),
+                ("worktree gone", dict(worktree=gone, repo="repo")),
+                ("bad branch",
+                 dict(worktree=worktree, repo="repo", branch="../x")),
+                ("over-length branch",
+                 dict(worktree=worktree, repo="repo",
+                      branch="b" * (crew.TOKEN_VALUE_MAX + 1))),
+                ("branch does not derive the worktree",
+                 dict(worktree=worktree, repo="repo", branch="other")),
+            ]
+            for label, kwargs in cases:
+                with self.subTest(case=label):
+                    _write_artifact("FANDEVX-9160", **kwargs)
+                    with self.assertRaises(CrewError) as ctx:
+                        read_dispatch_artifact("FANDEVX-9160", "repo",
+                                               repo_root)
+                    self.assertIn(crew.ARTIFACT_DISCARDED, str(ctx.exception))
+
+
+class TestDispatchLockSerialisesOneKey(unittest.TestCase):
+    """The per-key lock is the only thing serialising two concurrent dispatches
+    of one key, and so the only guard against two paid sessions on one
+    worktree. Replacing `with _locked(...)` with `if True:` left the suite
+    green, so the invariant is asserted directly: never two dispatches of one
+    key inside the critical section at once."""
+
+    def test_two_concurrent_dispatches_of_one_key_do_not_overlap(self):
+        import threading
+        import time as real_time
+
+        inside, peak = [0], [0]
+
+        def occupy_the_critical_section():
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+            real_time.sleep(0.25)
+            inside[0] -= 1
+            return DEFS
+
+        codes = []
+        with _repo_world() as (_, repo_root, _worktree):
+            with mock.patch.object(crew, "resolve_repo",
+                                   return_value=(repo_root, "repo")), \
+                 mock.patch.object(crew, "schema_defs",
+                                   side_effect=occupy_the_critical_section), \
+                 mock.patch.object(crew, "snapshot",
+                                   return_value=_snap([], [])), \
+                 mock.patch.object(crew, "start_setup",
+                                   return_value="wTest:pSetup"), \
+                 mock.patch.dict(crew.os.environ,
+                                 {"HERDR_WORKSPACE_ID": "wTest"}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+
+                def dispatch():
+                    codes.append(crew.main(["dispatch", "FANDEVX-9170",
+                                            "--type", "implementer"]))
+
+                threads = [threading.Thread(target=dispatch) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+        self.assertEqual(codes, [7, 7])
+        self.assertEqual(peak[0], 1,
+                         "two dispatches of one key were inside the critical "
+                         "section at once, so both could pay for a session")
+
+
+class TestMailAckIsForemanOnly(unittest.TestCase):
+    """Exit 4 is documented as load-bearing in two SKILL.md files, and
+    is_foreman_pane could be replaced with `return True` with the whole suite
+    still green. This is the same class of defect as the caller-identity check
+    that ignored its input."""
+
+    def _ack(self, foreman_pane, me="wV:p1", seq=12):
+        snap = _snap([_full_agent(foreman_pane, "idle", "foreman")]
+                     if foreman_pane else [], [])
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor = os.path.join(tmp, "cursor")
+            with mock.patch.object(crew, "calling_pane", return_value=me), \
+                 mock.patch.object(crew, "snapshot", return_value=snap), \
+                 mock.patch.object(crew, "CREW_DIR", tmp), \
+                 mock.patch.object(crew, "CURSOR", cursor), \
+                 mock.patch.object(crew.sys, "stderr", io.StringIO()):
+                code = crew.main(["mail", "ack", str(seq)])
+            written = None
+            if os.path.exists(cursor):
+                with open(cursor) as handle:
+                    written = handle.read().strip()
+        return code, written
+
+    def test_ack_from_a_non_foreman_pane_exits_4_and_acks_nothing(self):
+        code, written = self._ack(foreman_pane="wQ:pForeman")
+        self.assertEqual(code, 4)
+        self.assertIsNone(written,
+                          "a refused ack must not advance the cursor, or the "
+                          "mail it refused to acknowledge is lost")
+
+    def test_ack_with_no_foreman_agent_at_all_exits_4(self):
+        code, written = self._ack(foreman_pane=None)
+        self.assertEqual(code, 4)
+        self.assertIsNone(written)
+
+    def test_ack_outside_a_herdr_pane_exits_4(self):
+        code, written = self._ack(foreman_pane="wV:p1", me="")
+        self.assertEqual(code, 4)
+        self.assertIsNone(written)
+
+    def test_the_real_foreman_pane_acks(self):
+        # The control: the check must not be refusing everything.
+        code, written = self._ack(foreman_pane="wV:p1")
+        self.assertEqual(code, 0)
+        self.assertEqual(written, "12")
 
 
 CREW_GUARD = os.path.normpath(os.path.join(
@@ -1586,6 +2179,30 @@ GUARD_FORBIDDEN = (
     "herdr tab close wV:t2",
     "herdr workspace close wV",
     "herdr server stop",
+    # Pane-level verbs reaching an effect the agent-level guard already
+    # blocks. Every one of these was allowed from a crew worktree.
+    "herdr pane run wV:p2 'crew dispatch FANDEVX-1 --type implementer'",
+    "herdr pane send-keys wV:p2 C-c",
+    "herdr pane send-text wV:p2 'do this instead'",
+    "herdr pane report-metadata wV:p2 --source crew --clear-token key",
+    "herdr pane report-agent wV:p2 --state idle",
+    "herdr pane report-agent-session wV:p2 --session s-1",
+    "herdr pane release-agent wV:p2",
+    "herdr pane move wV:p2 --tab wV:t3",
+    "herdr pane swap wV:p1 wV:p2",
+)
+
+# Read-only pane verbs. Blocking these would stop a crew member looking at its
+# own pane, and a guard that blocks legitimate work gets switched off.
+GUARD_READ_ONLY_PANE = (
+    "herdr pane list",
+    "herdr pane get wV:p2",
+    "herdr pane read wV:p2 --lines 40",
+    "herdr pane current",
+    "herdr pane layout",
+    "herdr pane neighbor wV:p2 --direction left",
+    "herdr pane edges wV:p2",
+    "herdr pane process-info wV:p2",
 )
 
 
@@ -1657,6 +2274,24 @@ class TestCrewGuardHook(unittest.TestCase):
                 "herdr --json agent rename wV:p1 foreman"):
             with self.subTest(command=command):
                 self._assert(_guard(command), "deny", command)
+
+    def test_read_only_pane_verbs_stay_allowed_in_a_crew_worktree(self):
+        for command in GUARD_READ_ONLY_PANE:
+            with self.subTest(command=command):
+                self._assert(_guard(command), "allow", command)
+
+    def test_the_parser_is_shlex_and_not_a_naive_split(self):
+        # `crew "dispatch" K` tokenises to ["crew", "dispatch", "K"] under
+        # shlex and to ["crew", '"dispatch"', "K"] under command.split(),
+        # which matches no verb and allows the costliest action gated here.
+        self._assert(_guard('crew "dispatch" FANDEVX-1'), "deny",
+                     "quoted subcommand")
+        # And the program side: a quoted path containing a space is one token
+        # under shlex and three under a naive split, so its basename stops
+        # being `crew`.
+        self._assert(
+            _guard('"/Users/some one/.local/bin/crew" dispatch FANDEVX-1'),
+            "deny", "quoted path with a space")
 
     def test_a_forbidden_verb_inside_a_commit_message_is_allowed(self):
         # The raw substring pass was removed on purpose: it denied real work

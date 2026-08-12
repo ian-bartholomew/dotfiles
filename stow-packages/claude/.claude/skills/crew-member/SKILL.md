@@ -65,6 +65,26 @@ human's to confirm, because another crew member's context is unsaved work.
 
 Never force-push. Never merge. The human merges.
 
+## The guard stops accidents, not intent
+
+A PreToolUse hook denies you `crew dispatch`, `crew nudge`, `crew mail ack`,
+`crew claim-foreman`, and the `herdr` verbs that start, steer, relocate or
+close another session. It denies them at both layers, `herdr agent ...` and
+the `herdr pane ...` equivalents, because `pane send-keys` reaches the same
+effect as `agent send-keys` and `pane report-metadata` can erase the tokens
+crew treats as the authoritative record of who owns what.
+
+It is not a sandbox, and the design does not pretend otherwise. `herdr pane
+run` would execute its command in a pane shell, where NO PreToolUse hook fires
+at all, so the hook can only refuse the invocation, never the effect. The same
+is true of any wrapper, and herdr's socket has no authorization: every process
+running as this user has full control. The boundary above is yours to keep.
+The hook exists to catch the honest mistake and the prompt injection, not you.
+
+So if the guard denies something, that is the answer. Do not look for another
+route to the same effect. Report what you need with `crew mail send` and let
+the foreman or the human act.
+
 ## These override the global CLAUDE.md for you
 
 - Do NOT run `/start-ticket`. It already ran before you existed; your

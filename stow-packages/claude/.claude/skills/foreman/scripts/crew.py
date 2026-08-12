@@ -696,6 +696,41 @@ def worktree_for(root, branch):
     return os.path.join(root, ".claude", "worktrees", branch)
 
 
+def branch_for(root, worktree):
+    """The inverse of worktree_for: the branch a worktree path records.
+
+    /start-ticket names branches <TICKET>/<slug>, so the branch is the path
+    RELATIVE to the worktrees directory, not its basename. Basename kept only
+    the last component, and the tokens are the authoritative record every later
+    reader recomputes the path from, so `crew ls`, `crew peek` and the exit 5
+    resume line would all print a directory that does not exist."""
+    return os.path.relpath(worktree, os.path.join(root, ".claude", "worktrees"))
+
+
+def branch_path_problem(branch):
+    """Why this branch cannot name a worktree directory, or None.
+
+    An interior separator is the ORDINARY case: /start-ticket mandates
+    <TICKET>/<slug>, and refusing it meant every JIRA dispatch was refused
+    after a paid setup session had already been spent. What stays refused is
+    what makes the derived path unsafe or ambiguous: empty, absolute, a
+    leading or trailing separator, an empty interior component, and any `.` or
+    `..` component.
+
+    COMPONENTS are inspected rather than the string scanned for a substring,
+    so `a/../../b` is caught while `feat..ure`, a legal branch name, is not."""
+    if not branch:
+        return "is empty"
+    if os.path.isabs(branch):
+        return "is an absolute path"
+    parts = branch.split(os.sep)
+    if "" in parts:
+        return "has an empty path component"
+    if os.curdir in parts or os.pardir in parts:
+        return "has a %r or %r component" % (os.curdir, os.pardir)
+    return None
+
+
 def tag_pane(pane_id, key, repo, ctype, branch, root):
     args = [
         "pane", "report-metadata", pane_id, "--source", "crew",
@@ -742,15 +777,56 @@ def find_member(snap, root, key):
     return None
 
 
+def find_setup_panes(snap, root, key):
+    """EVERY setup pane carrying this key, not just the first.
+
+    One key really can have several. Dispatch refuses to close the pane it is
+    running in, and the remedy printed on every rejection tells the human to
+    re-run the command, which they naturally do from the setup pane they are
+    already sitting in: that leaves the old pane tagged and opens a second one.
+
+    Acting on the first match alone then reached for the wrong pane. It could
+    close a stale one and open ANOTHER setup pane, paying for a second Opus
+    session, while a live setup agent for the same key was still working. So the
+    whole set is inspected together: one occupied pane means close nothing, and
+    when none is occupied every one of them goes, or the next call trips over
+    whatever was left behind."""
+    wanted = sanitize_name(key)
+    return [member for member in crew_members(snap)
+            if member["type"] == "setup" and member["root"] == root
+            and member["key"] == wanted]
+
+
 def find_setup_pane(snap, root, key):
     """Setup panes are excluded from find_member so an orphan cannot brick a
     key. They must still be findable, or a retry spawns a second paid one."""
-    wanted = sanitize_name(key)
-    for member in crew_members(snap):
-        if (member["type"] == "setup" and member["root"] == root
-                and member["key"] == wanted):
-            return member
-    return None
+    panes = find_setup_panes(snap, root, key)
+    return panes[0] if panes else None
+
+
+def pane_has_agent(snap, pane_id):
+    """Whether an agent occupies this pane, read off the snapshot's agent list.
+
+    Absence is the only sound signal that closing a setup pane destroys
+    nothing. It is the same fact the `recover` bucket rests on, where an
+    agent-less crew pane shows up because crew_members finds no agent for it,
+    but it is read straight off the agent list here rather than through a
+    status, because EVERY status means an agent is present. Per herdr's own
+    definitions: `idle` is ready for input, `done` is that same idle state after
+    unseen background work finished, and `unknown` is an agent present that
+    herdr cannot classify confidently.
+
+    Gating a close on ("done", "idle", "unknown") therefore closed live
+    sessions, and the modal JIRA path lands exactly there: /start-ticket asks
+    the human questions in prose, which settles as idle or done and never as
+    blocked, so a human part way through answering lost the pane and the re-run
+    spent another paid Opus session.
+
+    Narrowing that list cannot fix it either. SETUP_PROMPT tells the setup agent
+    to write its JSON and stop, and a stopped Claude Code session is still
+    resident, so a FINISHED setup agent reads as idle or done as well. herdr
+    cannot tell "finished" from "waiting for your answer" by status at all."""
+    return any(agent["pane_id"] == pane_id for agent in snap["agents"])
 
 
 DEV_ROOT = os.path.expanduser("~/Dev")
@@ -909,6 +985,52 @@ def start_setup(key, repo, repo_root):
     return setup_pane
 
 
+def close_setup_pane(pane_id):
+    """Close crew's own spent setup pane. True if it is gone, False with the
+    reason printed if it is not.
+
+    Both refusals leave dispatch making progress, because this close exists to
+    unwedge a key and must never become the thing that wedges it.
+
+    The CALLING pane is never closed. Every rejection tells the human to re-run
+    this command, nothing hooks a human shell inside the setup pane, and with
+    HERDR_PANE_ID set to the setup pane dispatch emitted a close for the pane it
+    was running in. calling_pane() is spoofable, which is harmless here: this
+    check only ever prevents an action, so a spoofed value cannot cause a close
+    that would not otherwise happen.
+
+    A close that raises warns and returns. Aborting produced exit 3 twice with
+    `pane split` never running, which is the exact wedge this close was added to
+    remove. A stale pane left behind is untidy; refusing to make progress is a
+    bug."""
+    me = calling_pane()
+    if me and pane_id == me:
+        print("setup pane %s is the pane this command is running in, so it has "
+              "NOT been closed: that would kill this session. Close it yourself "
+              "once you no longer need it." % pane_id)
+        return False
+    try:
+        herdr("pane", "close", pane_id)
+    except HerdrError as exc:
+        print("could not close spent setup pane %s (%s), so it is still there. "
+              "Carrying on regardless; close that pane yourself."
+              % (pane_id, exc), file=sys.stderr)
+        return False
+    # Says only what BOTH callers can vouch for. One has an artifact proving
+    # setup finished, the other has an empty pane; neither has both, and a
+    # message this wave exists to make honest must not claim the other one.
+    print("closed spent setup pane %s." % pane_id)
+    return True
+
+
+ARTIFACT_DISCARDED = (
+    "It has been discarded. Re-running this command starts setup again: a setup "
+    "pane no agent occupies any more is closed first, while one an agent is "
+    "still in is named and left alone, because closing it would destroy that "
+    "session."
+)
+
+
 def read_dispatch_artifact(key, repo, repo_root):
     """None if setup has not written it yet, which is the common case on a
     fresh call.
@@ -940,49 +1062,46 @@ def read_dispatch_artifact(key, repo, repo_root):
     except ValueError as exc:
         clear_dispatch_artifact(key)
         raise CrewError(
-            "setup wrote unreadable JSON to %s (%s). It has been discarded; "
-            "re-run this command to start setup again." % (artifact, exc))
+            "setup wrote unreadable JSON to %s (%s). %s"
+            % (artifact, exc, ARTIFACT_DISCARDED))
 
     claimed = str(data.get("repo") or "").strip()
     if claimed != repo:
         clear_dispatch_artifact(key)
         raise CrewError(
-            "%s is for repo %r, but this dispatch is for %r. It has been "
-            "discarded; re-run this command to start setup again."
-            % (artifact, claimed, repo))
+            "%s is for repo %r, but this dispatch is for %r. %s"
+            % (artifact, claimed, repo, ARTIFACT_DISCARDED))
 
     worktree = str(data.get("worktree") or "").strip()
     if not worktree or not is_inside(worktree, repo_root):
         clear_dispatch_artifact(key)
         raise CrewError(
-            "%s names worktree %r, which is not inside repo root %r. It has "
-            "been discarded; re-run this command to start setup again."
-            % (artifact, worktree, repo_root))
+            "%s names worktree %r, which is not inside repo root %r. %s"
+            % (artifact, worktree, repo_root, ARTIFACT_DISCARDED))
     if not os.path.isdir(worktree):
         clear_dispatch_artifact(key)
         raise CrewError(
-            "setup wrote %s but worktree %r does not exist. It has been "
-            "discarded; re-run this command to start setup again."
-            % (artifact, worktree))
+            "setup wrote %s but worktree %r does not exist. %s"
+            % (artifact, worktree, ARTIFACT_DISCARDED))
 
     # The branch is validated HERE, not left to reach tag_pane. Over the token
     # limit it would raise only after a pane already existed, leaking an
-    # untagged pane on every retry; and a separator or .. derives a directory
+    # untagged pane on every retry; and a `..` component derives a directory
     # that is inside the repo but is not a worktree.
     branch = str(data.get("branch") or "").strip()
-    if not branch or os.sep in branch or branch in (os.curdir, os.pardir):
+    problem = branch_path_problem(branch)
+    if problem:
         clear_dispatch_artifact(key)
         raise CrewError(
-            "%s names branch %r, which is not a single directory name. It has "
-            "been discarded; re-run this command to start setup again."
-            % (artifact, branch))
+            "%s names branch %r, which %s, so it cannot name a worktree "
+            "directory. %s" % (artifact, branch, problem, ARTIFACT_DISCARDED))
     if len(branch) > TOKEN_VALUE_MAX:
         clear_dispatch_artifact(key)
         raise CrewError(
             "%s names branch %r, %d chars, over herdr's %d limit, so the token "
-            "recording it would be silently truncated. It has been discarded; "
-            "re-run this command to start setup again."
-            % (artifact, branch, len(branch), TOKEN_VALUE_MAX))
+            "recording it would be silently truncated. %s"
+            % (artifact, branch, len(branch), TOKEN_VALUE_MAX,
+               ARTIFACT_DISCARDED))
 
     # Containment is not enough: <root>/tmp/wt is inside the repo, and the
     # tokens written from it derive <root>/.claude/worktrees/wt, a path that
@@ -993,9 +1112,8 @@ def read_dispatch_artifact(key, repo, repo_root):
         clear_dispatch_artifact(key)
         raise CrewError(
             "%s names worktree %r, but branch %r derives %r, and the tokens "
-            "store the branch rather than the path. It has been discarded; "
-            "re-run this command to start setup again."
-            % (artifact, worktree, branch, derived))
+            "store the branch rather than the path. %s"
+            % (artifact, worktree, branch, derived, ARTIFACT_DISCARDED))
     return derived
 
 
@@ -1011,7 +1129,7 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     # Tag before agent.start. Tokens are authoritative, so an untagged
     # pane is invisible to ls; a tag that failed afterwards would leave a
     # live session unowned and burning shared quota.
-    tag_pane(pane, key, repo, ctype, os.path.basename(worktree), repo_root)
+    tag_pane(pane, key, repo, ctype, branch_for(repo_root, worktree), repo_root)
 
     live = set(a.get("name") for a in snap["agents"] if a.get("name"))
     name = pick_name(key, live)
@@ -1105,7 +1223,7 @@ def cmd_dispatch(key, ctype, repo, model):
         if worktree is not None:
             setup = find_setup_pane(snap, repo_root, key)
             if setup is not None:
-                herdr("pane", "close", setup["pane"])
+                close_setup_pane(setup["pane"])
             code = _complete_dispatch(key, ctype, repo, repo_root, workspace,
                                       model, worktree, snap)
             # Only after it returns. By then the paid session is started and
@@ -1117,12 +1235,32 @@ def cmd_dispatch(key, ctype, repo, model):
             return code
 
         if is_ticket(key):
-            setup = find_setup_pane(snap, repo_root, key)
-            if setup is not None:
-                print("setup pane %s is already running /start-ticket for "
-                      "%s. Answer the prompt in that pane, then re-run this "
-                      "command." % (setup["pane"], key))
+            setups = find_setup_panes(snap, repo_root, key)
+            occupied = [s for s in setups if pane_has_agent(snap, s["pane"])]
+            if occupied:
+                label = "pane" if len(occupied) == 1 else "panes"
+                subject = "that pane" if len(occupied) == 1 else "those panes"
+                # Only OCCUPIED panes are named as somewhere to act. Naming an
+                # empty one would send the human to a pane with no prompt in it
+                # while the live session sat elsewhere.
+                where = ", ".join("%s (herdr reports %s)"
+                                  % (s["pane"], s["status"]) for s in occupied)
+                leftover = ("" if len(setups) == len(occupied) else
+                            " Any other setup pane for this key that no agent "
+                            "occupies is closed on that same re-run.")
+                print("setup for %s still has an agent in it: %s %s. Nothing "
+                      "has been closed, because that is where /start-ticket "
+                      "may still be waiting on your answer. Either answer or "
+                      "redo setup there, or close %s yourself and re-run this "
+                      "command to start setup fresh.%s"
+                      % (key, label, where, subject, leftover))
                 return 7
+            # crew opened these panes and already closes one on the success
+            # path, and no agent is in any of them, so there is no session here
+            # to destroy. All of them go: an orphan left behind is what the
+            # next call reaches for instead of the live pane.
+            for setup in setups:
+                close_setup_pane(setup["pane"])
             setup_pane = start_setup(key, repo, repo_root)
             print("opened setup pane %s to run /start-ticket for %s. Answer "
                   "the prompt in that pane, then re-run this command."

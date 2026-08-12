@@ -13,6 +13,10 @@ output reaches the foreman's context, and a crew member reads untrusted diffs
 and logs. It does NOT stop a determined process, which can evade any
 string-matching gate by encoding the command, writing a wrapper, or calling the
 socket directly. Treat it as a guard rail, not a sandbox.
+
+`herdr pane run` is blocked below, but understand what that buys: the command
+it carries would execute in a pane shell, where no PreToolUse hook fires at
+all. Blocking the invocation stops the accident. Nothing here stops the intent.
 """
 import json
 import os
@@ -21,6 +25,13 @@ import sys
 
 # (program, verb tuple, why). Each spends money, steers another session, or
 # destroys one.
+#
+# The pane-level verbs are here because every one of them reaches an effect
+# already blocked one layer up: `pane run` runs the blocked command, `pane
+# send-keys` types it, `pane report-metadata --clear-token` erases the record
+# crew treats as authoritative, and `pane report-agent` fakes the lifecycle
+# state the foreman reads. Blocking `agent send-keys` while allowing `pane
+# send-keys` gates the label, not the effect.
 FORBIDDEN = (
     ("crew", ("dispatch",),
      "dispatching spends a paid session, and only the foreman dispatches"),
@@ -32,6 +43,20 @@ FORBIDDEN = (
     ("herdr", ("agent", "rename"), "renaming an agent is the foreman's to do"),
     ("herdr", ("agent", "send-keys"), "sending keys drives another session"),
     ("herdr", ("pane", "close"), "closing a pane is the human's to confirm"),
+    ("herdr", ("pane", "run"),
+     "running a command in another pane runs it as that session"),
+    ("herdr", ("pane", "send-keys"), "sending keys drives another session"),
+    ("herdr", ("pane", "send-text"), "sending text drives another session"),
+    ("herdr", ("pane", "report-metadata"),
+     "pane tokens are crew's authoritative record of who owns what"),
+    ("herdr", ("pane", "report-agent"),
+     "reporting a lifecycle state fakes what the foreman reads"),
+    ("herdr", ("pane", "report-agent-session"),
+     "reassigning an agent session rewrites who a pane belongs to"),
+    ("herdr", ("pane", "release-agent"),
+     "releasing an agent detaches it from the fleet"),
+    ("herdr", ("pane", "move"), "moving a pane relocates another session"),
+    ("herdr", ("pane", "swap"), "swapping panes relocates another session"),
     ("herdr", ("tab", "close"), "closing a tab is the human's to confirm"),
     ("herdr", ("workspace", "close"),
      "closing a workspace is the human's to confirm"),
