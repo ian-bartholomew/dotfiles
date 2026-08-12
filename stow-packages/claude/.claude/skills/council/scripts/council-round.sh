@@ -138,7 +138,12 @@ PROMPT="$(cat "$prompt_file")"
 # <member>.exit. Members run read-only and never touch the working tree.
 run_codex() {
   local out="$out_dir/codex.out"
-  local args=(exec --skip-git-repo-check -s read-only -o "$out")
+  # --ignore-user-config: a council seat must be a fast one-shot proposer, not an agentic
+  # crawler. Without it codex loads the user's ~/.codex config (hooks, MCP, skills) -- e.g.
+  # a UserPromptSubmit hook that injects a wiki and sends codex off on a multi-round file
+  # crawl. That makes codex far slower than the lightweight agy/claude seats, so under
+  # /moa's quorum it's the straggler that gets reaped every time and silently drops out.
+  local args=(exec --ignore-user-config --skip-git-repo-check -s read-only -o "$out")
   [ -n "$CODEX_MODEL" ] && args+=(-m "$CODEX_MODEL")
   # `--` ends option parsing so a prompt beginning with a dash is treated as the prompt,
   # not misread as a codex flag.
@@ -236,8 +241,14 @@ wait 2>/dev/null
 any_ok=1
 for member in "${MEMBERS[@]}"; do
   out="$out_dir/$member.out"
-  rc="$(cat "$out_dir/$member.exit" 2>/dev/null || echo 1)"
-  if [ "$rc" = "0" ] && [ -s "$out" ]; then
+  # An empty rc means the exit file was never written: the quorum reap killed the worker
+  # subshell after the member flushed its answer but before it recorded its exit code.
+  # codex is the usual victim -- it writes its answer via -o mid-run but tears down slowly
+  # (MCP/session teardown), so it's still exiting when the two faster seats hit quorum.
+  # A reaped member with a non-empty answer file did produce a usable answer; count it ok
+  # rather than throwing the work away. An explicit nonzero exit or a timeout still fails.
+  rc="$(cat "$out_dir/$member.exit" 2>/dev/null)"
+  if { [ "$rc" = "0" ] || [ -z "$rc" ]; } && [ -s "$out" ]; then
     printf '%s\tok\t%s\n' "$member" "$out"
     any_ok=0
   elif [ "$rc" = "124" ]; then

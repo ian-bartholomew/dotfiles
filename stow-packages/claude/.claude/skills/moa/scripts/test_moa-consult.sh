@@ -121,13 +121,14 @@ bash "$HERE/moa-consult.sh" --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/o6
   && fail "--layers abc should be rejected"
 echo "PASS: invalid --layers rejected"
 
-# --- case 6: default quorum makes a layer return without blocking on the slowest seat ---
-# Two fast proposers + one that hangs; moa should not wait out the slow seat's timeout.
+# --- case 6: default waits for all seats; the slow seat (codex-like) is not dropped ---
+# Two fast proposers + one slow-but-completing (models the real codex cold-start). Under the
+# wait-for-all default the slow seat must appear; explicit COUNCIL_QUORUM=2 still early-returns.
 mkdir -p "$WORK/qbin"
 cat >"$WORK/qbin/codex" <<'EOF'
 #!/usr/bin/env bash
 out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
-[ -n "$out" ] && echo "codex quick" >"$out"; exit 0
+[ -n "$out" ] && { sleep 3; echo "codex slow" >"$out"; }; exit 0
 EOF
 cat >"$WORK/qbin/claude" <<'EOF'
 #!/usr/bin/env bash
@@ -135,16 +136,22 @@ echo "sonnet quick"; exit 0
 EOF
 cat >"$WORK/qbin/agy" <<'EOF'
 #!/usr/bin/env bash
-sleep 30
+echo "agy quick"; exit 0
 EOF
 chmod +x "$WORK/qbin/"*
-q_start=$SECONDS
 PATH="$WORK/qbin:$PATH" COUNCIL_TIMEOUT=30 bash "$HERE/moa-consult.sh" \
-  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/oq" >/dev/null 2>&1 || fail "quorum consult should exit 0"
+  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/oq" >/dev/null 2>&1 || fail "consult should exit 0"
+grep -q "codex slow" "$WORK/oq/moa-final.md" || fail "default should wait for the slow seat, not drop it"
+echo "PASS: default waits for all seats and keeps the slow (codex-like) proposer"
+
+# explicit COUNCIL_QUORUM=2 still early-returns and drops the slow seat (speed opt-out)
+q_start=$SECONDS
+PATH="$WORK/qbin:$PATH" COUNCIL_TIMEOUT=30 COUNCIL_QUORUM=2 bash "$HERE/moa-consult.sh" \
+  --prompt-file "$WORK/prompt.txt" --out-dir "$WORK/oq2" >/dev/null 2>&1 || fail "quorum consult should exit 0"
 q_el=$((SECONDS - q_start))
-[ "$q_el" -lt 10 ] || fail "moa should return on quorum, not wait the slow seat (took ${q_el}s)"
-grep -q "codex quick" "$WORK/oq/moa-final.md" || fail "quorum consult missing a fast proposal"
-echo "PASS: default quorum returns without blocking on the slow seat"
+[ "$q_el" -lt 3 ] || fail "COUNCIL_QUORUM=2 should return before the slow seat (took ${q_el}s)"
+grep -q "codex slow" "$WORK/oq2/moa-final.md" && fail "quorum=2 should drop the slow seat"
+echo "PASS: COUNCIL_QUORUM=2 still early-returns (speed opt-out preserved)"
 
 # --- case 7 (C6): the real failure cause is surfaced, not hidden in the layer log ---
 # COUNCIL_TIMEOUT=0 makes council-round exit with a specific message; moa must surface it

@@ -1,6 +1,6 @@
 ---
 name: terraform-review
-description: Review Terraform code on the current branch or a GitHub PR across four lenses — style, module API, security, correctness — with confidence-filtered findings. Triggers on "/terraform-review", "review my terraform", "tf review", "review this terraform PR", "audit this terraform diff".
+description: Review Terraform code on the current branch or a GitHub PR across four lenses — style, module API, security, correctness — with confidence-filtered findings. Two additional whole-diff reviewers run on external CLIs (Codex and Antigravity) for cross-model diversity. Triggers on "/terraform-review", "review my terraform", "tf review", "review this terraform PR", "audit this terraform diff".
 arguments:
   - name: target
     description: Optional GitHub PR number (e.g. 1234 or #1234) or PR URL. If omitted, reviews the current branch diff against origin/main.
@@ -14,7 +14,7 @@ arguments:
 
 You are running a multi-lens Terraform code review. The goal is *"is this good Terraform?"* — distinct from `fes-terraform-plan-risk` which answers *"is this safe to merge right now?"*.
 
-The skill fans out to four parallel reviewer agents, one per lens, then merges and filters findings before printing.
+The skill fans out to four parallel reviewer agents, one per lens, plus two cross-model reviewers running on external CLIs (**Codex** via `codex exec`, **Antigravity** via `agy`) that review the whole diff across all lenses. All six streams merge into one confidence-filtered report.
 
 ## Step 1: Parse arguments
 
@@ -87,9 +87,40 @@ Record which tools were *available* (vs missing) so the final report's footer ca
 
 If a `CLAUDE.md` exists at the repo root, read it. Pass relevant snippets to each reviewer in Step 5 so they respect repo-specific conventions.
 
-## Step 5: Dispatch reviewer agents in parallel
+## Step 5: Dispatch reviewers in parallel
 
-In a **single message**, issue four (or fewer, if `--lens` is set) `Agent` tool calls with `subagent_type: terraform-reviewer`. The four lenses are:
+### Step 5a: Prepare the cross-model prompt file
+
+The external CLIs run headless and can't reliably read the skill's reference files, so everything is inlined.
+
+```bash
+XMODEL_DIR=$(mktemp -d)
+echo "$XMODEL_DIR"   # capture for the Write and Read calls below
+```
+
+`Write` `$XMODEL_DIR/prompt.txt` containing, in order:
+
+1. `You are reviewing a Terraform diff. Apply all four lenses: style, module API design, security, correctness.` (If `single_lens` is set, name only that lens.)
+2. The contents of `references/output-schema.md`.
+3. The repo CLAUDE.md snippet, if any.
+4. The deterministic-tool output from Step 3.
+5. The full unified diff and `FILES` list.
+6. `Return only the YAML findings list matching the schema above. No prose, no headers, no code fences. Set the 'lens' field to whichever of style|module-api|security|correctness fits each finding. If you find nothing at ≥80 confidence, return an empty list ([]).`
+
+### Step 5b: Dispatch all reviewers concurrently
+
+In a **single message**, issue four (or fewer, if `--lens` is set) `Agent` tool calls with `subagent_type: terraform-reviewer`, **plus one `Bash` call** for the two cross-model reviewers:
+
+```bash
+COUNCIL_TIMEOUT=300 ~/.claude/skills/council/scripts/council-round.sh \
+  --prompt-file "$XMODEL_DIR/prompt.txt" \
+  --out-dir "$XMODEL_DIR" \
+  --members codex,antigravity
+```
+
+The script writes `$XMODEL_DIR/codex.out` and `$XMODEL_DIR/antigravity.out` and prints a tab-separated manifest (`<member>\tok|failed(timeout)|failed\t<path>`). The `Agent` calls and this `Bash` call must go out together — do not dispatch sequentially.
+
+The four lens agents are:
 
 - `style` — pass `references/style.md`, fmt + tflint formatting findings.
 - `module-api` — pass `references/module-api.md`, tflint output as context.
@@ -110,10 +141,12 @@ Each call's prompt must end with: *"Return only the YAML findings list. No prose
 
 ## Step 6: Merge and filter
 
-Parse each agent's YAML output. Combine into one list, then:
+Parse each agent's YAML output. Then, for each member the manifest marks `ok`, `Read` `$XMODEL_DIR/codex.out` / `$XMODEL_DIR/antigravity.out` and parse the same way — tag those findings `source: codex` and `source: antigravity` (lens agents are `source: local`). A member marked `failed` / `failed(timeout)` produced nothing usable: note it in the report footer and move on; never fabricate its findings. Strip any stray prose or code fences the CLIs wrap around the YAML; if a member's output won't parse, treat it as failed.
+
+Combine into one list, then:
 
 1. **Filter** — drop findings with `confidence < 80` unless `show_all=true`.
-2. **Dedupe** — collapse identical `(file, line, rule)` tuples that appear from multiple agents. When deduping cross-lens hits, bump the surviving finding's confidence by `+10` (capped at 100) and tag with both lenses.
+2. **Dedupe** — collapse identical `(file, line, rule)` tuples that appear from multiple reviewers. When deduping hits from different lenses *or different models*, bump the surviving finding's confidence by `+10` (capped at 100) and tag with every contributing lens and source.
 3. **Group** by lens; within each, sort by severity (`critical` > `high` > `medium` > `low` > `info`) then `file:line`.
 
 ## Step 7: Print the report
@@ -124,17 +157,17 @@ Format (no emojis, no markdown headers in the chat output — keep it scannable)
 Terraform Review — <branch-or-PR> (<N> files changed)
 
 [SECURITY]
-  HIGH (conf 92)  modules/eks/iam.tf:14  iam-wildcard-action
+  HIGH (conf 92)  modules/eks/iam.tf:14  iam-wildcard-action  [local, codex]
     <message>
     > <suggestion>
 
 [CORRECTNESS]
-  CRITICAL (conf 95)  services/cognito/main.tf:88  rename-without-moved-block
+  CRITICAL (conf 95)  services/cognito/main.tf:88  rename-without-moved-block  [local]
     <message>
     > <suggestion>
 
 [MODULE-API]
-  MEDIUM (conf 85)  modules/vpc/variables.tf:5  variable-no-type
+  MEDIUM (conf 85)  modules/vpc/variables.tf:5  variable-no-type  [antigravity]
     <message>
     > <suggestion>
 
@@ -142,8 +175,11 @@ Terraform Review — <branch-or-PR> (<N> files changed)
   (no findings ≥80 confidence)
 
 Summary: <crit> critical, <high> high, <med> medium, <low> low. <N> lower-confidence findings suppressed (use --all to show).
+Reviewers: 4 lens agents + codex, antigravity. (<failed members> unavailable — skipped.)
 Tools used: terraform fmt, terraform validate, tflint. (<missing tools> not installed — skipped.)
 ```
+
+The trailing `[...]` on each finding is its source tag(s) — which reviewers surfaced it. Omit the failed-members note when both cross-model reviewers returned.
 
 If `references` are present on a finding, append them as a trailing line: `refs: [[wiki-page-a]], [[wiki-page-b]]`.
 
@@ -154,5 +190,7 @@ If no findings at all: `Terraform Review — no issues at ≥80 confidence (<len
 ## Notes on calibration
 
 - These reviewer agents are anchored by `references/output-schema.md`'s severity and confidence rubrics. If false-positive rate creeps up, tighten the confidence rubric there (single source of truth).
-- The `+10 cross-lens bump` is intentional: when two independent lenses flag the same line, that's a stronger signal than either alone.
+- The `+10 cross-lens bump` is intentional: when two independent lenses — or two different model families — flag the same line, that's a stronger signal than either alone.
+- The cross-model seats reuse `council-round.sh` rather than shelling out to `codex` / `agy` directly. That script owns the timeout watchdog (macOS has no `timeout`), the read-only sandbox flags, stdin handling under parallel contention, and the Antigravity quota fallback. Do not reimplement CLI invocation here.
+- Requires the `codex` and `agy` CLIs on `PATH`. If either is absent, `council-round.sh` exits non-zero for the whole call — the review still completes on the four lens agents alone; report the missing seats in the footer.
 - Do not invoke `terraform plan` or anything that touches state. This skill is static-analysis only.
