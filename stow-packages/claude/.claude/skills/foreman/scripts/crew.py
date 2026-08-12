@@ -120,6 +120,31 @@ def herdr(*args, **kwargs):
         raise HerdrError("herdr %s returned non-JSON: %.200s" % (args[0], out))
 
 
+def response_pane_id(payload, path, what):
+    """The pane id a herdr response carries at `path`, or a HerdrError naming
+    what was missing.
+
+    Both readers go through here rather than chaining the keys raw. Chained,
+    a response shape change is a KeyError or a TypeError, and main maps neither,
+    so a herdr rename exited 1 with a traceback and a pane already created.
+    herdr is pre-1.0 and self-updating, and this is the third defect caused by
+    trusting its response shape, so this reads it the way the snapshot reader
+    already reads its own fields.
+
+    The value is checked, not just the path: a null or non-string pane id would
+    otherwise flow into tag_pane and be written as a token, and the tokens are
+    the authoritative record of who owns what."""
+    node = payload
+    for step in path:
+        if not isinstance(node, dict) or step not in node:
+            raise HerdrError("%s returned no %s" % (what, ".".join(path)))
+        node = node[step]
+    if not isinstance(node, str) or not node.strip():
+        raise HerdrError("%s returned %s = %r, which is not a pane id"
+                         % (what, ".".join(path), node))
+    return node
+
+
 def snapshot():
     payload = herdr("api", "snapshot", read_only=True)
     if payload is None:
@@ -519,7 +544,11 @@ def crew_members(snap):
             "status": status,
             "bucket": bucket(status),
         })
-    members.sort(key=lambda m: (m["repo"], m["key"]))
+    # Type is part of the sort because it is part of the identity: one key can
+    # hold an implementer and the reviewer reading its worktree, and two rows
+    # ordered by whatever the snapshot happened to list first read as a fleet
+    # that reshuffles itself between calls.
+    members.sort(key=lambda m: (m["repo"], m["key"], m["type"]))
     return members
 
 
@@ -605,6 +634,19 @@ def orphan_crew_tabs(snap):
     return out
 
 
+def retire_handle(members, member):
+    """The handle `crew retire` resolves to exactly this member.
+
+    retire_target matches a key across every crew member, and one key can now
+    hold two: an implementer and the reviewer reading its worktree. Proposing
+    the key there names two things, so retire refuses and closes nothing, and
+    the foreman is told to print what ls proposed. The pane id is always unique,
+    so it is what gets proposed once the key is not."""
+    if sum(1 for m in members if m["key"] == member["key"]) > 1:
+        return member["pane"]
+    return member["key"]
+
+
 def render_ls(members, untagged, orphan_tabs=None):
     counts = {"working": 0, "awaiting": 0, "blocked": 0, "recover": 0}
     for m in members:
@@ -630,7 +672,8 @@ def render_ls(members, untagged, orphan_tabs=None):
         lines.append("%d crew pane(s) no agent occupies, retirable:" % len(spent))
         for m in spent:
             lines.append("  %-22s %-18s %-10s propose: crew retire %s"
-                         % (m["repo"], m["key"], m["pane"], m["key"]))
+                         % (m["repo"], m["key"], m["pane"],
+                            retire_handle(members, m)))
     if orphan_tabs:
         lines.append("")
         lines.append("%d tab(s) crew created holding no agent, retirable "
@@ -1034,6 +1077,16 @@ def take_flag(rest, names):
     return flag, rest[1], rest[2:]
 
 
+def review_findings_name(key):
+    """Where a reviewer writes, named after the key it reviews.
+
+    A reviewer now shares one checkout with the implementer, so a generic
+    findings filename could overwrite something the implementer wrote. One
+    reviewer per key per root is enforced by find_member, so the key makes this
+    unique among the sessions that can be in this worktree."""
+    return "crew-review-%s.md" % sanitize_name(key)
+
+
 def contract_pointer(name, ctype, key, repo, worktree):
     return (
         "You are crew member `%s`, type %s, on %s in repo %s, worktree %s. "
@@ -1142,19 +1195,37 @@ def tag_pane(pane_id, key, repo, ctype, branch, root):
     herdr(*args)
 
 
-def find_member(snap, root, key):
-    """Match on the authoritative root, not the repo label: two repos can share
-    a basename, and matching on the label alone rejected a legitimate dispatch
-    and printed a resume command into the wrong repository.
+def members_for(snap, root, key):
+    """Every crew member holding this root and key, whatever its type.
 
-    A `setup` pane is never a match. An orphaned setup pane would otherwise
+    Match on the authoritative root, not the repo label: two repos can share a
+    basename, and matching on the label alone rejected a legitimate dispatch and
+    printed a resume command into the wrong repository.
+
+    A `setup` pane is never included. An orphaned setup pane would otherwise
     make every retry of that key report a duplicate forever, and it carries no
     branch token so the resume command it printed was empty."""
     wanted = sanitize_name(key)
-    for member in crew_members(snap):
-        if member["type"] == "setup":
-            continue
-        if member["root"] == root and member["key"] == wanted:
+    return [member for member in crew_members(snap)
+            if member["type"] != "setup" and member["root"] == root
+            and member["key"] == wanted]
+
+
+def find_member(snap, root, key, ctype):
+    """The crew member whose identity is exactly (root, key, ctype), or None.
+
+    Identity includes the TYPE so a reviewer can coexist with the implementer
+    whose work it reviews. Keyed on (root, key) alone, a reviewer dispatch at a
+    live implementer's key returned exit 5, the foreman reported the resume
+    command that line prints, and that command resumed the implementer, so the
+    review never happened.
+
+    The type is a required argument rather than an optional one because every
+    other reader of this identity, `crew ls` and `crew retire`, now has to agree
+    with it: a caller that means "does anything hold this key" must say so by
+    calling members_for, not by leaving the type off here."""
+    for member in members_for(snap, root, key):
+        if member["type"] == ctype:
             return member
     return None
 
@@ -1247,15 +1318,6 @@ def canonical_repo_root(path):
         raise CrewError("%s is not inside a git repository" % path)
     common = proc.stdout.strip()
     return os.path.dirname(common) if os.path.basename(common) == ".git" else common
-
-
-def repo_root_for(path):
-    proc = subprocess.run(
-        ["git", "-C", path, "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise CrewError("%s is not inside a git repository" % path)
-    return proc.stdout.strip()
 
 
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
@@ -1413,7 +1475,8 @@ def start_setup(key, repo, repo_root):
 
     split = herdr("pane", "split", "--current", "--direction", "down",
                   "--cwd", repo_root, "--no-focus")
-    setup_pane = DRY_PANE if split is None else split["result"]["pane"]["pane_id"]
+    setup_pane = DRY_PANE if split is None else response_pane_id(
+        split, ("result", "pane", "pane_id"), "pane split")
     tag_pane(setup_pane, key, repo, "setup", "", repo_root)
 
     setup_name = ("setup-" + sanitize_name(key))[:32]
@@ -1562,7 +1625,8 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     tab = herdr("tab", "create", "--workspace", workspace,
                 "--label", crew_tab_label(repo, key),
                 "--cwd", worktree, "--no-focus")
-    pane = DRY_PANE if tab is None else tab["result"]["root_pane"]["pane_id"]
+    pane = DRY_PANE if tab is None else response_pane_id(
+        tab, ("result", "root_pane", "pane_id"), "tab create")
 
     # Tag before agent.start. Tokens are authoritative, so an untagged
     # pane is invisible to ls; a tag that failed afterwards would leave a
@@ -1595,9 +1659,16 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
         "implementer": "Read the plan in your worktree, then implement it.",
         "planner": ("Do not implement anything. Produce a plan and stop, "
                     "then report needs-input with what you decided."),
-        "reviewer": ("Do not change code. Review, write your findings to a "
-                     "file in your worktree, and report done naming that "
-                     "file."),
+        # A reviewer is dispatched INTO the worktree of the member it reviews,
+        # so this is the one type whose session shares a checkout with another
+        # live session. The findings file is named here so it cannot collide
+        # with the work being reviewed, and "do not change code" is the whole
+        # reason two sessions in one checkout is tolerable.
+        "reviewer": ("This worktree belongs to the member whose work you are "
+                     "reviewing and may still have a live session in it, so do "
+                     "not change code and run no git command that writes. "
+                     "Write your findings to %s in the worktree, and report "
+                     "done naming that file." % review_findings_name(key)),
     }[ctype]
     assignment = (
         "You are dispatched on %s in %s as a %s. Your worktree is %s. %s "
@@ -1629,6 +1700,48 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     print("dispatched %s as %s in pane %s on branch %s in %s"
           % (key, name, pane, branch, worktree))
     return 0
+
+
+def dispatch_reviewer(key, repo, repo_root, workspace, model, held, snap):
+    """Dispatch a reviewer into the worktree of the member it reviews.
+
+    This is NOT a setup path. The worktree already exists, and the point of a
+    reviewer is to read what is in it, so going through /start-ticket again
+    would spend a second paid Opus setup session and ask the human to answer the
+    same prompts to reach the tree they already have. Working around the old
+    exit 5 with a slug was worse: that branches off HEAD, so the reviewer was
+    told not to change code in a worktree that did not contain the work.
+
+    A key with no member has nothing to review, so it is refused rather than
+    given a worktree of its own.
+
+    The worktree is derived from the subject's tokens, not from its cwd, and it
+    has to be there: the tokens are the authoritative record and a reviewer sent
+    to a path that does not exist would fail inside `tab create`, after herdr
+    had been asked to make something."""
+    subject = held[0] if held else None
+    if subject is None:
+        raise CrewError(
+            "nothing to review: no crew member holds %s in %s. A reviewer reads "
+            "the worktree of the member whose work it reviews rather than "
+            "creating one, so dispatch that member first, or name the key it was "
+            "dispatched on. Nothing has been created." % (key, repo))
+    worktree = subject["worktree"]
+    if not worktree:
+        raise CrewError(
+            "crew member %s/%s in pane %s carries no branch token, so crew "
+            "cannot derive the worktree for a reviewer to read. Nothing has "
+            "been created." % (repo, subject["key"], subject["pane"]))
+    if not os.path.isdir(worktree):
+        raise CrewError(
+            "the worktree %s recorded by %s/%s in pane %s does not exist, so "
+            "there is nothing for a reviewer to read there. Nothing has been "
+            "created." % (worktree, repo, subject["key"], subject["pane"]))
+    print("reviewing in the existing worktree %s, held by the %s in pane %s. "
+          "No setup pane is opened and no worktree is created."
+          % (worktree, subject["type"], subject["pane"]))
+    return _complete_dispatch(key, "reviewer", repo, repo_root, workspace,
+                              model, worktree, snap)
 
 
 def cmd_dispatch(key, ctype, repo, model):
@@ -1682,15 +1795,50 @@ def cmd_dispatch(key, ctype, repo, model):
         snap = snapshot()
         assert_snapshot_shape(snap, defs)
 
-        existing = find_member(snap, repo_root, key)
-        if existing:
-            print("already dispatched: %s/%s in pane %s (%s). "
-                  "Resume with: cd %s && claude --continue"
-                  % (repo, existing["key"], existing["pane"],
-                     existing["bucket"], existing["worktree"]))
-            mail_send(key, repo, "duplicate",
-                      "dispatch declined, a live session already holds this key")
+        held = members_for(snap, repo_root, key)
+        # Identity is (root, key, type), but only a REVIEWER may coexist with
+        # another type on one key. Two writers in one worktree is the hazard,
+        # and the reviewer's contract not to change code is the single exception
+        # to it, so a reviewer is refused only by another reviewer while every
+        # other type is refused by anything already holding the key. Letting a
+        # second writer through would also send it down the setup path, which
+        # spends another paid setup session on a worktree that already exists.
+        if ctype == "reviewer":
+            existing = find_member(snap, repo_root, key, "reviewer")
+        else:
+            existing = held[0] if held else None
+        if existing is not None:
+            print("already dispatched: %s/%s as %s in pane %s (%s). "
+                  "Resume with: cd %s && claude --continue%s"
+                  % (repo, existing["key"], existing["type"],
+                     existing["pane"], existing["bucket"],
+                     existing["worktree"],
+                     "" if existing["type"] == ctype else
+                     " Only a reviewer shares a key with another type, because "
+                     "only a reviewer is contracted not to write, so this %s is "
+                     "declined too." % ctype))
+            # Contained. This notification makes a second herdr round trip and
+            # writes to disk, so a socket failure or a mailbox OSError turned
+            # the documented exit 5 into exit 3 after the refusal had already
+            # printed, and the foreman then followed the exit 3 branch. The
+            # refusal's exit code must not depend on a side effect.
+            try:
+                mail_send(key, repo, "duplicate",
+                          "dispatch declined, a live session already holds "
+                          "this key")
+            except (CrewError, HerdrError, OSError, ValueError) as exc:
+                print("the mailbox was not notified of this refusal (%s), so "
+                      "crew mail unread will not show it. The dispatch was "
+                      "still declined." % exc, file=sys.stderr)
             return 5
+
+        if ctype == "reviewer":
+            # No artifact is read and none is deleted on this path: the file is
+            # keyed on the key alone, so the implementer's setup may still be
+            # legitimately pending, and consuming it would cost that dispatch
+            # its paid setup session.
+            return dispatch_reviewer(key, repo, repo_root, workspace, model,
+                                     held, snap)
 
         # Resumable, so a retry never has to wait for the human. If setup
         # already wrote its artifact, this call has nothing interactive
@@ -1799,9 +1947,14 @@ def retire_target(snap, name):
     for member in crew_members(snap):
         if name in (member["name"], member["pane"]) \
                 or member["key"] == sanitize_name(name):
+            # The type is named because one key can hold two members, an
+            # implementer and the reviewer reading its worktree, and without it
+            # the ambiguity message lists two lines that differ only in the
+            # pane id it is telling the human to use instead.
             labelled.append(("member", member,
-                             "crew member %s/%s in pane %s"
-                             % (member["repo"], member["key"], member["pane"])))
+                             "the %s crew member %s/%s in pane %s"
+                             % (member["type"], member["repo"], member["key"],
+                                member["pane"])))
     for tab in snap.get("tabs") or []:
         if tab.get("tab_id") != name:
             continue
@@ -1868,7 +2021,8 @@ def cmd_retire(name):
     if kind == "member":
         panes = [payload["pane"]]
         tab_id = pane_tab(snap, payload["pane"])
-        what = "crew member %s/%s" % (payload["repo"], payload["key"])
+        what = "the %s crew member %s/%s" % (payload["type"], payload["repo"],
+                                             payload["key"])
     else:
         tab_id = payload["tab_id"]
         panes = [p["pane_id"] for p in tab_panes(snap, tab_id)]

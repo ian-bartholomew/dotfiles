@@ -93,6 +93,14 @@ Use `--type planner` for a ticket the user says is underspecified, and
 `--type reviewer` for a finished chunk that needs review. Default to
 `implementer` when the user did not say.
 
+A reviewer is not a fresh start: it joins the worktree of the crew member whose
+work it reviews, so dispatch it on that member's key, in that member's repo. It
+creates no worktree, opens no setup pane, and completes in one call even for a
+JIRA key. On a key no crew member holds there is nothing to review and it is
+refused with exit 3, so a review is something to dispatch as a second step, not
+part of the opening fan-out. Only a reviewer shares a key: a planner or a second
+implementer on a held key is declined with exit 5.
+
 For a JIRA key this returns immediately with exit 7 and opens a short-lived
 setup pane where `/start-ticket` runs interactively. **Tell the user to answer
 it in that pane.** Do not answer it for them, and do not run `/start-ticket`
@@ -108,7 +116,7 @@ Handle these exit codes rather than retrying blindly:
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | 0 | dispatched | continue to the next key |
-| 5 | a live session already holds this key | report the resume command it printed; do NOT dispatch again |
+| 5 | a live session already holds this key, and the line names its type | report the resume command it printed; do NOT dispatch again |
 | 6 | started but never reacted, delivery unconfirmed | the pane is tagged and visible; suggest `crew nudge <name> "<text>"` |
 | 7 | setup is pending on a JIRA key | tell the user to answer the prompt in the named pane, then re-run the exact same dispatch command |
 | 3 | a herdr, crew or filesystem error | report the message and stop |

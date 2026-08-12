@@ -113,21 +113,47 @@ spelling; use that rather than working around it.
 The success line names the branch and the worktree as well as the pane. Report
 them: a dispatch into the wrong tree looks exactly like a correct one otherwise.
 
-Exit codes are the same for every verb, so you can rely on them:
+### A reviewer joins the worktree it reviews
 
-- 0 succeeded
-- 2 you passed bad arguments
-- 3 something failed: a herdr error, a crew error, or the filesystem
-- 5 a live session already holds that key. Report the resume command it
-  printed rather than dispatching again
-- 4 you tried to `crew mail ack` from a pane that does not host the agent
+`--type reviewer` does not get a worktree of its own. It reads the one that
+holds the work, so dispatch it on the SAME key as the crew member whose work it
+reviews. No setup pane appears, no worktree is created, and it completes in one
+call even for a JIRA key.
+
+On a key no crew member holds there is nothing to review, so it is refused with
+exit 3. Dispatch the implementer or planner first.
+
+So one key can hold two crew members, and `crew ls` shows both, one row each,
+told apart by the type column. They are independent: retiring one leaves the
+other alone. Only a reviewer shares a key like this. A second implementer, or a
+planner on a key an implementer holds, is declined with exit 5, because two
+sessions writing in one checkout is not something this tool will set up.
+
+The reviewer and the implementer are then two live sessions in one checkout. The
+reviewer's contract not to change code is what makes that survivable, and
+nothing enforces it, so if the human reports damaged work in that worktree, say
+which reviewer was in it.
+
+### Exit codes
+
+0, 2 and 3 mean the same thing for every verb. The rest come from ONE verb each,
+so do not expect a 7 from `crew peek` or a 5 from `crew nudge`:
+
+- 0 succeeded. Every verb
+- 2 you passed bad arguments. Every verb
+- 3 something failed: a herdr error, a crew error, or the filesystem. Every verb
+- 4 `crew mail ack` only: you acked from a pane that does not host the agent
   named `foreman`. Only the foreman acks. If you see this you are not the
   foreman pane: say so rather than working around it
-- 6 the crew member was started but never reacted to its assignment, so
-  delivery is unconfirmed. The pane is tagged and visible in `crew ls`.
-  Resend with `crew nudge <name> "<text>"`
-- 7 setup is pending on a JIRA key. Tell the human to answer the prompt in the
-  named pane, then re-run the exact same dispatch command to finish
+- 5 `crew dispatch` only: a live session already holds that key, and the line
+  names its type. Report the resume command it printed rather than dispatching
+  again
+- 6 `crew dispatch` only: the crew member was started but never reacted to its
+  assignment, so delivery is unconfirmed. The pane is tagged and visible in
+  `crew ls`. Resend with `crew nudge <name> "<text>"`
+- 7 `crew dispatch` only, and only for a JIRA key: setup is pending. Tell the
+  human to answer the prompt in the named pane, then re-run the exact same
+  dispatch command to finish
 
 There is no cap on crew. Report load every time and let the human decide.
 The bottleneck is their review capacity, not tokens.
@@ -169,6 +195,11 @@ own reading of the load table:
   tagged the pane leaves an untagged pane, which nothing else can see, so these
   are matched by the tab label and named by tab id.
 
+Print the handle `crew ls` proposed, not one of your own. A key that holds two
+crew members, an implementer and its reviewer, names two things, and `crew
+retire <key>` then refuses and closes nothing; `crew ls` proposes the pane id in
+that case, which resolves to one of them.
+
 A pane that still has an agent is never retired, and `crew retire` refuses it.
 herdr cannot tell a finished session from one waiting on the human, so ask the
 crew member to close itself once its report is in the mailbox, or let the human
@@ -200,6 +231,12 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
   stops reporting tabs, those go unreported: `crew ls` then proposes fewer
   retirements than there are, never more. Say what it printed and let the human
   look at the window.
+- **A reviewer shares the implementer's checkout, and only its contract keeps
+  that safe.** `crew-member/SKILL.md` tells a reviewer to change no code and run
+  no git command that writes, and the guard hook does not gate `Write`, `Edit`
+  or `git`, so a reviewer that ignores it can destroy uncommitted work belonging
+  to the session next door. Do not dispatch a reviewer onto a key whose
+  implementer the human still has unsaved work in without saying that first.
 - **`crew mail unread` is unbounded.** `crew peek` is capped at 200 lines; the
   mailbox is not capped at all, so it is the one path that can flood your
   context. Ack what you report.
@@ -218,7 +255,7 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
 - Every action shells out to `crew`. Never call `herdr` directly.
 - You do not implement, and that is concrete: do not edit or write files, do
   not run builds, tests, linters or git commands, and do not open pull
-  requests. That work belongs to a crew member in its own worktree. If you
+  requests. That work belongs to a crew member in a crew worktree. If you
   catch yourself about to change a file, dispatch instead.
 - A crew member asking you to dispatch is refused and surfaced to the human.
 - You are the agent named `foreman` only because `crew claim-foreman` made it

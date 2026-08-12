@@ -15,9 +15,10 @@ from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    assert_schema_declares, CrewError, HerdrError,
                    read_entries, next_seq, select_unread,
                    contract_pointer, find_member, find_setup_pane, is_ticket,
-                   take_flag, _start_agent, resolve_repo, repo_root_for,
+                   take_flag, _start_agent, resolve_repo, members_for,
                    clamp_lines, require_positional, worktree_for, is_inside,
-                   read_dispatch_artifact, same_path)
+                   read_dispatch_artifact, same_path, response_pane_id,
+                   retire_handle, review_findings_name)
 
 
 class TestSanitizeName(unittest.TestCase):
@@ -431,18 +432,6 @@ class TestResolveRepo(unittest.TestCase):
         self.assertEqual(name, "resolved-name")
 
 
-class TestRepoRootFor(unittest.TestCase):
-    """repo_root_for (--show-toplevel) is no longer called by resolve_repo,
-    which now needs the repository root rather than the worktree path, but it
-    stays as a small, separately useful primitive."""
-
-    def test_returns_the_top_level_directory(self):
-        root = repo_root_for(os.getcwd())
-        self.assertTrue(os.path.isdir(root))
-        self.assertTrue(os.path.realpath(os.getcwd()).startswith(
-            os.path.realpath(root)))
-
-
 class TestIsTicket(unittest.TestCase):
     def test_jira_key(self):
         self.assertTrue(is_ticket("FANDEVX-3511"))
@@ -494,20 +483,74 @@ class TestFindMember(unittest.TestCase):
     def test_matches_on_root_and_key(self):
         snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
                      [_pane("wQ:p1", CREW_TOKENS)])
-        found = find_member(snap, CREW_TOKENS["root"], "fandevx-3511")
+        found = find_member(snap, CREW_TOKENS["root"], "fandevx-3511",
+                            "implementer")
         self.assertIsNotNone(found)
         self.assertEqual(found["pane"], "wQ:p1")
 
     def test_same_key_different_root_is_not_a_match(self):
         snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
                      [_pane("wQ:p1", CREW_TOKENS)])
-        self.assertIsNone(find_member(snap, "/somewhere-else", "fandevx-3511"))
+        self.assertIsNone(find_member(snap, "/somewhere-else", "fandevx-3511",
+                                      "implementer"))
 
     def test_key_is_compared_sanitised(self):
         snap = _snap([_agent("wQ:p1", "idle", "fandevx-3511")],
                      [_pane("wQ:p1", CREW_TOKENS)])
         self.assertIsNotNone(
-            find_member(snap, CREW_TOKENS["root"], "FANDEVX-3511"))
+            find_member(snap, CREW_TOKENS["root"], "FANDEVX-3511",
+                        "implementer"))
+
+
+def _reviewer_tokens(base=None, key=None):
+    toks = dict(base or CREW_TOKENS)
+    toks["type"] = "reviewer"
+    if key:
+        toks["key"] = key
+    return toks
+
+
+class TestMemberIdentityIncludesTheType(unittest.TestCase):
+    """Keyed on (root, key) alone, a reviewer dispatch at a live implementer's
+    key returned exit 5, and the resume command that line prints resumes the
+    IMPLEMENTER, so the review never happened."""
+
+    def _both(self):
+        return _snap(
+            [_agent("wQ:p1", "working", "fandevx-3511"),
+             _agent("wQ:p2", "idle", "fandevx-3511-2")],
+            [_pane("wQ:p1", CREW_TOKENS),
+             _pane("wQ:p2", _reviewer_tokens())])
+
+    def test_each_type_finds_its_own_pane_and_not_the_other(self):
+        snap = self._both()
+        root, key = CREW_TOKENS["root"], "fandevx-3511"
+        self.assertEqual(
+            find_member(snap, root, key, "implementer")["pane"], "wQ:p1")
+        self.assertEqual(
+            find_member(snap, root, key, "reviewer")["pane"], "wQ:p2")
+
+    def test_a_reviewer_is_not_found_where_only_an_implementer_holds_the_key(self):
+        snap = _snap([_agent("wQ:p1", "working", "fandevx-3511")],
+                     [_pane("wQ:p1", CREW_TOKENS)])
+        self.assertIsNone(find_member(snap, CREW_TOKENS["root"],
+                                      "fandevx-3511", "reviewer"))
+        self.assertIsNotNone(find_member(snap, CREW_TOKENS["root"],
+                                         "fandevx-3511", "implementer"))
+
+    def test_members_for_answers_the_other_question_whatever_the_type(self):
+        # "Does anything hold this key" has to be asked separately, or the
+        # reviewer path cannot find the worktree it is meant to read.
+        held = members_for(self._both(), CREW_TOKENS["root"], "fandevx-3511")
+        self.assertEqual(sorted(m["type"] for m in held),
+                         ["implementer", "reviewer"])
+
+    def test_members_for_still_never_returns_a_setup_pane(self):
+        toks = {"crew": "true", "v": "1", "key": "k", "repo": "r",
+                "root": "/root", "type": "setup"}
+        snap = {"agents": [_full_agent("wQ:p1", "idle", "k")],
+                "panes": [_full_pane("wQ:p1", toks)]}
+        self.assertEqual(members_for(snap, "/root", "k"), [])
 
 
 class TestFindMemberIgnoresSetupPanes(unittest.TestCase):
@@ -520,16 +563,17 @@ class TestFindMemberIgnoresSetupPanes(unittest.TestCase):
                 "root": "/root", "type": "setup"}
         snap = {"agents": [_full_agent("wQ:p1", "idle", "k")],
                 "panes": [_full_pane("wQ:p1", toks)]}
-        self.assertIsNone(find_member(snap, "/root", "k"))
+        self.assertIsNone(find_member(snap, "/root", "k", "setup"))
 
     def test_matching_is_on_root_not_the_repo_label(self):
         toks = {"crew": "true", "v": "1", "key": "k", "repo": "service",
                 "root": "/a/service", "type": "implementer"}
         snap = {"agents": [_full_agent("wQ:p1", "idle", "k")],
                 "panes": [_full_pane("wQ:p1", toks)]}
-        self.assertIsNotNone(find_member(snap, "/a/service", "k"))
+        self.assertIsNotNone(find_member(snap, "/a/service", "k",
+                                         "implementer"))
         # Same label, different repository: not a duplicate.
-        self.assertIsNone(find_member(snap, "/b/service", "k"))
+        self.assertIsNone(find_member(snap, "/b/service", "k", "implementer"))
 
 
 class TestFindSetupPane(unittest.TestCase):
@@ -834,6 +878,78 @@ class TestSlugDispatchStillCompletesInOneCall(unittest.TestCase):
         one_lookup.assert_not_called()
         set_lookup.assert_not_called()
         start.assert_not_called()
+
+
+class TestResponsePaneId(unittest.TestCase):
+    """`split["result"]["pane"]["pane_id"]` and
+    `tab["result"]["root_pane"]["pane_id"]` were chained raw, and main maps
+    neither KeyError nor TypeError, so a herdr response shape change exited 1
+    with a traceback and a pane already created. herdr is pre-1.0 and
+    self-updating, and this is the third defect caused by trusting its response
+    shape."""
+
+    def test_a_present_pane_id_is_returned(self):
+        payload = {"result": {"pane": {"pane_id": "wQ:p9"}}}
+        self.assertEqual(
+            response_pane_id(payload, ("result", "pane", "pane_id"), "x"),
+            "wQ:p9")
+
+    def test_a_renamed_field_is_a_herdr_error_naming_the_path(self):
+        payload = {"result": {"panel": {"pane_id": "wQ:p9"}}}
+        with self.assertRaises(HerdrError) as caught:
+            response_pane_id(payload, ("result", "pane", "pane_id"),
+                             "pane split")
+        self.assertIn("pane split", str(caught.exception))
+        self.assertIn("result.pane.pane_id", str(caught.exception))
+
+    def test_a_non_dict_partway_down_is_a_herdr_error_not_a_typeerror(self):
+        # A string is NOT enough here: `"pane_id" not in "wQ:p9"` is a substring
+        # test that happens to answer correctly, so a fixture of only that
+        # passes with the isinstance check deleted. These are the shapes where
+        # `in` raises or lies instead.
+        for node in (None, 7, ["pane_id"], "wQ:p9"):
+            with self.subTest(node=node):
+                payload = {"result": {"pane": node}}
+                with self.assertRaises(HerdrError):
+                    response_pane_id(payload, ("result", "pane", "pane_id"),
+                                     "x")
+
+    def test_a_pane_id_that_is_not_a_pane_id_is_refused(self):
+        # A null or blank id would otherwise be written as a pane token, and the
+        # tokens are the authoritative record of who owns what.
+        for value in (None, "", "   ", 7, {}):
+            with self.subTest(value=value):
+                payload = {"result": {"pane": {"pane_id": value}}}
+                with self.assertRaises(HerdrError):
+                    response_pane_id(payload, ("result", "pane", "pane_id"),
+                                     "x")
+
+
+class TestAHerdrShapeChangeIsExitThreeNotATraceback(unittest.TestCase):
+    """Through the verb, because the two call sites are what the defect was."""
+
+    def test_a_tab_create_shape_change_is_exit_three(self):
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, worktree):
+            _write_artifact(REVIEW_KEY, worktree, "repo")
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo",
+                tab={"result": {"rootPane": {"pane_id": "wTest:pW3"}}})
+        self.assertEqual(code, 3)
+        self.assertIn("tab create", err)
+        self.assertIn("result.root_pane.pane_id", err)
+        self.assertFalse(any(c[:2] == ("agent", "start") for c in calls),
+                         "an agent must not be started in a pane crew cannot "
+                         "name, because it could then never be tagged")
+
+    def test_a_pane_split_shape_change_is_exit_three(self):
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, _wt):
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo",
+                split={"result": {"pane": {}}})
+        self.assertEqual(code, 3)
+        self.assertIn("pane split", err)
+        self.assertIn("result.pane.pane_id", err)
+        self.assertFalse(any(c[:2] == ("agent", "start") for c in calls))
 
 
 class TestHerdrRawMode(unittest.TestCase):
@@ -1265,7 +1381,8 @@ def _setup_pane_snap(repo_root, key, status="idle", pane="wTest:pSetup",
 
 
 def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False,
-                  snap=None, close_error=None, caller=CALLER_PANE):
+                  snap=None, close_error=None, caller=CALLER_PANE,
+                  ctype="implementer", split=None, tab=None):
     """crew.main(["dispatch", ...]) with herdr faked. Returns
     (code, herdr calls, stdout, stderr).
 
@@ -1279,9 +1396,11 @@ def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False,
         if args[:2] == ("tab", "create"):
             if tab_error is not None:
                 raise tab_error
-            return {"result": {"root_pane": {"pane_id": "wTest:pW3"}}}
+            return ({"result": {"root_pane": {"pane_id": "wTest:pW3"}}}
+                    if tab is None else tab)
         if args[:2] == ("pane", "split"):
-            return {"result": {"pane": {"pane_id": "wTest:pSetup2"}}}
+            return ({"result": {"pane": {"pane_id": "wTest:pSetup2"}}}
+                    if split is None else split)
         if args[:2] == ("pane", "close") and close_error is not None:
             raise close_error
         return {"ok": True}
@@ -1298,7 +1417,7 @@ def _run_dispatch(key, repo_root, repo_name, tab_error=None, dry=False,
                                           "HERDR_PANE_ID": caller}), \
          contextlib.redirect_stdout(out), \
          mock.patch.object(crew.sys, "stderr", err):
-        code = crew.main(["dispatch", key, "--type", "implementer"])
+        code = crew.main(["dispatch", key, "--type", ctype])
     return code, calls, out.getvalue(), err.getvalue()
 
 
@@ -1351,6 +1470,253 @@ class TestDispatchClearsTheConsumedArtifact(unittest.TestCase):
             # Narrated, like every other dry-run line, because the refusals
             # report the deletion in the past tense.
             self.assertIn("would delete %s" % artifact, out)
+
+
+REVIEW_KEY = "FANDEVX-9201"
+REVIEW_BRANCH = "FANDEVX-9201-thing"
+
+
+def _fleet(specs, repo_root, key=REVIEW_KEY, branch=REVIEW_BRANCH,
+           repo_name="repo"):
+    """A snapshot holding one dispatched crew pane per spec.
+
+    `specs` is [(type, pane, tab, status or None)], where None means no agent
+    occupies that pane. Every pane carries the same root, key and branch on
+    purpose: an implementer and the reviewer reading its worktree now differ
+    only in their type, which is exactly what the identity change has to get
+    right."""
+    agents, panes, tabs = [], [], []
+    for ctype, pane, tab, status in specs:
+        tokens = {"crew": "true", "v": "1", "key": crew.sanitize_name(key),
+                  "repo": repo_name, "root": repo_root, "type": ctype,
+                  "branch": branch, "dispatched": "1786000000"}
+        panes.append(_full_pane(pane, tokens, tab=tab))
+        if status is not None:
+            agents.append(_full_agent(
+                pane, status,
+                ("%s-%s" % (crew.sanitize_name(key), ctype))[:32]))
+        tabs.append(_tab(tab, "%s/%s" % (repo_name, crew.sanitize_name(key))))
+    return _snap(agents, panes, tabs)
+
+
+IMPLEMENTER_LIVE = [("implementer", "wTest:pImpl", "wTest:tI", "working")]
+
+
+def _prompted(calls):
+    """The text of the last `agent prompt` herdr was asked to deliver."""
+    prompts = [c for c in calls if c[:2] == ("agent", "prompt")]
+    return prompts[-1][-1] if prompts else ""
+
+
+class TestReviewerJoinsTheWorktreeItReviews(unittest.TestCase):
+    """--type reviewer had no working path at all. find_member matched on root
+    and key and ignored the type, so a reviewer at a live implementer's key
+    returned exit 5, and the resume command that line prints resumes the
+    IMPLEMENTER. The two documented workarounds are worse: retiring and
+    re-dispatching the key pays for another Opus setup session, and using a slug
+    branches off HEAD, so the reviewer is told not to change code in a worktree
+    that does not contain the work."""
+
+    def test_a_reviewer_reuses_the_existing_worktree_and_never_sets_up(self):
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, worktree):
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root)
+            code, calls, out, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer", snap=snap)
+            self.assertEqual(code, 0, err)
+            self.assertFalse(any(c[:2] == ("pane", "split") for c in calls),
+                             "a setup pane is a second paid Opus session for a "
+                             "worktree that already exists")
+            created = [c for c in calls if c[:2] == ("tab", "create")]
+            self.assertEqual(len(created), 1)
+            self.assertIn(worktree, created[0],
+                          "the reviewer must be started in the worktree that "
+                          "holds the work, not in one of its own")
+            self.assertIn(worktree, out)
+
+    def test_the_reviewer_pane_records_its_own_type_on_the_shared_branch(self):
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, _wt):
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root)
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer", snap=snap)
+            self.assertEqual(code, 0, err)
+            tagged = [c for c in calls
+                      if c[:2] == ("pane", "report-metadata")][0]
+            self.assertIn("type=reviewer", tagged)
+            self.assertIn("branch=%s" % REVIEW_BRANCH, tagged)
+            self.assertIn("key=%s" % crew.sanitize_name(REVIEW_KEY), tagged)
+
+    def test_the_assignment_names_a_findings_file_that_cannot_collide(self):
+        # The reviewer and the implementer now share one checkout, so a generic
+        # "a file in your worktree" could overwrite the work under review.
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, _wt):
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root)
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer", snap=snap)
+            self.assertEqual(code, 0, err)
+            assignment = _prompted(calls)
+            self.assertIn(review_findings_name(REVIEW_KEY), assignment)
+            self.assertIn("do not change code", assignment)
+
+    def test_a_reviewer_never_consumes_the_implementers_artifact(self):
+        # The artifact is keyed on the key alone and the implementer's setup may
+        # still be legitimately pending, so consuming it would cost that
+        # dispatch its paid setup session.
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, worktree):
+            artifact = _write_artifact(REVIEW_KEY, worktree, "repo")
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root)
+            code, _, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer", snap=snap)
+            self.assertEqual(code, 0, err)
+            self.assertTrue(os.path.exists(artifact))
+
+    def test_a_reviewer_on_a_key_no_member_holds_is_refused(self):
+        # Nothing to review, so there is nothing to create either. The old
+        # workaround created a worktree off HEAD and reported done having
+        # reviewed nothing.
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, worktree):
+            artifact = _write_artifact(REVIEW_KEY, worktree, "repo")
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer")
+            self.assertEqual(code, 3)
+            self.assertIn("nothing to review", err)
+            for verb in (("pane", "split"), ("tab", "create"),
+                         ("agent", "start")):
+                self.assertFalse(any(c[:2] == verb for c in calls),
+                                 "%s ran on a refusal" % " ".join(verb))
+            self.assertTrue(os.path.exists(artifact),
+                            "a refusal that discards the artifact bricks the "
+                            "implementer's pending setup")
+
+    def test_a_reviewer_is_refused_when_the_recorded_worktree_is_gone(self):
+        with _repo_world(branch=REVIEW_BRANCH) as (tmp, repo_root, worktree):
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root,
+                          branch="FANDEVX-9201-never-made")
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer", snap=snap)
+            self.assertEqual(code, 3)
+            self.assertIn("does not exist", err)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
+
+    def test_a_reviewer_is_refused_when_the_subject_carries_no_branch(self):
+        with _repo_world(branch=REVIEW_BRANCH) as (_, repo_root, _wt):
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root, branch="")
+            code, calls, _, err = _run_dispatch(
+                REVIEW_KEY, repo_root, "repo", ctype="reviewer", snap=snap)
+            self.assertEqual(code, 3)
+            self.assertIn("no branch token", err)
+            self.assertFalse(any(c[:2] == ("tab", "create") for c in calls))
+
+
+class TestReviewFindingsName(unittest.TestCase):
+    """A reviewer writes into the implementer's checkout, so the filename has to
+    be one the work under review cannot already be using."""
+
+    def test_the_name_carries_the_key_it_reviews(self):
+        self.assertEqual(review_findings_name("FANDEVX-9201"),
+                         "crew-review-fandevx-9201.md")
+
+    def test_two_keys_cannot_produce_one_filename(self):
+        self.assertNotEqual(review_findings_name("FANDEVX-9201"),
+                            review_findings_name("FANDEVX-9202"))
+
+
+class TestOnlyAReviewerSharesAKey(unittest.TestCase):
+    """The identity change must not become a licence to put two writers in one
+    worktree, and must not let a second type fall through to the setup path,
+    which spends another paid setup session on a worktree that exists."""
+
+    def _refusal(self, ctype, specs, key=REVIEW_KEY):
+        with _repo_world(branch=REVIEW_BRANCH) as (tmp, repo_root, _wt):
+            snap = _fleet(specs, repo_root, key=key)
+            with mock.patch.object(crew, "MAILBOX",
+                                   os.path.join(tmp, "mailbox.jsonl")):
+                return _run_dispatch(key, repo_root, "repo", ctype=ctype,
+                                     snap=snap)
+
+    def _assert_declined(self, code, calls, out, ctype, existing_type):
+        self.assertEqual(code, 5)
+        self.assertIn("already dispatched", out)
+        self.assertIn("as %s" % existing_type, out)
+        for verb in (("pane", "split"), ("tab", "create"), ("agent", "start")):
+            self.assertFalse(any(c[:2] == verb for c in calls),
+                             "%s ran on a declined dispatch" % " ".join(verb))
+
+    def test_a_second_reviewer_on_one_key_is_declined(self):
+        code, calls, out, _ = self._refusal(
+            "reviewer",
+            IMPLEMENTER_LIVE + [("reviewer", "wTest:pRev", "wTest:tR", "idle")])
+        self._assert_declined(code, calls, out, "reviewer", "reviewer")
+
+    def test_a_second_implementer_on_one_key_is_still_declined(self):
+        code, calls, out, _ = self._refusal("implementer", IMPLEMENTER_LIVE)
+        self._assert_declined(code, calls, out, "implementer", "implementer")
+
+    def test_a_planner_at_a_live_implementers_key_is_declined(self):
+        # The type that must NOT get the reviewer's coexistence: a planner
+        # writes, and it would otherwise take the setup path.
+        code, calls, out, _ = self._refusal("planner", IMPLEMENTER_LIVE)
+        self._assert_declined(code, calls, out, "planner", "implementer")
+        self.assertIn("only a reviewer", out)
+
+    def test_an_implementer_at_a_live_reviewers_key_is_declined(self):
+        code, calls, out, _ = self._refusal(
+            "implementer", [("reviewer", "wTest:pRev", "wTest:tR", "idle")])
+        self._assert_declined(code, calls, out, "implementer", "reviewer")
+
+    def test_the_resume_line_names_the_type_that_holds_the_key(self):
+        # One key can hold two members, so a resume command with no type on it
+        # cannot tell the foreman which session it resumes.
+        code, _, out, _ = self._refusal("implementer", IMPLEMENTER_LIVE)
+        self.assertEqual(code, 5)
+        self.assertIn("as implementer in pane wTest:pImpl", out)
+        self.assertIn("claude --continue", out)
+
+
+class TestTheRefusalExitCodeSurvivesAFailedNotification(unittest.TestCase):
+    """The duplicate refusal called mail_send unguarded before `return 5`. That
+    is a second herdr round trip and a write to disk, so a socket failure or a
+    mailbox OSError turned the documented exit 5 into exit 3, after the "already
+    dispatched" line had printed, and the foreman followed the exit 3 branch,
+    which is report and stop, instead of the exit 5 branch."""
+
+    def _duplicate(self, mail_error=None):
+        with _repo_world(branch=REVIEW_BRANCH) as (tmp, repo_root, _wt):
+            snap = _fleet(IMPLEMENTER_LIVE, repo_root)
+            mailbox = os.path.join(tmp, "mailbox.jsonl")
+            with mock.patch.object(crew, "MAILBOX", mailbox):
+                if mail_error is None:
+                    code, calls, out, err = _run_dispatch(
+                        REVIEW_KEY, repo_root, "repo", snap=snap)
+                    return code, out, err, os.path.exists(mailbox)
+                with mock.patch.object(crew, "mail_send",
+                                       side_effect=mail_error):
+                    code, calls, out, err = _run_dispatch(
+                        REVIEW_KEY, repo_root, "repo", snap=snap)
+                return code, out, err, os.path.exists(mailbox)
+
+    def test_a_herdr_failure_in_the_notification_still_returns_five(self):
+        code, out, err, _ = self._duplicate(HerdrError("socket gone"))
+        self.assertEqual(code, 5)
+        self.assertIn("already dispatched", out)
+        self.assertIn("mailbox was not notified", err)
+        self.assertIn("socket gone", err)
+
+    def test_a_mailbox_oserror_in_the_notification_still_returns_five(self):
+        code, _, err, _ = self._duplicate(OSError("read-only file system"))
+        self.assertEqual(code, 5)
+        self.assertIn("mailbox was not notified", err)
+
+    def test_a_crew_error_in_the_notification_still_returns_five(self):
+        code, _, err, _ = self._duplicate(CrewError("no snapshot"))
+        self.assertEqual(code, 5)
+        self.assertIn("mailbox was not notified", err)
+
+    def test_the_notification_is_still_sent_when_it_can_be(self):
+        # Containing the failure must not quietly delete the report.
+        code, _, err, wrote = self._duplicate()
+        self.assertEqual(code, 5)
+        self.assertTrue(wrote, "the duplicate report never reached the mailbox")
+        self.assertNotIn("mailbox was not notified", err)
 
 
 class TestIsInside(unittest.TestCase):
@@ -3533,6 +3899,97 @@ class TestLsPassesOrphanTabsThrough(unittest.TestCase):
              contextlib.redirect_stdout(out):
             self.assertEqual(crew.main(["ls", "--json"]), 0)
         self.assertEqual(len(json.loads(out.getvalue())), 1)
+
+
+class TestOneKeyWithTwoMembersIsListedAndRetiredIndependently(
+        unittest.TestCase):
+    """The identity change ripples: find_member, `crew ls`, the exit 5 resume
+    line and `crew retire` all key off member identity. A reviewer sharing the
+    implementer's key means one key can name two panes, and the retirable
+    proposal `crew ls` prints has to be the handle that resolves to one of
+    them."""
+
+    def _both(self, impl_status=None, rev_status=None):
+        return _fleet([("implementer", "wV:pImpl", "wV:tI", impl_status),
+                       ("reviewer", "wV:pRev", "wV:tR", rev_status)], "/repo")
+
+    def _ls(self, snap, args=("ls",)):
+        out = io.StringIO()
+        with mock.patch.object(crew, "schema_defs", return_value=DEFS), \
+             mock.patch.object(crew, "snapshot", return_value=snap), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(crew.main(list(args)), 0)
+        return out.getvalue()
+
+    def test_the_ls_verb_lists_both_members_of_the_one_key(self):
+        out = self._ls(self._both(impl_status="working", rev_status="idle"))
+        rows = [line for line in out.splitlines()
+                if crew.sanitize_name(REVIEW_KEY) in line]
+        self.assertEqual(len(rows), 2, out)
+        self.assertTrue(any("implementer" in r and "wV:pImpl" in r
+                            for r in rows), out)
+        self.assertTrue(any("reviewer" in r and "wV:pRev" in r
+                            for r in rows), out)
+
+    def test_the_json_output_carries_both_identities(self):
+        out = self._ls(self._both(impl_status="working", rev_status="idle"),
+                       args=("ls", "--json"))
+        listed = json.loads(out)
+        self.assertEqual(
+            sorted((m["key"], m["type"]) for m in listed),
+            [(crew.sanitize_name(REVIEW_KEY), "implementer"),
+             (crew.sanitize_name(REVIEW_KEY), "reviewer")])
+
+    def test_the_retirable_proposal_is_the_pane_when_the_key_names_two(self):
+        # `crew retire <key>` resolves to two members here, so it refuses and
+        # closes nothing. A proposal the human cannot run is not a proposal.
+        out = self._ls(self._both())
+        self.assertIn("crew retire wV:pImpl", out)
+        self.assertIn("crew retire wV:pRev", out)
+        self.assertNotIn("crew retire %s" % crew.sanitize_name(REVIEW_KEY), out)
+
+    def test_one_member_on_a_key_is_still_proposed_by_that_key(self):
+        out = render_ls(crew_members(_member_snap()),
+                        untagged_agents(_member_snap()))
+        self.assertIn("crew retire fandevx-3511", out)
+
+    def test_retiring_the_reviewer_leaves_the_implementer_alone(self):
+        code, calls, _, err = _run_retire("wV:pRev",
+                                         self._both(impl_status="working"))
+        self.assertEqual(code, 0, err)
+        self.assertIn(("pane", "close", "wV:pRev"), calls)
+        self.assertIn(("tab", "close", "wV:tR"), calls)
+        self.assertNotIn(("pane", "close", "wV:pImpl"), calls)
+        self.assertNotIn(("tab", "close", "wV:tI"), calls)
+
+    def test_retiring_the_implementer_leaves_the_reviewer_alone(self):
+        code, calls, _, err = _run_retire("wV:pImpl",
+                                         self._both(rev_status="idle"))
+        self.assertEqual(code, 0, err)
+        self.assertIn(("pane", "close", "wV:pImpl"), calls)
+        self.assertIn(("tab", "close", "wV:tI"), calls)
+        self.assertNotIn(("pane", "close", "wV:pRev"), calls)
+        self.assertNotIn(("tab", "close", "wV:tR"), calls)
+
+    def test_the_two_rows_are_ordered_the_same_way_whatever_herdr_lists_first(
+            self):
+        # Type is part of the identity, so it is part of the sort. Ordered by
+        # whatever the snapshot happened to list first, a fleet reshuffles
+        # itself between two `crew ls` calls that measured the same thing.
+        reviewer_first = _fleet(
+            [("reviewer", "wV:pRev", "wV:tR", "idle"),
+             ("implementer", "wV:pImpl", "wV:tI", "working")], "/repo")
+        types = [m["type"] for m in crew_members(reviewer_first)]
+        self.assertEqual(types, ["implementer", "reviewer"])
+
+    def test_the_key_alone_names_both_and_closes_nothing(self):
+        code, calls, _, err = _run_retire(REVIEW_KEY, self._both())
+        self.assertEqual(code, 3)
+        self.assertFalse(any(c[1] == "close" for c in calls))
+        self.assertIn("implementer", err)
+        self.assertIn("reviewer", err)
+        self.assertIn("wV:pImpl", err)
+        self.assertIn("wV:pRev", err)
 
 
 class TestDispatchWaitsForTheAgentBeforePromptingIt(unittest.TestCase):

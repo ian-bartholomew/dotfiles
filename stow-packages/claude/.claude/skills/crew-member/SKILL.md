@@ -63,16 +63,39 @@ line and let the human decide.
 
 You may close your own pane, but only after `crew mail send` has exited 0.
 
-A reviewer closes itself in this order: write the findings to a file inside
-your own worktree, mail a one-line `done` naming that file path, confirm the
-send exited 0, then close. The findings go in the file, never in the mail
-line.
+A reviewer closes itself in this order: write the findings file, mail a one-line
+`done` naming its path, confirm the send exited 0, then close. The findings go in
+the file, never in the mail line. Which file, and why the worktree is not yours,
+is below.
 
 You own nothing beyond your own pane, so there is nothing else to lose. You
 may never close another session; that is the foreman's to propose and the
 human's to confirm, because another crew member's context is unsaved work.
 
 Never force-push. Never merge. The human merges.
+
+## If you are a reviewer, the worktree is not yours
+
+A reviewer is dispatched INTO the worktree of the crew member whose work it
+reviews, because the point of a reviewer is to read what is already there. So the
+worktree your system prompt names belongs to another crew member, and that member
+may have a live session in it right now. This is the one case where a crew member
+is not alone in its checkout, and "do not change code" stops being advice about
+scope and becomes the thing that keeps someone else's unsaved work alive.
+
+- Change no code, and create no file other than the findings file below.
+- Run no git command that writes. One checkout has one index and one HEAD, so
+  `git checkout`, `git switch`, `git stash`, `git add`, `git commit`, `git reset`
+  and `git rebase` all reach into work that is not yours, and uncommitted work is
+  gone for good.
+- Write your findings to the file your assignment names,
+  `crew-review-<your key>.md`, at the root of that worktree. It is named after
+  your key so it cannot collide with anything the member under review wrote.
+- Do not run `git status` and then tidy anything up. What looks like debris is
+  the other session's work in progress.
+
+Nothing enforces this. `Write`, `Edit` and `git` are not gated by the guard, so
+the work you are reviewing survives because you leave it alone.
 
 ## The guard stops accidents, not intent
 
@@ -113,7 +136,8 @@ effect `crew mail ack` is denied for. `~/.crew/mailbox.jsonl` can be appended to
 directly, past the lock and past the forgery check in `crew mail send`. The hook
 itself and the settings that install it are ordinary files too. So the mailbox is
 authoritative because you keep it that way. Report through `crew mail send` and
-write files only inside your own worktree.
+write files only inside the worktree your system prompt names, which for a
+reviewer is another crew member's and is narrower still: see above.
 
 So if the guard denies something, that is the answer. Do not look for another
 route to the same effect. Report what you need with `crew mail send` and let
