@@ -505,11 +505,13 @@ So a `done` report is not by itself permission to close. Check the PR first.
 `close-crew.py` below enforces this and refuses by default, including when it
 cannot determine the PR state at all, because unknown is not the same as none.
 
-Crew also owe `/finish-work` on the way out, run after their PR is approved and
-before they report `done`, declining its worktree cleanup. That is what transitions
-the JIRA ticket and writes the project record. If a crew member reports `done` on a
-PR-bearing ticket and its ticket is still sitting in the state it started in, ask
-before closing: the report is probably early and `/finish-work` was skipped.
+Crew were meant to run `/finish-work` on the way out, before reporting `done`, to
+transition the JIRA ticket and write the project record. Measured across this
+fleet, they skipped it as often as not, so **the foreman now owns that closeout**
+rather than trusting it happened. `/finish-work` also cannot be run after the fact:
+`close-crew.py` SIGTERMs the session, and the skill runs in the crew member's own
+session, so once you tear it down the chance is gone. See "The closeout, in order"
+below.
 
 **Check that a code review actually ran before you relay a PR as ready.** Crew owe
 `terraform-review` or `feature-dev:code-reviewer` before opening a PR, and roughly
@@ -527,6 +529,26 @@ it that it shares a live worktree.
 Override with `--allow-open-pr` only when deliberately abandoning the work, and
 say so to the human rather than doing it quietly.
 
+### The closeout, in order
+
+When the human says "retire" a crew member, that is the whole closeout, not just
+the pane. Do these in order:
+
+1. **Comment on the JIRA ticket** with an evidence-tiered result: lead with
+   `verified` / `reported` / `heuristic` / `asserted`, the same ladder the crew
+   contract puts on `done`. `verified` needs a named mechanical check.
+2. **Transition the ticket to Done** (transition id `31` in FANDEVX). A merged PR
+   whose ticket is still `In Progress` is the tell that this step was skipped.
+3. **`crew log <key>`** to fold the crew's reports into the project record, but
+   only if a `~/Documents/Work/projects/<project>/` project owns the work. For an
+   ad-hoc FANDEVX key there is usually no project and it refuses with "no project
+   names <key>"; that is expected, skip it (or pass `--project`).
+4. **`close-crew.py <key>`** ends the session and removes its worktree (below).
+5. **`crew retire <handle>`** closes the now-vacant pane (below).
+
+Do NOT run `/finish-work` yourself: it runs in the crew member's session, which is
+gone by step 5, and step 1 and 2 are the parts of it that matter to you.
+
 ### Use the script; do not improvise the PID lookup
 
 ```bash
@@ -534,8 +556,12 @@ python3 ~/.claude/skills/foreman/scripts/close-crew.py <key> [--dry-run]
 ```
 
 It identifies the session by its own command line, refuses unless exactly one
-matches, gates on open PRs, sends SIGTERM, and confirms the exit. Run `--dry-run`
-first when you are unsure.
+matches, gates on open PRs, sends SIGTERM, confirms the exit, and then **removes
+the worktree**. That removal is fail-safe: `git worktree remove` without `--force`
+refuses a dirty tree and `git branch -d` (never `-D`) refuses an unmerged branch,
+so a dirty or unmerged worktree is left and reported rather than forced, and no
+local-only commit is ever lost. A reviewer's shared worktree is left for the
+implementer. Pass `--keep-worktree` to hold it, and `--dry-run` first when unsure.
 
 Two reasons it is a script rather than a shell pipeline you retype. Identifying by
 working directory returns **two** crew for any key holding an implementer and a

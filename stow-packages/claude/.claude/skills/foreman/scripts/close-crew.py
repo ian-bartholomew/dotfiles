@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Close a settled crew member's session so its pane can be retired.
 
-    close-crew.py <key> [--allow-open-pr] [--dry-run]
+    close-crew.py <key> [--allow-open-pr] [--keep-worktree] [--dry-run]
 
 Identifies the session by its own command line, refuses if it still owns an open
-PR, sends SIGTERM, and confirms the process exited. Retiring the pane afterwards
-is deliberately left to `crew retire`, so the handle comes from `crew ls` rather
-than from a guess: a key holding both an implementer and a reviewer needs a pane
-id, not the key.
+PR, sends SIGTERM, confirms the process exited, and then removes its worktree
+(fail-safe: a dirty or unmerged worktree is left and reported, never forced; a
+reviewer's shared worktree is left for the implementer; --keep-worktree opts
+out). Retiring the pane afterwards is deliberately left to `crew retire`, so the
+handle comes from `crew ls` rather than from a guess: a key holding both an
+implementer and a reviewer needs a pane id, not the key.
 
 Why SIGTERM and not -9: measured 2026-08-14, SIGTERM runs the session's
 SessionEnd hooks (honcho registers one) and -9 skips them.
@@ -90,11 +92,41 @@ def alive(pid):
         return False
 
 
+def remove_worktree(worktree):
+    """Remove a retired crew worktree, fail-safe. `git worktree remove` without
+    --force refuses a dirty tree; `git branch -d` (never -D) refuses an unmerged
+    branch, so no local-only commit is ever lost: a dirty or unmerged one is left
+    and reported instead."""
+    if not worktree or not os.path.isdir(worktree):
+        return "no worktree on disk"
+    wl = run(["git", "-C", worktree, "worktree", "list", "--porcelain"])
+    main = next((ln.split(" ", 1)[1] for ln in wl.stdout.splitlines()
+                 if ln.startswith("worktree ") and "/.claude/worktrees/" not in ln), None)
+    if not main:
+        return "could not resolve the main repo, left intact"
+    dirty = run(["git", "-C", worktree, "status", "--porcelain"]).stdout.strip()
+    if dirty:
+        return f"DIRTY, left intact ({len(dirty.splitlines())} change(s))"
+    branch = run(["git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    rm = run(["git", "-C", main, "worktree", "remove", worktree])
+    if rm.returncode != 0:
+        tail = (rm.stderr.strip().splitlines() or ["refused"])[-1]
+        return f"left intact: {tail}"
+    note = "worktree removed"
+    if branch and branch != "HEAD":
+        bd = run(["git", "-C", main, "branch", "-d", branch])
+        note += "; branch deleted" if bd.returncode == 0 else "; branch kept (unmerged/squash)"
+    run(["git", "-C", main, "worktree", "prune"])
+    return note
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("key")
     ap.add_argument("--allow-open-pr", action="store_true",
                     help="close even though the crew member still owns an open PR")
+    ap.add_argument("--keep-worktree", action="store_true",
+                    help="do not remove the worktree after the session exits")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -153,6 +185,12 @@ def main():
         time.sleep(1)
         if not alive(pid):
             print(f"pid {pid} exited")
+            if a.keep_worktree:
+                print("worktree: kept (--keep-worktree)")
+            elif ctype == "reviewer":
+                print("worktree: kept, a reviewer shares the implementer's worktree")
+            else:
+                print(f"worktree: {remove_worktree(worktree)}")
             print(f"Now run: crew ls   (expect {a.key} as `recover`)")
             print("then retire it with the handle crew ls proposes")
             return 0
