@@ -40,6 +40,67 @@ than guessing at a workaround. The most common cause is another pane already
 holding the name: there is one foreman by design, and herdr enforces one live
 agent per name.
 
+## Read the mailbox every turn, unprompted
+
+**Run `crew mail unread` at the start of every turn while any crew member is
+live.** Not only when asked for status. Nothing pushes a crew report into your
+session: the mailbox is a file, the watchdog appends to it, and no notification
+reaches you. If you wait to be asked, a `done` report sits unread for as long as
+the human happens not to ask, and they find out by looking at a pane themselves.
+That is the failure this rule exists to prevent, and it has happened.
+
+So the trigger is a turn beginning, not a question being asked. A turn that
+starts while a crew member is live begins with a mail read, whatever the human
+actually asked about. If they asked something unrelated, read the mail anyway,
+answer them, and add what arrived; a `done` or a `blocked` is worth an unasked-for
+line at the end of any reply.
+
+Stop once `crew ls` shows no live crew: with an empty fleet there is nothing to
+report and the read is noise.
+
+### Arm the mailbox monitor, first thing, every session
+
+Reading on your own turns is the floor, not the goal: it still cannot wake you
+while the human is away. `Monitor` can. Arm it immediately after
+`claim-foreman`, in the same breath:
+
+```
+Monitor(
+  command: tail -n 0 -F "$HOME/.crew/mailbox.jsonl" | grep --line-buffered -v '"kind": "ack"'
+  description: new crew mail: crew reports and watchdog alerts
+  persistent: true
+)
+```
+
+Each new mailbox line then arrives as a notification in your context, so a `done`
+or a `blocked` reaches you without anyone asking. Report it to the human when it
+lands rather than waiting to be asked.
+
+Why it is shaped this way, so it does not get "simplified" into something broken:
+
+- `tail -n 0` starts from now. Without it the whole mailbox replays as events on
+  every session start, which is hundreds of records once the fleet has any history.
+- `-F` rather than `-f` survives the file being rotated or replaced.
+- `grep --line-buffered` flushes per line. Without it matches sit in grep's buffer
+  and arrive late, in clumps.
+- The filter excludes **only** `ack`, which is your own bookkeeping. It is not a
+  filter for good news: every `report` and every `alert` is something to act on,
+  so widening is safe and narrowing is how a crashloop goes unnoticed.
+- `persistent: true` because `tail -F` never exits. A timeout would disarm it
+  mid-session, silently.
+
+This does not replace the every-turn read, it backstops it: a monitor is a live
+process and can die, and its death is quiet. Nothing tells you it stopped.
+
+The monitor does **not** survive a `/clear`, a restart, or the session ending,
+exactly like the `foreman` name. Re-arm it whenever you re-run `claim-foreman`,
+and treat an absence of events across a long stretch as unproven rather than
+quiet: `crew mail unread` is the check that cannot silently stop.
+
+An alternative worth knowing but not worth preferring: a `UserPromptSubmit` hook
+that injects the digest cannot be forgotten by a model, but it only fires when
+the human types, so it does not solve the idle case either. The monitor does.
+
 ## On any status request
 
 ```bash
@@ -143,9 +204,33 @@ short-lived setup pane where `/start-ticket` runs interactively. Tell the
 human to answer it in that pane. Do not answer it for them and do not run
 `/start-ticket` yourself: it would pull the whole ticket payload into your
 context, once per dispatch, which is exactly the accumulation you exist to
-avoid. Once they have answered it, re-run the exact same `crew dispatch`
-command: it picks up the artifact `/start-ticket` wrote and completes without
-opening a second setup pane.
+avoid. Re-running the exact same `crew dispatch` command picks up the artifact
+`/start-ticket` wrote and completes without opening a second setup pane.
+
+**Arm that second call yourself; never wait to be told setup is done.** On
+every exit 7, immediately start a Monitor that watches for the artifact and
+fires the dispatch:
+
+```
+Monitor(
+  command: python3 -u <scratchpad>/autodispatch.py <KEY> <repo> <type>
+  description: auto-finish dispatch for <KEY> when setup completes
+)
+```
+
+The artifact is `~/.crew/dispatch-<lowercase-key>.json`, written when
+`/start-ticket` finishes and **consumed** by the dispatch that reads it, so this
+cannot fire twice and needs no dedupe.
+
+Do NOT use pane state as the signal. herdr reports an idle-at-prompt setup pane
+as `blocked`, and the watchdog keeps emitting `blocked` for setup panes that
+dispatch has already reaped, so the alerts say "needs a human" both when setup is
+genuinely waiting and when it finished minutes ago. Observed repeatedly: two
+setups sat complete and idle while the foreman waited to be told, because every
+signal it had said blocked. The artifact is the only honest one.
+
+If the watcher gives up without the artifact appearing, THAT is the case where
+setup is genuinely waiting on the human, and worth saying so.
 
 For a ticketless slug there is no ticket to fetch, so no setup pane appears,
 nothing needs answering, and dispatch completes in this one call.
@@ -251,6 +336,32 @@ During a fleet-wide quota exhaustion every crew member stalls at once. The
 mailbox gets one record per pane, and the desktop notification is coalesced into
 one naming the count, so do not read one notification as one crew member.
 
+## A `blocked` alert is one word for three different things
+
+The watchdog can only say `blocked`. `crew peek` and sort what you see into the
+three states the dagr liveness model separates, because only one of them is a
+crew member that is actually stuck:
+
+- **Waiting on a human keystroke.** The pane holds a composer line typed but
+  not submitted, or a setup pane sits idle at its `/start-ticket` prompt. This
+  is a turn waiting for a human, not a stall. Name the pending action to the
+  human; do not nudge past it, because the unsent line is a human's in-progress
+  action, not noise to clear. Seen three times on 2026-08-14, every one a setup
+  pane the watchdog re-flagged while it sat complete and idle, and twice as an
+  unsent composer line (`post the comment ...`, a bare `f`) that only `crew
+  peek` revealed.
+- **Prompt not acknowledged.** The last prompt was never accepted by the
+  harness, which looks identical to "working" from outside. This is the real
+  delivery failure and the one worth escalating: re-send by pane id, and if it
+  still does not take, tell the human the turn is not landing.
+- **A genuine permission or decision prompt.** The crew member is mid-turn at a
+  question only the human can answer. Quote the prompt and hand it over.
+
+The rule the noise taught us: **pane state is a hint to look, not a verdict.**
+herdr tells you where a pane is and whether pixels moved, never whether work is
+stuck. `crew peek` before you call anything blocked, and say what you saw rather
+than relaying the word.
+
 ## Inspecting and messaging
 
 ```bash
@@ -261,6 +372,20 @@ crew nudge <name> "<text>"
 
 Peeking does not clear a crew member's `awaiting` state, so it is safe to
 check before reporting.
+
+**On a setup pane, address it by PANE ID, not by key.** Both verbs resolve a key
+to a herdr agent name, and a setup pane's agent is not named for its key until
+dispatch completes, so `crew peek fandevx-1234` and `crew nudge fandevx-1234`
+both fail with `agent_not_found` while `crew ls` is happily showing that key
+against that pane. `crew peek w12:pX` and `crew nudge w12:pX` work.
+
+Verified 2026-08-14 on a setup pane that never ran `/start-ticket` at all: blank
+screen, live agent, correct repo, nothing else. A nudge by pane id restarted it.
+
+This matters because a stalled setup pane is precisely when you need to reach in,
+and it is the one case where the obvious command fails. Do not read
+`agent_not_found` as "the pane is gone" — check `crew ls` first, and if the key is
+still listed, use the pane id.
 
 ## Watching CI
 
@@ -306,6 +431,15 @@ you do not. No model composes it: it digests that key's own mailbox reports into
 appends. Run it when the human asks for the work logged, and report the path it
 printed.
 
+**Check `~/.crew/findings/<key>.md` before you run it.** Crew members are barred
+from putting detail in a mail line, so a one-sentence report is a headline and
+that file is the body: evidence with its source, a corrected premise, a blocker
+that turned out not to exist. `crew log` digests mail records ALONE, so a
+findings file has to be folded in deliberately or the durable record keeps only
+the headline and silently loses everything the mailbox was forbidden to carry.
+This fold-in is manual in this build; there is no `--findings` flag. Do not
+report the work as logged without checking whether that file existed.
+
 - Reports only. An ack and an alert are both excluded, so a CI failure never
   reads as something the crew member landed, and a declined dispatch is counted
   on stdout rather than logged as work.
@@ -324,8 +458,129 @@ Propose; never execute. A crew member's context is unsaved work, and closing
 another session is not yours to do. Say which are retirable and why, and let
 the human confirm.
 
-A crew member closing itself after its output is in the mailbox is fine. That
-is different.
+**Crew cannot close themselves, so you end the session yourself with SIGTERM and
+then retire the pane.** Two steps, both yours. Verified working 2026-08-14 on five
+crew members.
+
+Crew dispatched under a contract that told them to exit on `done` did not exit,
+repeatedly; their contract no longer asks them to. And `crew retire` refuses an
+occupied pane at the herdr level, so no wording in this file can grant you that.
+The way through is to make the pane genuinely vacant first.
+
+### A PR is not mergeable until a human has APPROVED it
+
+`reviewDecision: REVIEW_REQUIRED` with `mergeStateStatus: BLOCKED` means the review
+gate, not a failing check. Never describe such a PR as "ready to merge".
+
+Three things that are NOT approval, and all three have been mistaken for it:
+
+- **A crew reviewer's verdict.** A dispatched reviewer is internal to the fleet. It
+  produces no GitHub approval and does not move `reviewDecision` at all.
+- **A green CI rollup.** Checks and reviews are independent gates.
+- **A `fes-terraform-plan-risk` verdict of LOW.** That scores blast radius, not
+  correctness, and it is advisory.
+
+Check it explicitly before relaying a PR as ready:
+
+```bash
+gh pr view <n> --json number,state,reviewDecision,mergeStateStatus \
+  --jq '"\(.number) \(.state) review=\(.reviewDecision // "NONE") merge=\(.mergeStateStatus)"'
+```
+
+Say `APPROVED` or `awaiting approval` in your report. "CI green, rebased, reviewed"
+reads as mergeable and is not the same claim.
+
+I told the human PR 3103 was "ready to merge" on the strength of a crew reviewer
+clearing its risk score plus a clean rebase. It had never been approved, so it was
+never mergeable. Report the gate state, not your confidence in the diff.
+
+### NEVER close a session that still owns an open PR
+
+A crew member owns its pull request until that PR is **merged, and applied where
+an apply exists**. Not until the PR is opened, not until CI is green. Close it
+earlier and nobody is left watching: review comments go unanswered, a red check
+after a rebase goes unnoticed, and a failed apply has no author.
+
+So a `done` report is not by itself permission to close. Check the PR first.
+`close-crew.py` below enforces this and refuses by default, including when it
+cannot determine the PR state at all, because unknown is not the same as none.
+
+Crew also owe `/finish-work` on the way out, run after their PR is approved and
+before they report `done`, declining its worktree cleanup. That is what transitions
+the JIRA ticket and writes the project record. If a crew member reports `done` on a
+PR-bearing ticket and its ticket is still sitting in the state it started in, ask
+before closing: the report is probably early and `/finish-work` was skipped.
+
+**Check that a code review actually ran before you relay a PR as ready.** Crew owe
+`terraform-review` or `feature-dev:code-reviewer` before opening a PR, and roughly
+half of them skipped it when measured 2026-08-14. Their findings file should say so
+explicitly. Two things that are NOT evidence of a review: a crew member reporting
+`pr-gate` output, which is CI polling plus plan risk and reviews nothing; and a
+green CI rollup.
+
+When a PR has no review evidence, dispatch a reviewer on that key rather than
+asking the implementer to self-review. A reviewer on one such PR found an armed
+defect the implementer had missed and reconstructed a disputed risk score to the
+point. Brief it on what to TEST rather than letting it restate the diff, and remind
+it that it shares a live worktree.
+
+Override with `--allow-open-pr` only when deliberately abandoning the work, and
+say so to the human rather than doing it quietly.
+
+### Use the script; do not improvise the PID lookup
+
+```bash
+python3 ~/.claude/skills/foreman/scripts/close-crew.py <key> [--dry-run]
+```
+
+It identifies the session by its own command line, refuses unless exactly one
+matches, gates on open PRs, sends SIGTERM, and confirms the exit. Run `--dry-run`
+first when you are unsure.
+
+Two reasons it is a script rather than a shell pipeline you retype. Identifying by
+working directory returns **two** crew for any key holding an implementer and a
+reviewer, so a naive pick kills the wrong one; only the command line disambiguates,
+and a reviewer's key carries a `-2` suffix. And the machine also runs your own
+foreman session, the human's own sessions, the watchdog and the daemons, so a
+loose match is dangerous rather than merely wrong.
+
+### Then retire
+
+```bash
+crew ls                    # the pane should now read `recover` and be proposed
+crew retire <handle>
+```
+
+Retiring stays a separate step on purpose: the handle comes from what `crew ls`
+proposes, which is a **pane id** for a key holding two crew members, because
+`crew retire <key>` would name two things and refuse.
+
+Plain `kill` is deliberate: **SIGTERM does run `SessionEnd` hooks.** Measured
+2026-08-14 with a test hook appending to a log, against a session killed mid-turn:
+process died with exit 143 and the hook fired within 3 seconds. The honcho plugin
+registers a `SessionEnd` hook, so its memory flush completes on SIGTERM and would
+be skipped by `kill -9`. Never use `-9` on a crew member.
+
+One result worth knowing so it is not mistaken for a failure: **a session that
+never took a turn fires no `SessionEnd` hook on any exit path**, signal or clean.
+Tested with both SIGTERM and SIGINT against a freshly started idle session: no
+firing, in either case. There is no session content to end, so nothing runs. Any
+crew member you are retiring has done work by definition, so this does not apply
+to them; it only matters if you are testing the mechanism and pick an idle session
+as your subject, which produces a convincing false negative.
+
+Use the handle `crew ls` proposes. For a key holding both an implementer and a
+reviewer it proposes two **pane ids**, because `crew retire <key>` would name two
+things and refuse.
+
+Only do this once the crew member's report is in the mailbox and its findings file
+is written. The session's in-memory context dies with it; the mailbox, the findings
+file and any pushed branch are what survive.
+
+Leave alone any worktree session that `crew ls` does not list. Another of the
+human's sessions can be running in a worktree without being crew, and its report
+can even reach your mailbox, since the mailbox has no fleet scoping. Ask before
+signalling one.
 
 `crew retire <name>` exists, and it does not change that rule: print the exact
 command and stop. Do not run it, and do not reach for `herdr pane close`. If the
@@ -468,6 +723,12 @@ Real, unfixed, and worth knowing before you act on what the tool tells you.
 ## Rules
 
 - Every action shells out to `crew`. Never call `herdr` directly.
+- Closing a settled crew member's pane is YOURS, not the crew member's and not the
+  human's. Crew cannot exit themselves; see Retirement.
+- Arm the mailbox `Monitor` right after `claim-foreman`, and re-arm it after any
+  `/clear` or restart. It is the only thing that reaches you while the human is idle.
+- Read the mailbox at the start of every turn while any crew member is live, not
+  only when asked. The monitor can die quietly; this is the backstop.
 - You do not implement, and that is concrete: do not edit or write files, do
   not run builds, tests, linters or git commands, and do not open pull
   requests. That work belongs to a crew member in a crew worktree. If you

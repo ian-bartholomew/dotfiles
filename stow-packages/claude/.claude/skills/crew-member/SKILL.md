@@ -35,7 +35,88 @@ means your report did not reach the foreman: retry once, and if it still
 fails, say so in your session and stop. Do not close a pane whose report
 never arrived.
 
-This is your only obligation to the fleet. Silence is a bug.
+**If you opened a PR, you are not done until it is merged, and applied where an
+apply exists.** Opening it is not done. Green CI is not done. You own that PR:
+answer review comments, notice a red check after a rebase, and watch the apply if
+your change has one.
+
+While you are waiting, send `needs-input` naming what you are waiting for, and
+stay alive. The foreman refuses to close a session that still owns an open PR, so
+a premature `done` does not get you retired early; it just makes the board lie
+about where the work is.
+
+The order to settle a PR-bearing ticket:
+
+1. **Run a code review BEFORE you push and open the PR.** `terraform-review` for
+   Terraform, `feature-dev:code-reviewer` otherwise. This is a gate, not a tool you
+   may reach for. Record in your findings file that you ran it and what it said,
+   including "no findings" — otherwise nobody downstream can tell whether it ran.
+2. PR opened, CI green
+3. PR **approved** by a human
+4. Run **`/finish-work`**, declining its worktree and branch cleanup
+5. PR merged, and applied if it has an apply
+6. Only now send `done`
+
+Step 1 is the one most often skipped, because the ticket feels finished once the
+code works. Measured 2026-08-14 across seven crew members: roughly half opened a
+PR with no review pass. A dispatched reviewer on one of them found an armed
+defect the implementer had missed entirely, worth about 187 risk points. Running
+`pr-gate` is **not** a substitute: it polls CI and scores plan risk, it does not
+review your code.
+
+Steps 3 and 4 are both required and neither substitutes for the other:
+`/finish-work` settles the ticket and the project record, the merge and apply
+settle the change itself.
+
+If your change has no PR, which happens for verification and investigation work,
+then your report and your findings file are the whole deliverable and `done` is
+correct as soon as both are in place.
+
+## Every `done` carries an evidence tier
+
+`done` is a claim, and the foreman needs to know how strong it is without
+reading your whole findings file. Lead your `done` sentence with one of these
+four words, borrowed from the dagr contract, in decreasing order of trust:
+
+- **verified** — you ran a mechanical check and it passed, and you can name it:
+  a test suite, a plan applied and the result read back, a pod log line, a
+  `has_table_privilege` query. This is the CLAUDE.md "quote the output" bar.
+- **reported** — a tool returned structured success you are relaying but did
+  not independently confirm: `gh` says the PR merged, the apply job went green.
+  True as far as it goes, and not proof the change had its intended effect.
+- **heuristic** — you are inferring from a runtime signal: the pane exited
+  clean, the result "looks" right. No check ran.
+- **asserted** — a bare claim, nothing structured behind it.
+
+The rule: **`verified` requires a check you can name, and nothing weaker may be
+worded as if it were verified.** If all you have is `reported`, say `reported`;
+do not round it up. A `done` with no tier is read as `asserted`, the weakest.
+
+```bash
+crew mail send --key <key> done "verified: make ready green, inf-dev applied, param read back SecureString v1"
+crew mail send --key <key> done "reported: PR merged and all five applies green per gh; effect not independently confirmed"
+```
+
+Why: measured 2026-08-14, two reviewers sent `done` with an empty findings
+marker while their subagents were still running, and a profile SSM change was
+nearly called done on prod when only its plan had been read. Forcing the sender
+to name the tier catches both. "The agent said done" is not evidence; the tier
+says how much it is.
+
+Your report IS your handover. Once it is in the mailbox you are done, and closing
+your pane is **the foreman's job, not yours**. Do not try to exit, and do not
+remove your worktree or branch: the foreman is still tracking both.
+
+An earlier version of this contract told crew to close their own session. That
+was wrong twice over. Crew dispatched under that rule did not exit, so it was an
+instruction without a mechanism, and it also put the decision in the wrong place:
+only the foreman can see whether your pane is still needed, and only the human
+can see whether there is unsaved work in the worktree you share.
+
+So the sequence is: you report, you stop, the foreman closes you. Reporting
+without stopping is fine. Stopping without reporting is the bug.
+
+Reporting is your only obligation to the fleet. Silence is a bug.
 
 You cannot report `blocked`, `stalled` or `dead`, and `crew mail send` refuses
 all three. That is not an oversight. In each of those states you are the thing
@@ -68,10 +149,20 @@ your peers.
 
 Never put command output, credentials, ARNs, account ids, tokens, hostnames,
 IP addresses, stack traces or file contents in a mail line. State plus one
-human-readable sentence only. Detail belongs in a file in your worktree, not
-in the mailbox: the mailbox is never pruned, and `crew log` digests it into a
-git-tracked project log, so your sentence outlives your session and gets
-committed. Write it as the log entry it becomes.
+human-readable sentence only. Write that sentence as the log entry it becomes.
+
+Detail goes in a findings file at `~/.crew/findings/<YOUR-KEY>.md`. **Not in your
+worktree.** A worktree is deleted once you are retired, and if you finish with no
+PR and no commits then nothing in it survives you at all: the verification you
+did, the failure you root-caused, the constraint you discovered, all gone. That
+has happened. One file per key, so no two crew members ever contend for it, and
+that directory is never pruned, the same as the mailbox.
+
+Write the findings file whenever you learned something the next person would
+otherwise have to rediscover, which includes work that shipped no code. Evidence
+with its source, a wrong premise you corrected, a blocker that turned out not to
+exist, an account or AZ or profile that behaved unexpectedly. Your mail line is
+that record's headline; the findings file is its body.
 
 ## Boundaries
 
@@ -194,12 +285,23 @@ the foreman or the human act.
 - Do NOT run `/start-ticket`. It already ran before you existed; your
   worktree and plan are in place.
 - Do NOT write to any project `log.md`, and do not run `crew log`. Several crew
-  writing to one log interleaves, and the mailbox already holds your report.
-  `crew log <key>` digests those reports into the project log, deterministically
-  and append-only, and it is the foreman's to run or the human's. Your one line
-  in the mailbox IS your log entry; write it well and leave the file alone.
-- Do NOT run `/finish-work`. Report `done` and stop. It would delete the
-  worktree the foreman is still tracking.
+  writing to one log interleaves, and `crew log <key>` digests the mailbox into
+  the project log append-only; it is the foreman's to run or the human's. Your
+  mail line is that entry's headline and `~/.crew/findings/<YOUR-KEY>.md` is its
+  body. Write both well and leave the project log alone. If you believe your
+  findings have no durable home, say so in your report rather than writing the
+  log yourself: that is a gap to fix, not one for you to route around.
+- DO run `/finish-work`, once your PR has been **approved** and before you report
+  `done`. It transitions the JIRA ticket from the PR's real state and captures
+  learnings into the project documents, which is work that otherwise falls to the
+  human. **Decline its worktree and branch cleanup**: the foreman is still
+  tracking both, and removing them is the one part of that skill that is not
+  yours. If it does not offer the choice, stop and report rather than letting it
+  delete the tree.
+
+  This reverses an earlier version of this contract, which forbade
+  `/finish-work` outright because of that cleanup step. Declining the cleanup is
+  enough; the rest of the skill is wanted.
 
 Everything else in the global CLAUDE.md still applies to you.
 
