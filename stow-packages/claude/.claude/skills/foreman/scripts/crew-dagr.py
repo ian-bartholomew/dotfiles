@@ -26,10 +26,13 @@ import threading
 import time
 from datetime import datetime, timezone
 
-# One global run file, not per-repo: the fleet is global, so the foreman writes
-# the same file wherever its cwd is, and the herdr pane always reads that path.
-# Override with $CREW_DAGR_RUN or a positional arg.
-DEFAULT_RUN = os.path.expanduser(os.environ.get("CREW_DAGR_RUN") or "~/.crew/dagr.json")
+# The run file and backlog derive from CREW_DIR (default ~/.crew), matching
+# crew.py, so a per-project foreman launched with CREW_DIR=~/.crew-<proj> gets a
+# TUI over its own fleet. $CREW_DAGR_RUN still overrides the run file directly,
+# and a positional arg overrides it per-invocation.
+CREW_DIR = os.path.expanduser(os.environ.get("CREW_DIR") or "~/.crew")
+DEFAULT_RUN = os.path.expanduser(os.environ.get("CREW_DAGR_RUN") or os.path.join(CREW_DIR, "dagr.json"))
+BACKLOG_PATH = os.path.join(CREW_DIR, "backlog.jsonl")  # queued tickets, written by `crew backlog`
 
 # For the "open in browser" keys. Overridable by env; repo defaults per task.
 JIRA_BASE = os.environ.get("CREW_DAGR_JIRA_BASE") or "https://betfanatics.atlassian.net/browse/"
@@ -618,6 +621,24 @@ HELP = [
 ]
 
 
+def read_backlog():
+    """The queued tickets `crew backlog` maintains. [] if none. Never raises."""
+    out = []
+    try:
+        with open(BACKLOG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return out
+
+
 def _load_doc(path):
     try:
         with open(path) as f:
@@ -787,6 +808,25 @@ def _tui_loop(stdscr, path, interval):
                 put(y, rx, f"{glyph} {t.get('id', '?')}  {note}",
                     pair(state_name.get(t.get("state"), "def"), False), W)
                 y += 1
+            # backlog panel: queued tickets not yet dispatched
+            backlog = read_backlog()
+            y += 1
+            put(y, rx, "BACKLOG", curses.A_BOLD, W)
+            btag = f"{len(backlog)} queued"
+            if rw - len(btag) > 9:
+                put(y, rx + rw - len(btag), btag, curses.A_DIM, W)
+            y += 1
+            if not backlog:
+                put(y, rx, "(empty)", curses.A_DIM, W)
+                y += 1
+            else:
+                show = max(1, (H - 4) // 4)
+                for it in backlog[:show]:
+                    put(y, rx, f"○ {it.get('key', '?')}", pair("blue", False), W)
+                    y += 1
+                if len(backlog) > show:
+                    put(y, rx, "  +%d more" % (len(backlog) - show), curses.A_DIM, W)
+                    y += 1
             # focus card for the selected task
             cy = y + 1
             card = tasks[sel]

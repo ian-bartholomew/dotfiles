@@ -37,8 +37,16 @@ same mail over and over without ever clearing it.
 
 If `claim-foreman` fails for any reason, report the message and stop rather
 than guessing at a workaround. The most common cause is another pane already
-holding the name: there is one foreman by design, and herdr enforces one live
-agent per name.
+holding the name: one foreman per name by design, and herdr enforces one live
+agent per name. A second foreman for a different project is legitimate, but it
+needs its own fleet, and the fleet has to be in this session's environment from
+the moment it launched. The Bash tool starts a fresh shell every call, so
+exporting `CREW_DIR` mid-session does not stick: the next `crew` call would not
+see it and would act on the default fleet. Launch the second foreman as
+`CREW_DIR=~/.crew-<project> CREW_FOREMAN_NAME=foreman-<project> claude`; then
+`claim-foreman` claims `foreman-<project>` and every later `crew` call inherits
+the fleet. Dispatch carries `CREW_DIR` into each crew member's pane, so their
+reports return to this fleet's mailbox and not the default one.
 
 ## Read the mailbox every turn, unprompted
 
@@ -66,7 +74,7 @@ while the human is away. `Monitor` can. Arm it immediately after
 
 ```
 Monitor(
-  command: tail -n 0 -F "$HOME/.crew/mailbox.jsonl" | grep --line-buffered -v '"kind": "ack"'
+  command: tail -n 0 -F "${CREW_DIR:-$HOME/.crew}/mailbox.jsonl" | grep --line-buffered -v '"kind": "ack"'
   description: new crew mail: crew reports and watchdog alerts
   persistent: true
 )
@@ -289,6 +297,37 @@ a 7 from `crew peek` or a 5 from `crew nudge`:
 
 There is no cap on crew. Report load every time and let the human decide.
 The bottleneck is their review capacity, not tokens.
+
+## The backlog and headless auto-dispatch
+
+`crew` keeps a queue of tickets and can top the fleet up from it without a human
+answering `/start-ticket`. This is newer than the rest of this contract and has
+not had a full end-to-end run, so treat it as usable but unproven, and do not
+point it at work you cannot afford to have a fresh Fable plan drive.
+
+- `crew backlog add <KEY...> [--repo R]` queues tickets. **"Add these to the
+  backlog" means exactly this.** Also `crew backlog ls`, `crew backlog rm <KEY>`,
+  `crew backlog clear`. The backlog is a plain file (`~/.crew/backlog.jsonl`);
+  adding is harmless, only `run` spends sessions.
+- `crew backlog run [--target 3] [--interval 20] [--dry-run] [--once]` is the
+  auto-picker, run in a no-agent pane like the watchdog. One dispatch per tick,
+  then it sleeps.
+
+The pipeline is two stages, not one:
+
+- a **planner** (Fable 5) is dispatched headless, does the `/start-ticket` work
+  itself (fetch, brainstorm, adversarial-review), writes `PLAN.md` at the
+  worktree root, and reports done;
+- the runner sees `PLAN.md`, retires the planner keeping its worktree, and
+  dispatches an **implementer** (Opus 4.8) onto that same worktree to build it.
+
+`--target` caps total live crew (default 3, the review bottleneck). The runner
+never exceeds it, so it fills with implementers awaiting your review and then
+waits. Start it `--dry-run` to watch its decisions with no dispatch.
+
+Headless dispatch trades away interactive `/start-ticket`: nobody confirms the
+plan, the Fable planner makes the calls and records them in `PLAN.md`, and the
+branch is just the key (`fandevx-1234`), not a summary slug.
 
 ## The watchdog
 
