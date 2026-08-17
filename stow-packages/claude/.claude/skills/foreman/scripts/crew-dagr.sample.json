@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "run": {
+    "id": "crew-3549-identity-loyalty",
+    "title": "fixture: identity + loyalty fleet (not a live snapshot)",
+    "started_at": "2026-08-13T09:00:00Z"
+  },
+  "generated_at": "2026-08-17T17:00:00Z",
+  "tasks": [
+    {
+      "id": "pr-3103",
+      "title": "impl: declarative app database",
+      "kind": "impl",
+      "owner": "l56-dev",
+      "state": "awaiting",
+      "attempts": [
+        {
+          "id": "pr-3103·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "l56-dev", "state": "awaiting",
+          "locator": {"pane": "w12:p14"},
+          "started_at": "2026-08-14T20:00:00Z",
+          "liveness": {"prompt_acknowledged": true, "last_output_at": "2026-08-17T15:30:00Z", "queued_input": 0}
+        }
+      ]
+    },
+    {
+      "id": "fandevx-3628",
+      "title": "impl: inf-dev orchestration Temporal SSM",
+      "kind": "impl",
+      "owner": "l28-dev",
+      "state": "done",
+      "attempts": [
+        {
+          "id": "fandevx-3628·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "l28-dev", "state": "done",
+          "started_at": "2026-08-14T21:50:00Z", "ended_at": "2026-08-14T22:06:00Z",
+          "outcome": {"result": "done", "evidence": "verified", "receipt": "temporal task-queue describe: activity+workflow pollers present"}
+        }
+      ]
+    },
+    {
+      "id": "fandevx-3629",
+      "title": "impl: profile Kafka SSM params",
+      "kind": "impl",
+      "owner": "l29-dev",
+      "state": "done",
+      "attempts": [
+        {
+          "id": "fandevx-3629·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "l29-dev", "state": "done",
+          "started_at": "2026-08-14T20:30:00Z", "ended_at": "2026-08-14T21:30:00Z",
+          "outcome": {"result": "done", "evidence": "reported", "receipt": "PR 3122 merged and all five applies green per gh; effect not independently confirmed on prod"}
+        }
+      ]
+    },
+    {
+      "id": "fandevx-3597",
+      "title": "impl: inf-dev identity Cassandra Twingate",
+      "kind": "impl",
+      "owner": "l97-dev",
+      "state": "done",
+      "attempts": [
+        {
+          "id": "fandevx-3597·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "l97-dev", "state": "lost",
+          "started_at": "2026-08-13T10:00:00Z", "ended_at": "2026-08-13T10:20:00Z"
+        },
+        {
+          "id": "fandevx-3597·a2", "n": 2,
+          "cause": {"type": "followup", "ref": "fandevx-3597·a1", "reason": "pane died mid-run, re-dispatched"},
+          "actor": "l97-dev", "state": "done",
+          "started_at": "2026-08-13T10:25:00Z", "ended_at": "2026-08-13T11:00:00Z",
+          "outcome": {"result": "done", "evidence": "heuristic", "reason": "connections.yaml grants confirmed by read; reachability not exercised end to end"}
+        }
+      ]
+    },
+    {
+      "id": "fandevx-3631",
+      "title": "impl: SSM audit, generalise prefix",
+      "kind": "impl",
+      "owner": "l31-dev",
+      "state": "awaiting",
+      "note": "PR 3126 up for review",
+      "attempts": [
+        {
+          "id": "fandevx-3631·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "l31-dev", "state": "awaiting",
+          "locator": {"pane": "w12:p1B"},
+          "started_at": "2026-08-14T19:00:00Z",
+          "liveness": {"prompt_acknowledged": true, "last_output_at": "2026-08-17T16:50:00Z", "queued_input": 1}
+        }
+      ]
+    },
+    {
+      "id": "fandevx-3630",
+      "title": "impl: loyalty declarative DB follow-up",
+      "kind": "impl",
+      "owner": "orchestrator",
+      "state": "blocked",
+      "unblock": "PR 3103 merged",
+      "deps": ["pr-3103"],
+      "attempts": []
+    },
+    {
+      "id": "gate-inf-dev-identity",
+      "title": "gate: inf-dev identity stack up",
+      "kind": "gate",
+      "owner": "foreman",
+      "state": "working",
+      "deps": ["fandevx-3628", "fandevx-3629"],
+      "attempts": [
+        {
+          "id": "gate-inf-dev-identity·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "foreman", "state": "working",
+          "locator": {"pane": "w12:p1"},
+          "started_at": "2026-08-17T16:40:00Z",
+          "liveness": {"prompt_acknowledged": true, "last_output_at": "2026-08-17T16:58:00Z", "queued_input": 0}
+        }
+      ]
+    },
+    {
+      "id": "fandevx-3635",
+      "title": "impl: too-narrow paths-filter sweep",
+      "kind": "impl",
+      "owner": "unassigned",
+      "state": "queued",
+      "attempts": []
+    },
+    {
+      "id": "verify-prod-schema",
+      "title": "investigation: loyalty-bonus prod schema_migrations",
+      "kind": "investigation",
+      "owner": "foreman",
+      "state": "done",
+      "attempts": [
+        {
+          "id": "verify-prod-schema·a1", "n": 1, "cause": {"type": "initial"},
+          "actor": "foreman", "state": "done",
+          "started_at": "2026-08-14T22:30:00Z", "ended_at": "2026-08-14T22:45:00Z",
+          "outcome": {"result": "done", "evidence": "asserted", "reason": "no prod DB access; inferred from the apply succeeding, not read back"}
+        }
+      ]
+    }
+  ]
+}

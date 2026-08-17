@@ -1,0 +1,76 @@
+# herdr-plugin.toml — crew-dagr as a herdr pane.
+#
+# Thin integration wrapper: the tool itself is single-sourced at
+# ~/.claude/skills/foreman/scripts/crew-dagr.py (the foreman skill). This
+# plugin only opens it as a split pane. No build step, it is pure Python
+# stdlib. The pane reads ONE global run file ($CREW_DAGR_RUN, default
+# ~/.crew/dagr.json), so unlike herdr-dagr it needs no per-repo cwd
+# resolution: the fleet is global and the pane is the same wherever you are.
+
+id = "crew-dagr"
+name = "crew-dagr"
+version = "0.1.0"
+description = "Live DAG of the crew fleet — tasks, attempts, evidence tiers, liveness — in a herdr split pane."
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "dagr"
+title = "crew-dagr"
+placement = "split"
+# /bin/sh -c so $HOME expands; the script defaults to ~/.crew/dagr.json.
+command = ["/bin/sh", "-c", "exec python3 \"$HOME/.claude/skills/foreman/scripts/crew-dagr.py\" tui"]
+
+# Toggle: open the pane, or close it if one is already open. This is the one
+# to bind to a key. It finds an existing crew-dagr pane by its live foreground
+# process, so it works no matter how the pane was launched.
+[[actions]]
+id = "toggle-crew-dagr"
+platforms = ["linux", "macos"]
+title = "Toggle crew-dagr"
+description = "Open the live crew DAG in a horizontal split (below), or close it if already open."
+contexts = ["workspace"]
+command = ["bash", "toggle.sh", "down"]
+
+# The open-* actions open unconditionally, one per placement, so each can carry
+# its own keybinding. herdr splits go right/down natively; left/up open then
+# swap across (handled in open.sh).
+[[actions]]
+id = "open-crew-dagr"
+platforms = ["linux", "macos"]
+title = "Open crew-dagr"
+description = "Open the live crew DAG in a split pane beside the current work."
+contexts = ["workspace"]
+command = ["bash", "open.sh", "right"]
+
+[[actions]]
+id = "open-crew-dagr-right"
+platforms = ["linux", "macos"]
+title = "Open crew-dagr (right)"
+description = "Open the live crew DAG in a split pane to the right."
+contexts = ["workspace"]
+command = ["bash", "open.sh", "right"]
+
+[[actions]]
+id = "open-crew-dagr-down"
+platforms = ["linux", "macos"]
+title = "Open crew-dagr (below)"
+description = "Open the live crew DAG in a split pane below the current work."
+contexts = ["workspace"]
+command = ["bash", "open.sh", "down"]
+
+[[actions]]
+id = "open-crew-dagr-up"
+platforms = ["linux", "macos"]
+title = "Open crew-dagr (above)"
+description = "Open the live crew DAG in a split pane above the current work."
+contexts = ["workspace"]
+command = ["bash", "open.sh", "up"]
+
+[[actions]]
+id = "open-crew-dagr-left"
+platforms = ["linux", "macos"]
+title = "Open crew-dagr (left)"
+description = "Open the live crew DAG in a split pane to the left."
+contexts = ["workspace"]
+command = ["bash", "open.sh", "left"]
