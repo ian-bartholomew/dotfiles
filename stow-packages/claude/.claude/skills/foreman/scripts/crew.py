@@ -21,7 +21,14 @@ import warnings
 # add a number without re-running the drift checks in the spec, because the
 # design rests on five measured behaviours, not on documented ones.
 HERDR_VERIFIED_PROTOCOLS = (17, 19)
-CREW_DIR = os.path.expanduser("~/.crew")
+# CREW_DIR and FOREMAN_NAME are env-overridable so a second foreman can run an
+# isolated fleet for another project. Everything below derives from CREW_DIR
+# (mailbox, cursor, watchdog files, backlog), so overriding it alone gives that
+# project its own fleet; CREW_FOREMAN_NAME gives it a distinct herdr agent name
+# so herdr's one-live-agent-per-name check does not collide with the default
+# foreman. Defaults are unchanged.
+CREW_DIR = os.path.expanduser(os.environ.get("CREW_DIR") or "~/.crew")
+FOREMAN_NAME = os.environ.get("CREW_FOREMAN_NAME") or "foreman"
 MAILBOX = os.path.join(CREW_DIR, "mailbox.jsonl")
 CURSOR = os.path.join(CREW_DIR, "cursor")
 # A skill's scripts/ directory is not on PATH and ~/.local/bin is, so this
@@ -1240,7 +1247,7 @@ def foreman_pane():
     """The pane hosting the agent named foreman, or "" when no agent holds that
     name. herdr enforces one live agent per name, so there is at most one."""
     for agent in snapshot()["agents"]:
-        if agent.get("name") == "foreman":
+        if agent.get("name") == FOREMAN_NAME:
             return agent.get("pane_id") or ""
     return ""
 
@@ -1258,8 +1265,8 @@ def known_foreman_pane():
         return "", ("herdr could not be asked which pane hosts the foreman (%s)"
                     % exc)
     if not pane:
-        return "", ("no agent is named foreman, so there is no pane to compare "
-                    "an ack against; run crew claim-foreman")
+        return "", ("no agent is named %r, so there is no pane to compare "
+                    "an ack against; run crew claim-foreman" % FOREMAN_NAME)
     return pane, None
 
 
@@ -1292,18 +1299,19 @@ def claim_foreman():
     snap = snapshot()
     assert_snapshot_shape(snap, defs)
     for agent in snap["agents"]:
-        if agent.get("name") != "foreman":
+        if agent.get("name") != FOREMAN_NAME:
             continue
         if agent.get("pane_id") == me:
-            print("already the foreman (%s)" % me)
+            print("already the foreman (%s) on %s" % (FOREMAN_NAME, me))
             return 0
         raise CrewError(
-            "pane %s is already the foreman. herdr allows one live agent per "
-            "name, and this design allows one foreman. Use that pane, or rename "
-            "it first." % agent.get("pane_id"))
-    herdr("agent", "rename", me, "foreman")
-    print("claimed foreman on %s. The name is cleared if this agent exits, so "
-          "re-run this after a /clear or restart." % me)
+            "pane %s already holds the name %r. herdr allows one live agent per "
+            "name. Use that pane, or set CREW_FOREMAN_NAME (and CREW_DIR) to run "
+            "a separate, isolated foreman for another project."
+            % (agent.get("pane_id"), FOREMAN_NAME))
+    herdr("agent", "rename", me, FOREMAN_NAME)
+    print("claimed foreman %r on %s. The name is cleared if this agent exits, so "
+          "re-run this after a /clear or restart." % (FOREMAN_NAME, me))
     return 0
 
 
@@ -1968,6 +1976,8 @@ def _run(args):
         key = require_positional(args[1], "dispatch key")
         opts = {"--type": "implementer", "--repo": None, "--model": None}
         rest = args[2:]
+        headless = "--headless" in rest
+        rest = [a for a in rest if a != "--headless"]
         while rest:
             flag, value, rest = take_flag(rest, tuple(opts))
             if flag is None:
@@ -1978,7 +1988,7 @@ def _run(args):
         # returned 1 for this one, so the same failure exited differently
         # depending on which verb produced it.
         return cmd_dispatch(key, opts["--type"], opts["--repo"],
-                            opts["--model"])
+                            opts["--model"], headless=headless)
     if verb == "peek":
         if len(args) < 2:
             print("usage: crew peek <name> [--lines N]", file=sys.stderr)
@@ -2072,6 +2082,8 @@ def _run(args):
                 raise CrewError("unexpected argument: %s" % rest[0])
             opts[flag] = value
         return cmd_log(key, opts["--project"])
+    if verb == "backlog":
+        return cmd_backlog(args[1:])
     if verb == "uninstall":
         rest = [a for a in args[1:] if a != "--confirm"]
         if rest:
@@ -2083,7 +2095,12 @@ def _run(args):
 
 CONTRACT_PATH = os.path.expanduser("~/.claude/skills/crew-member/SKILL.md")
 DRY_PANE = "wDRY:pDRY"
-MODEL_BY_TYPE = {"implementer": "opus", "planner": "opus", "reviewer": "opus"}
+MODEL_BY_TYPE = {"implementer": "claude-opus-4-8", "planner": "claude-fable-5", "reviewer": "opus"}
+
+# Where a headless planner writes its plan and the implementer that follows
+# reads it. A plain filename at the worktree root so the runner can detect a
+# finished plan on the filesystem without reading the mailbox.
+PLAN_FILE = "PLAN.md"
 
 SETUP_PROMPT = (
     "You are a short-lived setup agent. Do exactly this and nothing else.\n"
@@ -2663,9 +2680,18 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     """Tag, start and confirm the crew member's own pane. Shared by the
     artifact-ready path for a ticket and the inline path for a slug: once a
     worktree exists there is no interactive step left either way."""
+    # Carry the fleet into the crew member's pane. A dispatched pane starts a
+    # fresh login shell that does NOT inherit the foreman's exported CREW_DIR,
+    # so without this a non-default foreman's crew member resolves CREW_DIR to
+    # the default ~/.crew and its `crew mail send` reports to a mailbox that
+    # foreman never reads. herdr sets these on the pane's shell and the agent
+    # started in it inherits them.
     tab = herdr("tab", "create", "--workspace", workspace,
                 "--label", crew_tab_label(repo, key),
-                "--cwd", worktree, "--no-focus")
+                "--cwd", worktree,
+                "--env", "CREW_DIR=%s" % CREW_DIR,
+                "--env", "CREW_FOREMAN_NAME=%s" % FOREMAN_NAME,
+                "--no-focus")
     pane = DRY_PANE if tab is None else response_pane_id(
         tab, ("result", "root_pane", "pane_id"), "tab create")
 
@@ -2697,9 +2723,15 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
               % (name, int(READY_TIMEOUT_MS) // 1000, name), file=sys.stderr)
 
     duty = {
-        "implementer": "Read the plan in your worktree, then implement it.",
-        "planner": ("Do not implement anything. Produce a plan and stop, "
-                    "then report needs-input with what you decided."),
+        "implementer": ("Read the plan in your worktree (%s at its root if a "
+                        "planner left one), then implement it." % PLAN_FILE),
+        "planner": ("Do NOT implement. Do the /start-ticket work headlessly: "
+                    "fetch %s from JIRA, plan the work (brainstorm, then "
+                    "adversarial-review), and write the final plan to %s at the "
+                    "root of your worktree. Make reasonable calls without asking "
+                    "and record them in the plan. Then report done: %s is your "
+                    "whole handoff to the implementer that follows."
+                    % (key, PLAN_FILE, PLAN_FILE)),
         # A reviewer is dispatched INTO the worktree of the member it reviews,
         # so this is the one type whose session shares a checkout with another
         # live session. The findings file is named here so it cannot collide
@@ -2785,7 +2817,7 @@ def dispatch_reviewer(key, repo, repo_root, workspace, model, held, snap):
                               model, worktree, snap)
 
 
-def cmd_dispatch(key, ctype, repo, model):
+def cmd_dispatch(key, ctype, repo, model, headless=False):
     if sanitize_name(key) in MODEL_BY_TYPE or sanitize_name(key) == "setup":
         raise CrewError(
             "%r is a crew type, not a key. Did you mean --type %s?"
@@ -2899,7 +2931,7 @@ def cmd_dispatch(key, ctype, repo, model):
             clear_dispatch_artifact(key)
             return code
 
-        if is_ticket(key):
+        if is_ticket(key) and not headless:
             setups = find_setup_panes(snap, repo_root, key)
             occupied = [s for s in setups if pane_has_agent(snap, s["pane"])]
             if occupied:
@@ -2932,9 +2964,10 @@ def cmd_dispatch(key, ctype, repo, model):
                   % (setup_pane, key))
             return 7
 
-        # A slug has no ticket to fetch, so there is no interactive step:
-        # the worktree exists as soon as plain_worktree returns, and this
-        # one call finishes the whole dispatch.
+        # A slug, or a headless ticket: no interactive step. The worktree
+        # exists as soon as plain_worktree returns (branch = the key), and this
+        # one call finishes the whole dispatch. A headless planner then does
+        # the /start-ticket work itself and writes PLAN.md.
         worktree = plain_worktree(key, repo_root)
         return _complete_dispatch(key, ctype, repo, repo_root, workspace,
                                   model, worktree, snap)
@@ -3553,8 +3586,14 @@ def cmd_watch(run_id, repo_arg):
                   % (run_id, watcher["pane"], watcher["tab"] or watcher["pane"]))
             return 0
 
+    # Same fleet propagation as _complete_dispatch: watch-run runs as a fresh
+    # process in this pane and reads CREW_DIR from its env, so without this a
+    # non-default foreman's CI outcome would be written to the default ~/.crew
+    # mailbox it never reads.
     tab = herdr("tab", "create", "--workspace", workspace,
                 "--label", crew_tab_label(repo, key), "--cwd", repo_root,
+                "--env", "CREW_DIR=%s" % CREW_DIR,
+                "--env", "CREW_FOREMAN_NAME=%s" % FOREMAN_NAME,
                 "--no-focus")
     pane = DRY_PANE if tab is None else response_pane_id(
         tab, ("result", "root_pane", "pane_id"), "tab create")
@@ -4197,6 +4236,188 @@ def cmd_uninstall(confirm):
             if step.get("command"):
                 print("    %s" % step["command"])
     return 0 if done else 3
+
+
+BACKLOG_PATH = os.path.join(CREW_DIR, "backlog.jsonl")
+BACKLOG_TARGET_DEFAULT = 3
+BACKLOG_INTERVAL_DEFAULT = 20
+
+
+def _backlog_read():
+    if not os.path.exists(BACKLOG_PATH):
+        return []
+    out = []
+    with open(BACKLOG_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def _backlog_write(items):
+    ensure_crew_dir()
+    tmp = BACKLOG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        for it in items:
+            f.write(json.dumps(it) + "\n")
+    os.replace(tmp, BACKLOG_PATH)
+
+
+def _backlog_remove(key):
+    k = sanitize_name(key)
+    _backlog_write([it for it in _backlog_read()
+                    if sanitize_name(it.get("key", "")) != k])
+
+
+def _backlog_plan_actions(members, backlog, target, plan_exists):
+    """Pure. Given the live members, the backlog, a concurrency target and a
+    predicate for whether a worktree holds a finished plan, decide the ordered
+    actions: hand off any planner whose plan is written, then start planners for
+    queued keys until the fleet reaches `target`. Handoff is net-zero on live
+    count (a planner retires, an implementer starts), so it never consumes room.
+
+    A member's key is stored sanitized (lowercase); the original key needed to
+    re-dispatch without tripping the wrong-case guard comes from the backlog."""
+    live = {sanitize_name(m.get("key", "")): m for m in members}
+    orig = {sanitize_name(it.get("key", "")): it.get("key") for it in backlog}
+    repo_of = {sanitize_name(it.get("key", "")): it.get("repo") for it in backlog}
+    actions = []
+    for m in members:
+        if m.get("type") == "planner" and plan_exists(m.get("worktree")):
+            k = sanitize_name(m.get("key", ""))
+            actions.append({"kind": "handoff", "key": orig.get(k, m.get("key")),
+                            "repo": repo_of.get(k), "worktree": m.get("worktree")})
+    room = target - len(members)
+    for it in backlog:
+        if room <= 0:
+            break
+        if sanitize_name(it.get("key", "")) in live:
+            continue  # already planning or implementing
+        actions.append({"kind": "plan", "key": it.get("key"), "repo": it.get("repo")})
+        room -= 1
+    return actions
+
+
+def _handoff(key, repo):
+    """Retire a finished planner keeping its worktree, then dispatch the
+    implementer onto it. --keep-worktree is why the plan survives the retire."""
+    close_crew = os.path.join(os.path.dirname(os.path.abspath(__file__)), "close-crew.py")
+    subprocess.run([sys.executable, close_crew, sanitize_name(key), "--keep-worktree"],
+                   capture_output=True, text=True)
+    subprocess.run([CREW_BIN, "retire", sanitize_name(key)], capture_output=True, text=True)
+    return cmd_dispatch(key, "implementer", repo, None, headless=True)
+
+
+def _runner_stamp(msg):
+    print("[backlog] %s" % msg, flush=True)
+
+
+def cmd_backlog_run(target, interval, dry, once):
+    if not os.environ.get("HERDR_WORKSPACE_ID"):
+        raise CrewError("crew backlog run must run inside a herdr pane")
+
+    def plan_exists(wt):
+        return bool(wt) and os.path.exists(os.path.join(wt, PLAN_FILE))
+
+    _runner_stamp("run: target=%d interval=%ds%s" % (target, interval, " DRY" if dry else ""))
+    while True:
+        snap = snapshot()
+        members = crew_members(snap)
+        backlog = _backlog_read()
+        # At most ONE dispatch per tick, then sleep: throttles the fleet so a
+        # bug cannot burst paid sessions. Handoffs are prioritised so in-flight
+        # work finishes before new work starts.
+        actions = _backlog_plan_actions(members, backlog, target, plan_exists)
+        if not actions:
+            _runner_stamp("idle: %d/%d live, %d queued" % (len(members), target, len(backlog)))
+        else:
+            a = actions[0]
+            if dry:
+                _runner_stamp("DRY would %s %s (repo %s)" % (a["kind"], a["key"], a.get("repo")))
+            elif a["kind"] == "handoff":
+                _runner_stamp("handoff %s: retiring planner, dispatching implementer" % a["key"])
+                _handoff(a["key"], a.get("repo"))
+                _backlog_remove(a["key"])
+            else:
+                _runner_stamp("planning %s (fable)" % a["key"])
+                cmd_dispatch(a["key"], "planner", a.get("repo"), None, headless=True)
+        if once:
+            return 0
+        time.sleep(interval)
+
+
+def cmd_backlog(args):
+    usage = ("usage: crew backlog <add KEY... [--repo R] | ls | rm KEY | clear "
+             "| run [--target N] [--interval S] [--dry-run] [--once]>")
+    if not args:
+        print(usage, file=sys.stderr)
+        return 2
+    action, rest = args[0], args[1:]
+    if action == "add":
+        repo = None
+        keys = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--repo":
+                if i + 1 >= len(rest):
+                    raise CrewError("--repo needs a value")
+                repo = rest[i + 1]
+                i += 2
+            else:
+                keys.append(require_positional(rest[i], "backlog key"))
+                i += 1
+        if not keys:
+            raise CrewError("nothing to add")
+        items = _backlog_read()
+        have = {sanitize_name(it.get("key", "")) for it in items}
+        added = 0
+        for k in keys:
+            if sanitize_name(k) in have:
+                continue
+            items.append({"key": k, "repo": repo})
+            have.add(sanitize_name(k))
+            added += 1
+        _backlog_write(items)
+        print("added %d, backlog now %d" % (added, len(items)))
+        return 0
+    if action == "ls":
+        items = _backlog_read()
+        if not items:
+            print("backlog empty")
+            return 0
+        for i, it in enumerate(items, 1):
+            print("%2d. %-18s %s" % (i, it.get("key", "?"), it.get("repo") or ""))
+        return 0
+    if action == "rm":
+        if not rest:
+            raise CrewError("rm needs a key")
+        _backlog_remove(require_positional(rest[0], "backlog key"))
+        print("removed %s" % rest[0])
+        return 0
+    if action == "clear":
+        _backlog_write([])
+        print("backlog cleared")
+        return 0
+    if action == "run":
+        target, interval = BACKLOG_TARGET_DEFAULT, BACKLOG_INTERVAL_DEFAULT
+        dry = "--dry-run" in rest
+        once = "--once" in rest
+        rest = [a for a in rest if a not in ("--dry-run", "--once")]
+        while rest:
+            flag, value, rest = take_flag(rest, ("--target", "--interval"))
+            if flag is None:
+                raise CrewError("unexpected argument: %s" % rest[0])
+            if flag == "--target":
+                target = max(1, int(value))
+            else:
+                interval = max(5, int(value))
+        return cmd_backlog_run(target, interval, dry, once)
+    raise CrewError("unknown backlog action %r; %s" % (action, usage))
 
 
 def main(argv):

@@ -59,7 +59,29 @@ Skip it and `crew mail ack` refuses with exit 4, so the same crew reports get
 read out every single time without ever clearing.
 
 If it refuses because another pane already holds the name, stop and tell the
-user which pane. There is one foreman by design.
+user which pane. One foreman per name, per fleet, by design: two sharing a
+mailbox would both ack the same reports and each see a half-empty fleet.
+
+To run a **second foreman for a different project**, give it its own fleet in
+its environment at launch. This session's Bash tool starts a fresh shell every
+call, so exporting the vars mid-session does not stick: `claim-foreman` might
+see them on its own line, but the next `crew dispatch` would not, and it would
+act on the default fleet. Set them when the foreman's `claude` starts:
+
+```bash
+CREW_DIR=~/.crew-<project> \
+CREW_FOREMAN_NAME=foreman-<project> \
+claude
+```
+
+`CREW_DIR` gives it its own mailbox, watchdog state and backlog;
+`CREW_FOREMAN_NAME` gives it a distinct herdr name so `claim-foreman` does not
+collide with the default `foreman`. Dispatch, mail, watchdog and the crew-dagr
+TUI all derive from `CREW_DIR`, and dispatch now injects it into each crew
+member's pane, so a second fleet's reports come back to its own mailbox rather
+than the default one. Its watchdog is still started the usual way (`crew
+watchdog` in a no-agent pane), inheriting this fleet's `CREW_DIR`. Without both
+vars set it is one foreman by design.
 
 ## Step 3: Adopt the role
 
