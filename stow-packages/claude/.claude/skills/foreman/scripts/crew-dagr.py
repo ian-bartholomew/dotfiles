@@ -52,6 +52,28 @@ def pr_url(task):
     return f"https://github.com/{GH_ORG}/{task.get('repo') or DEFAULT_REPO}/pull/{pr}"
 
 
+def _task_pane(task):
+    """The live pane hosting the task's latest located attempt, or None. Pure."""
+    for a in reversed(task.get("attempts") or []):
+        pane = (a.get("locator") or {}).get("pane")
+        if pane:
+            return pane
+    return None
+
+
+def _focus_pane(pane):
+    """Switch the terminal to the herdr pane hosting a crew member. Best effort;
+    returns False if the pane is gone or no longer hosts an agent."""
+    if not pane:
+        return False
+    try:
+        return subprocess.run(["herdr", "agent", "focus", pane],
+                              capture_output=True, text=True,
+                              timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _open_url(url):
     if not url:
         return False
@@ -614,6 +636,7 @@ HELP = [
     ("", ""),
     ("KEYS", None),
     ("j/k", "move     tab  next needing attention"),
+    ("enter", "focus that crew member's pane"),
     ("o", "open JIRA ticket     p  open PR"),
     ("r", "reload     ?  toggle help     q  quit"),
 ]
@@ -736,15 +759,26 @@ def _tui_loop(stdscr, path, interval):
         if len(stats) + 2 < W:
             put(0, W - len(stats), stats, topbar, W)
 
-        # sidecar (trace left, attention + focus card right) when wide; tig below that
-        wide = W >= 118 and n > 0
-        left_w = int(W * 0.60) if wide else W
-        if wide:
-            list_h = H - 2
-        else:
-            detail = detail_lines(tasks[sel], by_id, now) if n else ["(no tasks in run file)"]
-            detail_h = min(len(detail) + 1, max(3, H // 2))
-            list_h = max(1, H - 1 - detail_h - 1)
+        # single column: trace on top, then the selected task's detail and the
+        # backlog below it. No sidebar.
+        left_w = W
+        detail = detail_lines(tasks[sel], by_id, now) if n else ["(no tasks in run file)"]
+        # Hide backlog items already picked up: a dispatched key becomes a task
+        # in the run file (dispatch-sync), so drop it from the queue view.
+        live_ids = {t.get("id", "").lower() for t in tasks if isinstance(t, dict)}
+        backlog = [it for it in read_backlog()
+                   if it.get("key", "").lower() not in live_ids]
+        if backlog:
+            blk = ["BACKLOG — %d queued:" % len(backlog)]
+            for it in backlog[:8]:
+                bb = it.get("blocked_by")
+                blk.append("  ○ %s%s" % (it.get("key", "?"),
+                                          "  (blocked by %s)" % bb if bb else ""))
+            if len(backlog) > 8:
+                blk.append("  +%d more" % (len(backlog) - 8))
+            detail = blk + [""] + detail
+        detail_h = min(len(detail) + 1, max(3, H // 2))
+        list_h = max(1, H - 1 - detail_h - 1)
 
         if sel < top:
             top = sel
@@ -789,62 +823,14 @@ def _tui_loop(stdscr, path, interval):
             model_attr = pair("def", selected) | (0 if selected else curses.A_DIM)
             put(y, x_model, c["model"][:MW], model_attr, left_w)
 
-        if wide:
-            for y in range(1, H - 1):
-                put(y, left_w, "│", curses.A_DIM, W)
-            rx, rw = left_w + 2, W - (left_w + 2)
-            att = attention(edoc, now)
-            put(1, rx, "ATTENTION", curses.A_BOLD, W)
-            tag = f"{len(att)} need eyes"
-            if rw - len(tag) > 11:
-                put(1, rx + rw - len(tag), tag, curses.A_DIM, W)
-            y = 2
-            if not att:
-                put(y, rx, "(all quiet)", curses.A_DIM, W)
-                y += 1
-            for t, glyph, note in att[:max(2, (H - 3) // 3)]:
-                put(y, rx, f"{glyph} {t.get('id', '?')}  {note}",
-                    pair(state_name.get(t.get("state"), "def"), False), W)
-                y += 1
-            # backlog panel: queued tickets not yet dispatched
-            backlog = read_backlog()
-            y += 1
-            put(y, rx, "BACKLOG", curses.A_BOLD, W)
-            btag = f"{len(backlog)} queued"
-            if rw - len(btag) > 9:
-                put(y, rx + rw - len(btag), btag, curses.A_DIM, W)
-            y += 1
-            if not backlog:
-                put(y, rx, "(empty)", curses.A_DIM, W)
-                y += 1
-            else:
-                show = max(1, (H - 4) // 4)
-                for it in backlog[:show]:
-                    put(y, rx, f"○ {it.get('key', '?')}", pair("blue", False), W)
-                    y += 1
-                if len(backlog) > show:
-                    put(y, rx, "  +%d more" % (len(backlog) - show), curses.A_DIM, W)
-                    y += 1
-            # focus card for the selected task
-            cy = y + 1
-            card = tasks[sel]
-            put(cy, rx, ("┌─ " + f"{card.get('id', '?')} · {str(card.get('state', '?')).upper()} ")
-                .ljust(rw - 1, "─") + "┐", curses.A_BOLD, W)
-            body = focus_card_lines(card, by_id, now)
-            room = max(0, (H - 2) - (cy + 1) + 1)  # rows for body + bottom border
-            shown = body[:max(0, room - 1)]
-            for i, line in enumerate(shown):
-                put(cy + 1 + i, rx, ("│ " + line).ljust(rw - 1) + "│", 0, W)
-            put(cy + 1 + len(shown), rx, "└".ljust(rw - 1, "─") + "┘", curses.A_BOLD, W)
-        else:
-            sep = 1 + list_h
-            put(sep, 0, "─" * W, curses.A_DIM, W)
-            for j, line in enumerate(detail[:detail_h - 1]):
-                put(sep + 1 + j, 0, line, 0, W)
+        sep = 1 + list_h
+        put(sep, 0, "─" * W, curses.A_DIM, W)
+        for j, line in enumerate(detail[:detail_h - 1]):
+            put(sep + 1 + j, 0, line, 0, W)
 
         foot = (f" {flash} " if flash
-                else " ? help · j/k move · tab attn · o ticket · p PR · r reload · q quit ")
-        put(H - 1, 0, foot.ljust(W) if wide else foot.rjust(W),
+                else " ? help · j/k move · enter pane · o ticket · p PR · r reload · q quit ")
+        put(H - 1, 0, foot.rjust(W),
             curses.A_BOLD if flash else curses.A_DIM, W)
 
         # help overlay, drawn last so it sits on top of everything
@@ -888,6 +874,9 @@ def _tui_loop(stdscr, path, interval):
             after = [i for i in order if i > sel]
             if order:
                 sel = after[0] if after else order[0]
+        elif ch in (10, 13, curses.KEY_ENTER):  # Enter: jump to the crew pane
+            p = _task_pane(tasks[sel]) if n else None
+            flash = ("focusing %s..." % p) if (p and _focus_pane(p)) else "no live pane for this row"
         elif ch == ord("o"):  # open the JIRA ticket for the selected row
             u = jira_url(tasks[sel].get("id")) if n else None
             flash = "opening ticket..." if _open_url(u) else "no JIRA ticket for this row"
