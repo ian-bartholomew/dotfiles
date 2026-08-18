@@ -6620,5 +6620,285 @@ class TestUninstallProposesBeforeItActs(unittest.TestCase):
             self.assertTrue(os.path.isdir(paths["crew_dir"]))
 
 
+# --- backlog planner -> implementer handoff pipeline ------------------------
+# The four bugs a live run + review surfaced (dotfiles PR #34 follow-ups):
+#   1. the in-loop handoff never actually retired the idle planner, so the
+#      implementer dispatch was declined "already holds this key" every tick;
+#   2. the implementer must JOIN the planner's kept worktree, not make a new one;
+#   3. retiring a needs-input/blocked member stamped its run-file task `done`,
+#      which unblocked a dependent whose blocker never finished;
+#   4. a stuck handoff at the head of the queue starved every item behind it.
+
+
+class _Proc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+class TestPlainWorktreeJoinsExisting(unittest.TestCase):
+    """Bug 2: the headless implementer must join the planner's kept worktree."""
+
+    def test_existing_worktree_dir_is_reused_without_git(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, ".claude", "worktrees", "fandevx-1")
+            os.makedirs(path)
+            with mock.patch.object(crew.subprocess, "run") as run:
+                self.assertEqual(crew.plain_worktree("FANDEVX-1", root), path)
+                run.assert_not_called()   # joins, never re-adds
+
+    def test_existing_branch_checks_out_without_dash_b(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, ".claude", "worktrees", "fandevx-2")
+            with mock.patch.object(crew.subprocess, "run",
+                                   side_effect=[_Proc(0), _Proc(0)]) as run:
+                self.assertEqual(crew.plain_worktree("FANDEVX-2", root), path)
+            add = run.call_args_list[1].args[0]
+            self.assertEqual(add, ["git", "-C", root, "worktree", "add", path,
+                                   "fandevx-2"])
+            self.assertNotIn("-b", add)
+
+    def test_missing_branch_creates_it_with_dash_b(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, ".claude", "worktrees", "fandevx-3")
+            with mock.patch.object(crew.subprocess, "run",
+                                   side_effect=[_Proc(1), _Proc(0)]) as run:
+                self.assertEqual(crew.plain_worktree("FANDEVX-3", root), path)
+            add = run.call_args_list[1].args[0]
+            self.assertEqual(add, ["git", "-C", root, "worktree", "add", path,
+                                   "-b", "fandevx-3"])
+
+
+class TestHandoffRetiresPlannerBeforeDispatch(unittest.TestCase):
+    """Bug 1: the planner must be confirmed gone before the implementer runs."""
+
+    def test_dispatches_only_after_retire_confirms_the_key_is_free(self):
+        with mock.patch.object(crew.subprocess, "run", return_value=_Proc(0)), \
+             mock.patch.object(crew, "_retire_until_gone", return_value=True) as ret, \
+             mock.patch.object(crew, "cmd_dispatch", return_value=0) as disp:
+            self.assertEqual(crew._handoff("FANDEVX-1", "repo"), 0)
+            ret.assert_called_once()
+            disp.assert_called_once()
+            self.assertEqual(disp.call_args.args[1], "implementer")
+
+    def test_close_crew_failure_aborts_without_dispatching(self):
+        with mock.patch.object(crew.subprocess, "run", return_value=_Proc(4)), \
+             mock.patch.object(crew, "_retire_until_gone") as ret, \
+             mock.patch.object(crew, "cmd_dispatch") as disp:
+            self.assertIsNone(crew._handoff("FANDEVX-1", "repo"))
+            ret.assert_not_called()
+            disp.assert_not_called()
+
+    def test_unretired_planner_aborts_without_dispatching(self):
+        with mock.patch.object(crew.subprocess, "run", return_value=_Proc(0)), \
+             mock.patch.object(crew, "_retire_until_gone", return_value=False), \
+             mock.patch.object(crew, "cmd_dispatch") as disp:
+            self.assertIsNone(crew._handoff("FANDEVX-1", "repo"))
+            disp.assert_not_called()
+
+
+class TestRetireUntilGone(unittest.TestCase):
+    def test_returns_true_without_retiring_when_key_already_free(self):
+        with mock.patch.object(crew, "_handoff_member_present", return_value=False), \
+             mock.patch.object(crew, "cmd_retire") as retire:
+            self.assertTrue(crew._retire_until_gone("fandevx-1", "repo"))
+            retire.assert_not_called()
+
+    def test_retries_retire_until_the_pane_is_gone(self):
+        # present, still present after the first retire, then gone.
+        present = mock.patch.object(crew, "_handoff_member_present",
+                                    side_effect=[True, True, False])
+        with present, mock.patch.object(crew, "cmd_retire") as retire, \
+                mock.patch.object(crew.time, "sleep"):
+            self.assertTrue(crew._retire_until_gone("fandevx-1", "repo",
+                                                    tries=3, delay=0))
+            self.assertGreaterEqual(retire.call_count, 1)
+
+    def test_gives_up_after_tries_when_key_never_frees(self):
+        with mock.patch.object(crew, "_handoff_member_present", return_value=True), \
+             mock.patch.object(crew, "cmd_retire",
+                               side_effect=crew.CrewError("occupied")), \
+             mock.patch.object(crew.time, "sleep"):
+            self.assertFalse(crew._retire_until_gone("fandevx-1", "repo",
+                                                     tries=2, delay=0))
+
+
+class TestHandoffMemberPresent(unittest.TestCase):
+    def test_true_when_a_member_holds_the_key(self):
+        tokens = dict(CREW_TOKENS, key="fandevx-1", type="planner", root="/r")
+        snap = _snap([_full_agent("wQ:p1", "idle", "fandevx-1")],
+                     [_full_pane("wQ:p1", tokens)])
+        with mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "resolve_repo", return_value=("/r", "r")):
+            self.assertTrue(crew._handoff_member_present("fandevx-1", "r"))
+
+    def test_false_when_no_member_holds_the_key(self):
+        snap = _snap([], [])
+        with mock.patch.object(crew, "snapshot", return_value=snap), \
+             mock.patch.object(crew, "resolve_repo", return_value=("/r", "r")):
+            self.assertFalse(crew._handoff_member_present("fandevx-1", "r"))
+
+
+class TestBacklogPlanActions(unittest.TestCase):
+    """The pipeline decisions: hand off finished planners, then plan the queue."""
+
+    def _member(self, key, mtype="planner", worktree="/wt", branch=None, repo="r"):
+        return {"type": mtype, "key": crew.sanitize_name(key), "worktree": worktree,
+                "branch": branch or key, "repo": repo}
+
+    def test_finished_planner_becomes_a_handoff_with_original_case_key(self):
+        members = [self._member("fandevx-1", worktree="/wt")]
+        backlog = [{"key": "FANDEVX-1", "repo": "r"}]
+        actions = crew._backlog_plan_actions(members, backlog, 3, lambda wt: True)
+        self.assertEqual(actions[0], {"kind": "handoff", "key": "FANDEVX-1",
+                                      "repo": "r", "worktree": "/wt"})
+
+    def test_handoff_key_falls_back_to_the_branch_when_backlog_gone(self):
+        members = [self._member("fandevx-2", branch="fandevx-2", worktree="/wt2")]
+        actions = crew._backlog_plan_actions(members, [], 3, lambda wt: True)
+        self.assertEqual(actions[0]["key"], "FANDEVX-2")   # uppercased for dispatch
+
+    def test_planner_without_a_plan_is_not_handed_off(self):
+        members = [self._member("fandevx-1")]
+        actions = crew._backlog_plan_actions(members, [], 3, lambda wt: False)
+        self.assertEqual(actions, [])
+
+    def test_queued_key_is_planned_when_there_is_room(self):
+        actions = crew._backlog_plan_actions([], [{"key": "FANDEVX-3", "repo": "r"}],
+                                             3, lambda wt: False)
+        self.assertEqual(actions, [{"kind": "plan", "key": "FANDEVX-3", "repo": "r"}])
+
+    def test_blocked_item_is_skipped_until_its_dependency_is_done(self):
+        backlog = [{"key": "FANDEVX-4", "repo": "r", "blocked_by": "FANDEVX-9"}]
+        self.assertEqual(
+            crew._backlog_plan_actions([], backlog, 3, lambda wt: False,
+                                       is_done=lambda k: False), [])
+        self.assertEqual(
+            crew._backlog_plan_actions([], backlog, 3, lambda wt: False,
+                                       is_done=lambda k: True),
+            [{"kind": "plan", "key": "FANDEVX-4", "repo": "r"}])
+
+    def test_target_caps_new_plans(self):
+        members = [self._member("fandevx-a", "implementer"),
+                   self._member("fandevx-b", "implementer"),
+                   self._member("fandevx-c", "implementer")]
+        actions = crew._backlog_plan_actions(members, [{"key": "FANDEVX-3"}],
+                                             3, lambda wt: False)
+        self.assertEqual(actions, [])   # full at target
+
+    def test_a_key_already_live_is_not_planned_again(self):
+        members = [self._member("fandevx-3", "implementer")]
+        actions = crew._backlog_plan_actions(members, [{"key": "FANDEVX-3"}],
+                                             3, lambda wt: False)
+        self.assertEqual(actions, [])
+
+
+class TestRunnerParksStuckActions(unittest.TestCase):
+    """Bug 4: a wedged action is stepped over so the queue keeps moving."""
+
+    def test_record_failure_parks_at_the_threshold_once(self):
+        failures, parked = {}, set()
+        for _ in range(crew.ACTION_MAX_FAILURES - 1):
+            self.assertFalse(crew._record_action_failure(failures, parked, "handoff:x"))
+        self.assertNotIn("handoff:x", parked)
+        self.assertTrue(crew._record_action_failure(failures, parked, "handoff:x"))
+        self.assertIn("handoff:x", parked)
+        # already parked: does not re-announce.
+        self.assertFalse(crew._record_action_failure(failures, parked, "handoff:x"))
+
+    def test_next_actionable_steps_past_a_parked_head_of_queue(self):
+        actions = [{"kind": "handoff", "key": "STUCK"},
+                   {"kind": "plan", "key": "NEXT"}]
+        self.assertEqual(crew._next_actionable(actions, set())["key"], "STUCK")
+        self.assertEqual(
+            crew._next_actionable(actions, {"handoff:STUCK"})["key"], "NEXT")
+
+    def test_next_actionable_is_none_when_all_parked(self):
+        actions = [{"kind": "plan", "key": "A"}]
+        self.assertIsNone(crew._next_actionable(actions, {"plan:A"}))
+
+
+@contextlib.contextmanager
+def _dagr_world():
+    """A private CREW_DIR and run-file path, so the mailbox and dagr sync a test
+    exercises never touch the developer's own ~/.crew."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run_path = os.path.join(tmp, "dagr.json")
+        with mock.patch.object(crew, "CREW_DIR", tmp), \
+                mock.patch.dict(os.environ, {"CREW_DAGR_RUN": run_path}):
+            yield tmp, run_path
+
+
+def _write_mailbox(crew_dir, records):
+    with open(os.path.join(crew_dir, "mailbox.jsonl"), "w") as handle:
+        for i, r in enumerate(records, 1):
+            handle.write(json.dumps(dict({"seq": i}, **r)) + "\n")
+
+
+class TestKeyReportedDone(unittest.TestCase):
+    def test_true_when_this_pane_reported_done(self):
+        with _dagr_world() as (crew_dir, _):
+            _write_mailbox(crew_dir, [
+                {"kind": "report", "state": "needs-input", "key": "fandevx-5", "pane": "wA:p1"},
+                {"kind": "report", "state": "done", "key": "fandevx-5", "pane": "wA:p1"}])
+            self.assertTrue(crew._key_reported_done("FANDEVX-5", "wA:p1"))
+
+    def test_false_when_only_a_different_pane_reported_done(self):
+        # The reused-key hazard: planner (pane A) reported done and was retired,
+        # the implementer was redispatched under the SAME key in a fresh pane B and
+        # is now retired at needs-input. It must NOT inherit the planner's done.
+        with _dagr_world() as (crew_dir, _):
+            _write_mailbox(crew_dir, [
+                {"kind": "report", "state": "done", "key": "fandevx-5", "pane": "wA:p1"},
+                {"kind": "report", "state": "needs-input", "key": "fandevx-5", "pane": "wB:p2"}])
+            self.assertFalse(crew._key_reported_done("FANDEVX-5", "wB:p2"))
+            self.assertTrue(crew._key_reported_done("FANDEVX-5", "wA:p1"))
+
+    def test_false_when_the_pane_only_needed_input(self):
+        with _dagr_world() as (crew_dir, _):
+            _write_mailbox(crew_dir, [
+                {"kind": "report", "state": "needs-input", "key": "fandevx-6", "pane": "wA:p1"},
+                {"kind": "report", "state": "duplicate", "key": "fandevx-6", "pane": "wA:p1"}])
+            self.assertFalse(crew._key_reported_done("FANDEVX-6", "wA:p1"))
+
+    def test_false_when_no_mailbox_exists(self):
+        with _dagr_world() as (crew_dir, _):
+            self.assertFalse(crew._key_reported_done("FANDEVX-7", "wA:p1"))
+
+
+class TestRetireSyncReflectsTrueState(unittest.TestCase):
+    """Bug 3: a non-completing retire must not read as `done` to the blocked-skip."""
+
+    def _seed_working_task(self, key):
+        with contextlib.redirect_stdout(io.StringIO()):
+            crew._dagr_add_task(key, "implementer", "r", key + "-x", "wQ:p1", "opus")
+
+    def test_completed_member_is_marked_done(self):
+        with _dagr_world():
+            self._seed_working_task("FANDEVX-5")
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew._dagr_mark_retired("FANDEVX-5", True)
+            self.assertTrue(crew._dagr_task_done("FANDEVX-5"))
+
+    def test_uncompleted_member_is_abandoned_not_done(self):
+        with _dagr_world() as (_, run_path):
+            self._seed_working_task("FANDEVX-6")
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew._dagr_mark_retired("FANDEVX-6", False)
+            self.assertFalse(crew._dagr_task_done("FANDEVX-6"))
+            with open(run_path) as handle:
+                doc = json.load(handle)
+            self.assertEqual(doc["tasks"][0]["state"], "abandoned")
+
+    def test_a_blocker_retired_before_completing_keeps_its_dependent_blocked(self):
+        with _dagr_world():
+            self._seed_working_task("FANDEVX-6")
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew._dagr_mark_retired("FANDEVX-6", False)   # needs-input retire
+            backlog = [{"key": "DEP-1", "repo": "r", "blocked_by": "FANDEVX-6"}]
+            actions = crew._backlog_plan_actions([], backlog, 3, lambda wt: False,
+                                                 is_done=crew._dagr_task_done)
+            self.assertEqual(actions, [])   # dependent stays queued, not dispatched
+
+
 if __name__ == "__main__":
     unittest.main()
