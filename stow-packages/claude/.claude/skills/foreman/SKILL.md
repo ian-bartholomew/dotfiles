@@ -37,16 +37,8 @@ same mail over and over without ever clearing it.
 
 If `claim-foreman` fails for any reason, report the message and stop rather
 than guessing at a workaround. The most common cause is another pane already
-holding the name: one foreman per name by design, and herdr enforces one live
-agent per name. A second foreman for a different project is legitimate, but it
-needs its own fleet, and the fleet has to be in this session's environment from
-the moment it launched. The Bash tool starts a fresh shell every call, so
-exporting `CREW_DIR` mid-session does not stick: the next `crew` call would not
-see it and would act on the default fleet. Launch the second foreman as
-`CREW_DIR=~/.crew-<project> CREW_FOREMAN_NAME=foreman-<project> claude`; then
-`claim-foreman` claims `foreman-<project>` and every later `crew` call inherits
-the fleet. Dispatch carries `CREW_DIR` into each crew member's pane, so their
-reports return to this fleet's mailbox and not the default one.
+holding the name: there is one foreman by design, and herdr enforces one live
+agent per name.
 
 ## Read the mailbox every turn, unprompted
 
@@ -74,7 +66,7 @@ while the human is away. `Monitor` can. Arm it immediately after
 
 ```
 Monitor(
-  command: tail -n 0 -F "${CREW_DIR:-$HOME/.crew}/mailbox.jsonl" | grep --line-buffered -v '"kind": "ack"'
+  command: tail -n 0 -F "$HOME/.crew/mailbox.jsonl" | grep --line-buffered -v '"kind": "ack"'
   description: new crew mail: crew reports and watchdog alerts
   persistent: true
 )

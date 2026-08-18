@@ -26,13 +26,11 @@ import threading
 import time
 from datetime import datetime, timezone
 
-# The run file and backlog derive from CREW_DIR (default ~/.crew), matching
-# crew.py, so a per-project foreman launched with CREW_DIR=~/.crew-<proj> gets a
-# TUI over its own fleet. $CREW_DAGR_RUN still overrides the run file directly,
-# and a positional arg overrides it per-invocation.
-CREW_DIR = os.path.expanduser(os.environ.get("CREW_DIR") or "~/.crew")
-DEFAULT_RUN = os.path.expanduser(os.environ.get("CREW_DAGR_RUN") or os.path.join(CREW_DIR, "dagr.json"))
-BACKLOG_PATH = os.path.join(CREW_DIR, "backlog.jsonl")  # queued tickets, written by `crew backlog`
+# One global run file, not per-repo: the fleet is global, so the foreman writes
+# the same file wherever its cwd is, and the herdr pane always reads that path.
+# Override with $CREW_DAGR_RUN or a positional arg.
+DEFAULT_RUN = os.path.expanduser(os.environ.get("CREW_DAGR_RUN") or "~/.crew/dagr.json")
+BACKLOG_PATH = os.path.expanduser("~/.crew/backlog.jsonl")  # queued tickets, written by `crew backlog`
 
 # For the "open in browser" keys. Overridable by env; repo defaults per task.
 JIRA_BASE = os.environ.get("CREW_DAGR_JIRA_BASE") or "https://betfanatics.atlassian.net/browse/"

@@ -21,14 +21,7 @@ import warnings
 # add a number without re-running the drift checks in the spec, because the
 # design rests on five measured behaviours, not on documented ones.
 HERDR_VERIFIED_PROTOCOLS = (17, 19)
-# CREW_DIR and FOREMAN_NAME are env-overridable so a second foreman can run an
-# isolated fleet for another project. Everything below derives from CREW_DIR
-# (mailbox, cursor, watchdog files, backlog), so overriding it alone gives that
-# project its own fleet; CREW_FOREMAN_NAME gives it a distinct herdr agent name
-# so herdr's one-live-agent-per-name check does not collide with the default
-# foreman. Defaults are unchanged.
-CREW_DIR = os.path.expanduser(os.environ.get("CREW_DIR") or "~/.crew")
-FOREMAN_NAME = os.environ.get("CREW_FOREMAN_NAME") or "foreman"
+CREW_DIR = os.path.expanduser("~/.crew")
 MAILBOX = os.path.join(CREW_DIR, "mailbox.jsonl")
 CURSOR = os.path.join(CREW_DIR, "cursor")
 # A skill's scripts/ directory is not on PATH and ~/.local/bin is, so this
@@ -1247,7 +1240,7 @@ def foreman_pane():
     """The pane hosting the agent named foreman, or "" when no agent holds that
     name. herdr enforces one live agent per name, so there is at most one."""
     for agent in snapshot()["agents"]:
-        if agent.get("name") == FOREMAN_NAME:
+        if agent.get("name") == "foreman":
             return agent.get("pane_id") or ""
     return ""
 
@@ -1265,8 +1258,8 @@ def known_foreman_pane():
         return "", ("herdr could not be asked which pane hosts the foreman (%s)"
                     % exc)
     if not pane:
-        return "", ("no agent is named %r, so there is no pane to compare "
-                    "an ack against; run crew claim-foreman" % FOREMAN_NAME)
+        return "", ("no agent is named foreman, so there is no pane to compare "
+                    "an ack against; run crew claim-foreman")
     return pane, None
 
 
@@ -1299,19 +1292,18 @@ def claim_foreman():
     snap = snapshot()
     assert_snapshot_shape(snap, defs)
     for agent in snap["agents"]:
-        if agent.get("name") != FOREMAN_NAME:
+        if agent.get("name") != "foreman":
             continue
         if agent.get("pane_id") == me:
-            print("already the foreman (%s) on %s" % (FOREMAN_NAME, me))
+            print("already the foreman (%s)" % me)
             return 0
         raise CrewError(
-            "pane %s already holds the name %r. herdr allows one live agent per "
-            "name. Use that pane, or set CREW_FOREMAN_NAME (and CREW_DIR) to run "
-            "a separate, isolated foreman for another project."
-            % (agent.get("pane_id"), FOREMAN_NAME))
-    herdr("agent", "rename", me, FOREMAN_NAME)
-    print("claimed foreman %r on %s. The name is cleared if this agent exits, so "
-          "re-run this after a /clear or restart." % (FOREMAN_NAME, me))
+            "pane %s is already the foreman. herdr allows one live agent per "
+            "name, and this design allows one foreman. Use that pane, or rename "
+            "it first." % agent.get("pane_id"))
+    herdr("agent", "rename", me, "foreman")
+    print("claimed foreman on %s. The name is cleared if this agent exits, so "
+          "re-run this after a /clear or restart." % me)
     return 0
 
 
@@ -2680,18 +2672,9 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     """Tag, start and confirm the crew member's own pane. Shared by the
     artifact-ready path for a ticket and the inline path for a slug: once a
     worktree exists there is no interactive step left either way."""
-    # Carry the fleet into the crew member's pane. A dispatched pane starts a
-    # fresh login shell that does NOT inherit the foreman's exported CREW_DIR,
-    # so without this a non-default foreman's crew member resolves CREW_DIR to
-    # the default ~/.crew and its `crew mail send` reports to a mailbox that
-    # foreman never reads. herdr sets these on the pane's shell and the agent
-    # started in it inherits them.
     tab = herdr("tab", "create", "--workspace", workspace,
                 "--label", crew_tab_label(repo, key),
-                "--cwd", worktree,
-                "--env", "CREW_DIR=%s" % CREW_DIR,
-                "--env", "CREW_FOREMAN_NAME=%s" % FOREMAN_NAME,
-                "--no-focus")
+                "--cwd", worktree, "--no-focus")
     pane = DRY_PANE if tab is None else response_pane_id(
         tab, ("result", "root_pane", "pane_id"), "tab create")
 
@@ -3668,14 +3651,8 @@ def cmd_watch(run_id, repo_arg):
                   % (run_id, watcher["pane"], watcher["tab"] or watcher["pane"]))
             return 0
 
-    # Same fleet propagation as _complete_dispatch: watch-run runs as a fresh
-    # process in this pane and reads CREW_DIR from its env, so without this a
-    # non-default foreman's CI outcome would be written to the default ~/.crew
-    # mailbox it never reads.
     tab = herdr("tab", "create", "--workspace", workspace,
                 "--label", crew_tab_label(repo, key), "--cwd", repo_root,
-                "--env", "CREW_DIR=%s" % CREW_DIR,
-                "--env", "CREW_FOREMAN_NAME=%s" % FOREMAN_NAME,
                 "--no-focus")
     pane = DRY_PANE if tab is None else response_pane_id(
         tab, ("result", "root_pane", "pane_id"), "tab create")
