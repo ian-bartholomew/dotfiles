@@ -2755,6 +2755,7 @@ def _complete_dispatch(key, ctype, repo, repo_root, workspace, model, worktree, 
     # question when --repo is wrong or an artifact came from another checkout.
     print("dispatched %s as %s in pane %s on branch %s in %s"
           % (key, name, pane, branch, worktree))
+    _dagr_add_task_safe(key, ctype, repo, branch, pane, model)
     return 0
 
 
@@ -3061,7 +3062,10 @@ def _close_or_warn(kind, target_id):
 # updates an EXISTING task (authoring stays the foreman's) and never a terminal
 # one, and a failure here never breaks the retire it follows.
 
-DAGR_RUN = os.environ.get("CREW_DAGR_RUN") or os.path.join(CREW_DIR, "dagr.json")
+def _dagr_run_path():
+    """The crew-dagr run file, resolved from CREW_DIR at call time so a test that
+    patches CREW_DIR is isolated (mirrors watchdog_path). $CREW_DAGR_RUN overrides."""
+    return os.environ.get("CREW_DAGR_RUN") or os.path.join(CREW_DIR, "dagr.json")
 
 
 def _dagr_validate(tmp):
@@ -3079,37 +3083,10 @@ def _dagr_validate(tmp):
     return result.returncode == 0
 
 
-def _dagr_mark_done(key):
-    """Stamp the task whose id matches `key` as done in the run file. No-op if the
-    file or the task is absent, or the task is already terminal."""
-    path = DAGR_RUN
-    if not os.path.exists(path):
-        return
-    with open(path) as handle:
-        doc = json.load(handle)
-    task = next((t for t in (doc.get("tasks") or [])
-                 if str(t.get("id", "")).lower() == key.lower()), None)
-    if task is None or task.get("state") in ("done", "failed", "abandoned"):
-        return
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    task["state"] = "done"
-    attempts = task.get("attempts") or [{
-        "id": "%s·a1" % task["id"], "n": 1, "cause": {"type": "initial"},
-        "actor": task.get("owner", "foreman"), "started_at": now}]
-    task["attempts"] = attempts
-    last = attempts[-1]
-    last["state"] = "done"
-    last.pop("liveness", None)   # a done attempt is not live
-    last.pop("locator", None)    # volatile, live-only
-    last["ended_at"] = now
-    # `asserted`: retiring is the foreman's decision to close, not a mechanical
-    # check of the PR, so the tier is honest and the trace renders `!`. The TUI's
-    # own PR poller carries the real merged/open state alongside it.
-    last["outcome"] = {"result": "retired by foreman", "evidence": "asserted",
-                       "receipt": "crew retire %s" % key,
-                       "reason": "crew member retired"}
-    doc["generated_at"] = now
-    tmp = path + ".tmp"
+def _dagr_write(doc, path):
+    """Validate a .tmp via crew-dagr check, then rename over the live run file.
+    Never publishes a file that fails the schema check (E-level errors)."""
+    tmp = "%s.tmp.%d" % (path, os.getpid())  # per-process, never a shared tmp
     with open(tmp, "w") as handle:
         json.dump(doc, handle, indent=2)
     if _dagr_validate(tmp) is False:
@@ -3117,6 +3094,40 @@ def _dagr_mark_done(key):
         raise CrewError("crew-dagr check rejected the updated run file; left %s "
                         "unchanged" % path)
     os.replace(tmp, path)
+
+
+def _dagr_mark_done(key):
+    """Stamp the task whose id matches `key` as done in the run file. No-op if the
+    file or the task is absent, or the task is already terminal."""
+    path = _dagr_run_path()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with _locked(path + ".lock", "a+"):   # serialise with the backlog runner
+        if not os.path.exists(path):
+            return
+        with open(path) as handle:
+            doc = json.load(handle)
+        task = next((t for t in (doc.get("tasks") or [])
+                     if str(t.get("id", "")).lower() == key.lower()), None)
+        if task is None or task.get("state") in ("done", "failed", "abandoned"):
+            return
+        task["state"] = "done"
+        attempts = task.get("attempts") or [{
+            "id": "%s·a1" % task["id"], "n": 1, "cause": {"type": "initial"},
+            "actor": task.get("owner", "foreman"), "started_at": now}]
+        task["attempts"] = attempts
+        last = attempts[-1]
+        last["state"] = "done"
+        last.pop("liveness", None)   # a done attempt is not live
+        last.pop("locator", None)    # volatile, live-only
+        last["ended_at"] = now
+        # `asserted`: retiring is the foreman's decision to close, not a mechanical
+        # check of the PR, so the tier is honest and the trace renders `!`. The TUI's
+        # own PR poller carries the real merged/open state alongside it.
+        last["outcome"] = {"result": "retired by foreman", "evidence": "asserted",
+                           "receipt": "crew retire %s" % key,
+                           "reason": "crew member retired"}
+        doc["generated_at"] = now
+        _dagr_write(doc, path)
     print("dagr: marked %s done in %s" % (key, path))
 
 
@@ -3124,7 +3135,70 @@ def _dagr_mark_done_safe(key):
     """_dagr_mark_done, but a failure here never breaks the retire it follows."""
     try:
         _dagr_mark_done(key)
-    except (CrewError, OSError, ValueError) as exc:
+    except Exception as exc:
+        print("dagr sync skipped: %s" % exc, file=sys.stderr)
+
+
+def _dagr_add_task(key, ctype, repo, branch, pane, model):
+    """Record a freshly dispatched crew member as a working task in the run file,
+    so the TUI shows it. The mirror of _dagr_mark_done. Carries the repo (so the
+    TUI's PR link points at the right repository, not a default) and the model.
+    No-op if a live task with this id exists (the foreman owns its state then);
+    reopens a settled (done/failed/abandoned) one with a fresh attempt rather
+    than leaving it done while new work runs; bootstraps the run file if none
+    exists yet. The read-modify-replace is locked against the backlog runner."""
+    path = _dagr_run_path()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tid = key.lower()
+    title = branch or key
+    if branch and branch.lower().startswith(tid + "-"):
+        title = branch[len(tid) + 1:]   # drop the redundant key prefix
+    liveness = {"prompt_acknowledged": True, "last_output_at": now, "queued_input": 0}
+    with _locked(path + ".lock", "a+"):   # serialise with the backlog runner
+        if os.path.exists(path):
+            with open(path) as handle:
+                doc = json.load(handle)
+        else:
+            doc = {"version": 1, "run": {"id": "fleet"}, "generated_at": now,
+                   "tasks": []}
+        tasks = doc.setdefault("tasks", [])
+        existing = next((t for t in tasks if str(t.get("id", "")).lower() == tid), None)
+        if existing is not None and existing.get("state") not in ("done", "failed", "abandoned"):
+            return  # already live; the foreman owns its state
+        prev = (existing.get("attempts") if existing else None) or []
+        n = len(prev) + 1
+        attempt = {"id": "%s·a%d" % (tid, n), "n": n,
+                   "cause": {"type": "followup", "ref": prev[-1]["id"]} if prev else {"type": "initial"},
+                   "actor": ctype, "state": "working", "started_at": now,
+                   "liveness": liveness}
+        if model:
+            attempt["model"] = model
+        if pane:
+            attempt["locator"] = {"pane": pane}
+        if existing is not None:
+            # Re-dispatch of a settled key (a planner handed off to an
+            # implementer): reopen with a fresh attempt, do not leave it done.
+            existing.setdefault("attempts", []).append(attempt)
+            existing["state"] = "working"
+            if repo:
+                existing["repo"] = repo
+        else:
+            task = {"id": tid, "title": title or key,
+                    "kind": "review" if ctype == "reviewer" else "impl",
+                    "state": "working", "attempts": [attempt]}
+            if repo:
+                task["repo"] = repo
+            tasks.append(task)
+        doc["generated_at"] = now
+        _dagr_write(doc, path)
+    print("dagr: added %s to %s" % (key, path))
+
+
+def _dagr_add_task_safe(key, ctype, repo, branch, pane, model):
+    """_dagr_add_task, but a failure here never breaks the dispatch it follows."""
+    try:
+        _dagr_add_task(key, ctype, repo, branch, pane, model)
+    except Exception as exc:
         print("dagr sync skipped: %s" % exc, file=sys.stderr)
 
 
@@ -4333,7 +4407,34 @@ def _backlog_remove(key):
                     if sanitize_name(it.get("key", "")) != k])
 
 
-def _backlog_plan_actions(members, backlog, target, plan_exists):
+def _key_from_branch(branch):
+    """The UPPERCASE ticket key at the head of a crew branch, or None for a
+    free-form slug. Handles both `FANDEVX-3593-slug` and the bare headless
+    branch `fandevx-3593`, and always upper-cases the letters: dispatch refuses
+    a lowercase JIRA-shaped key, and a headless planner's branch is the bare
+    lowercase key, so a verbatim copy would be refused at handoff."""
+    m = re.match(r"([A-Za-z]+)-(\d+)(?:[-/]|$)", branch or "")
+    return "%s-%s" % (m.group(1).upper(), m.group(2)) if m else None
+
+
+def _dagr_task_done(key):
+    """True if the run file holds a task with this key already in state `done`.
+    Used to gate a blocked backlog item: its `blocked_by` dependency must be
+    done before it is dispatched, so a restart does not wall it."""
+    path = _dagr_run_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    tid = key.lower()
+    return any(str(t.get("id", "")).lower() == tid and t.get("state") == "done"
+               for t in (doc.get("tasks") or []))
+
+
+def _backlog_plan_actions(members, backlog, target, plan_exists, is_done=None):
     """Pure. Given the live members, the backlog, a concurrency target and a
     predicate for whether a worktree holds a finished plan, decide the ordered
     actions: hand off any planner whose plan is written, then start planners for
@@ -4349,14 +4450,23 @@ def _backlog_plan_actions(members, backlog, target, plan_exists):
     for m in members:
         if m.get("type") == "planner" and plan_exists(m.get("worktree")):
             k = sanitize_name(m.get("key", ""))
-            actions.append({"kind": "handoff", "key": orig.get(k, m.get("key")),
-                            "repo": repo_of.get(k), "worktree": m.get("worktree")})
+            # Original-case key + repo must survive the backlog item being gone
+            # (it is removed when the plan is dispatched), so fall back to the
+            # member's branch and repo, never its sanitized key: a lowercase
+            # JIRA-shaped key is refused by dispatch.
+            hkey = orig.get(k) or _key_from_branch(m.get("branch", "")) or m.get("key")
+            actions.append({"kind": "handoff", "key": hkey,
+                            "repo": repo_of.get(k) or m.get("repo"),
+                            "worktree": m.get("worktree")})
     room = target - len(members)
     for it in backlog:
         if room <= 0:
             break
         if sanitize_name(it.get("key", "")) in live:
             continue  # already planning or implementing
+        bb = it.get("blocked_by")
+        if bb and is_done is not None and not is_done(bb):
+            continue  # dependency not done yet; skip so it is not dispatched into a wall
         actions.append({"kind": "plan", "key": it.get("key"), "repo": it.get("repo")})
         room -= 1
     return actions
@@ -4391,34 +4501,41 @@ def cmd_backlog_run(target, interval, dry, once):
         # At most ONE dispatch per tick, then sleep: throttles the fleet so a
         # bug cannot burst paid sessions. Handoffs are prioritised so in-flight
         # work finishes before new work starts.
-        actions = _backlog_plan_actions(members, backlog, target, plan_exists)
+        actions = _backlog_plan_actions(members, backlog, target, plan_exists, _dagr_task_done)
         if not actions:
             _runner_stamp("idle: %d/%d live, %d queued" % (len(members), target, len(backlog)))
         else:
             a = actions[0]
-            if dry:
-                _runner_stamp("DRY would %s %s (repo %s)" % (a["kind"], a["key"], a.get("repo")))
-            elif a["kind"] == "handoff":
-                _runner_stamp("handoff %s: retiring planner, dispatching implementer" % a["key"])
-                _handoff(a["key"], a.get("repo"))
-                _backlog_remove(a["key"])
-            else:
-                _runner_stamp("planning %s (fable)" % a["key"])
-                cmd_dispatch(a["key"], "planner", a.get("repo"), None, headless=True)
+            try:
+                if dry:
+                    _runner_stamp("DRY would %s %s (repo %s)" % (a["kind"], a["key"], a.get("repo")))
+                elif a["kind"] == "handoff":
+                    _runner_stamp("handoff %s: retiring planner, dispatching implementer" % a["key"])
+                    _handoff(a["key"], a.get("repo"))
+                    _backlog_remove(a["key"])
+                else:
+                    _runner_stamp("planning %s (fable)" % a["key"])
+                    if cmd_dispatch(a["key"], "planner", a.get("repo"), None, headless=True) == 0:
+                        _backlog_remove(a["key"])  # picked up: drop from the queue
+            except Exception as exc:
+                # One bad action must never kill the long-lived runner.
+                _runner_stamp("action %s %s failed, continuing: %s"
+                              % (a.get("kind"), a.get("key"), exc))
         if once:
             return 0
         time.sleep(interval)
 
 
 def cmd_backlog(args):
-    usage = ("usage: crew backlog <add KEY... [--repo R] | ls | rm KEY | clear "
-             "| run [--target N] [--interval S] [--dry-run] [--once]>")
+    usage = ("usage: crew backlog <add KEY... [--repo R] [--blocked-by KEY] | ls "
+             "| rm KEY | clear | run [--target N] [--interval S] [--dry-run] [--once]>")
     if not args:
         print(usage, file=sys.stderr)
         return 2
     action, rest = args[0], args[1:]
     if action == "add":
         repo = None
+        blocked_by = None
         keys = []
         i = 0
         while i < len(rest):
@@ -4426,6 +4543,11 @@ def cmd_backlog(args):
                 if i + 1 >= len(rest):
                     raise CrewError("--repo needs a value")
                 repo = rest[i + 1]
+                i += 2
+            elif rest[i] == "--blocked-by":
+                if i + 1 >= len(rest):
+                    raise CrewError("--blocked-by needs a value")
+                blocked_by = rest[i + 1]
                 i += 2
             else:
                 keys.append(require_positional(rest[i], "backlog key"))
@@ -4438,7 +4560,10 @@ def cmd_backlog(args):
         for k in keys:
             if sanitize_name(k) in have:
                 continue
-            items.append({"key": k, "repo": repo})
+            item = {"key": k, "repo": repo}
+            if blocked_by:
+                item["blocked_by"] = blocked_by
+            items.append(item)
             have.add(sanitize_name(k))
             added += 1
         _backlog_write(items)

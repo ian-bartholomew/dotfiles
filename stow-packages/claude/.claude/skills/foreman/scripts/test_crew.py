@@ -17,6 +17,10 @@ import unittest
 from unittest import mock
 
 import crew
+# The suite must never touch the real ~/.crew (see module docstring). Default
+# CREW_DIR to a throwaway dir so a dispatch's crew-dagr run-file sync cannot write
+# the real run file from a test that does not isolate CREW_DIR itself.
+crew.CREW_DIR = tempfile.mkdtemp(prefix="crew-test-")
 from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
                    assert_schema_declares, CrewError, HerdrError,
