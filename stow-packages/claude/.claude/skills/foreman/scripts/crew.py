@@ -3096,11 +3096,51 @@ def _dagr_write(doc, path):
     os.replace(tmp, path)
 
 
-def _dagr_mark_done(key):
-    """Stamp the task whose id matches `key` as done in the run file. No-op if the
-    file or the task is absent, or the task is already terminal."""
+def _mailbox_path():
+    """The mailbox path, resolved from CREW_DIR at call time so a test that
+    patches CREW_DIR is isolated (mirrors _dagr_run_path)."""
+    return os.path.join(CREW_DIR, "mailbox.jsonl")
+
+
+def _key_reported_done(key, pane):
+    """True if the session in `pane` reported `done` for this key.
+
+    The signal that a retired member genuinely completed, as opposed to being
+    retired at needs-input or blocked. A dependent's blocked-skip keys off the
+    run-file `done` state (see _dagr_task_done), so a non-completing retire must
+    not be stamped done or it unblocks work whose blocker never finished.
+
+    Scoped to the pane, NOT the whole key history: the planner->implementer
+    pipeline reuses one key across phases (the planner reports done, is retired,
+    and the implementer is redispatched under the same key), so a whole-history
+    match would see the planner's old done and wrongly mark a later implementer
+    retired at needs-input as done. Every report carries its sender's pane and
+    each dispatch gets a fresh pane, so a per-pane match isolates the retiring
+    member's own report. The key match is kept too, in case a pane id recurs."""
+    path = _mailbox_path()
+    if not os.path.exists(path):
+        return False
+    wanted = sanitize_name(key)
+    with _locked(path, "r") as handle:
+        entries, _ = read_entries(handle.readlines())
+    return any(record_kind(e) == KIND_REPORT and e.get("state") == "done"
+               and e.get("pane") == pane
+               and sanitize_name(e.get("key", "")) == wanted
+               for e in entries)
+
+
+def _dagr_mark_retired(key, completed):
+    """Stamp the task whose id matches `key` in the run file to reflect a retire.
+
+    `completed` True -> done; False -> abandoned, so the backlog blocked-skip is
+    not fooled into dispatching past a blocker retired before its work finished.
+    No-op if the file or the task is absent, or the task is already terminal."""
     path = _dagr_run_path()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    task_state = "done" if completed else "abandoned"
+    attempt_state = "done" if completed else "failed"
+    result = ("retired by foreman" if completed
+              else "retired by foreman before completing")
     with _locked(path + ".lock", "a+"):   # serialise with the backlog runner
         if not os.path.exists(path):
             return
@@ -3110,31 +3150,31 @@ def _dagr_mark_done(key):
                      if str(t.get("id", "")).lower() == key.lower()), None)
         if task is None or task.get("state") in ("done", "failed", "abandoned"):
             return
-        task["state"] = "done"
+        task["state"] = task_state
         attempts = task.get("attempts") or [{
             "id": "%s·a1" % task["id"], "n": 1, "cause": {"type": "initial"},
             "actor": task.get("owner", "foreman"), "started_at": now}]
         task["attempts"] = attempts
         last = attempts[-1]
-        last["state"] = "done"
-        last.pop("liveness", None)   # a done attempt is not live
+        last["state"] = attempt_state
+        last.pop("liveness", None)   # a settled attempt is not live
         last.pop("locator", None)    # volatile, live-only
         last["ended_at"] = now
         # `asserted`: retiring is the foreman's decision to close, not a mechanical
         # check of the PR, so the tier is honest and the trace renders `!`. The TUI's
         # own PR poller carries the real merged/open state alongside it.
-        last["outcome"] = {"result": "retired by foreman", "evidence": "asserted",
+        last["outcome"] = {"result": result, "evidence": "asserted",
                            "receipt": "crew retire %s" % key,
                            "reason": "crew member retired"}
         doc["generated_at"] = now
         _dagr_write(doc, path)
-    print("dagr: marked %s done in %s" % (key, path))
+    print("dagr: marked %s %s in %s" % (key, task_state, path))
 
 
-def _dagr_mark_done_safe(key):
-    """_dagr_mark_done, but a failure here never breaks the retire it follows."""
+def _dagr_mark_retired_safe(key, completed):
+    """_dagr_mark_retired, but a failure here never breaks the retire it follows."""
     try:
-        _dagr_mark_done(key)
+        _dagr_mark_retired(key, completed)
     except Exception as exc:
         print("dagr sync skipped: %s" % exc, file=sys.stderr)
 
@@ -3260,10 +3300,13 @@ def cmd_retire(name):
         done = _close_or_warn("pane", pane_id) and done
 
     # A retired member's task is settled; stamp the crew-dagr run file so the TUI
-    # stops showing it awaiting. Member kind only: a failed-dispatch tab has no
-    # settled task. Never breaks the retire above.
+    # stops showing it awaiting. `done` only if the member actually reported done,
+    # else `abandoned`: a needs-input/blocked member retired before completing must
+    # not be stamped done, or a dependent's blocked-skip dispatches past it. Member
+    # kind only: a failed-dispatch tab has no settled task. Never breaks the retire.
     if kind == "member":
-        _dagr_mark_done_safe(payload["key"])
+        _dagr_mark_retired_safe(payload["key"],
+                                _key_reported_done(payload["key"], payload["pane"]))
 
     if not tab_id:
         return 0 if done else 3
@@ -4472,18 +4515,106 @@ def _backlog_plan_actions(members, backlog, target, plan_exists, is_done=None):
     return actions
 
 
+HANDOFF_RETIRE_TRIES = 10
+HANDOFF_RETIRE_DELAY = 2
+
+
+def _handoff_member_present(skey, repo):
+    """True if any non-setup member still holds this key. Matches on the repo
+    root when the repo resolves, else on the key alone across the fleet. An
+    agent-LESS pane still holding the key token counts: it is exactly that pane
+    that makes the implementer dispatch a duplicate until it is closed."""
+    snap = snapshot()
+    try:
+        repo_root, _ = resolve_repo(repo)
+    except CrewError:
+        repo_root = None
+    if repo_root is not None:
+        return bool(members_for(snap, repo_root, skey))
+    return any(m["key"] == skey and m["type"] != "setup"
+               for m in crew_members(snap))
+
+
+def _retire_until_gone(skey, repo, tries=HANDOFF_RETIRE_TRIES,
+                       delay=HANDOFF_RETIRE_DELAY):
+    """Retire the planner's pane, retrying until no member holds the key.
+
+    close-crew confirms the PROCESS exited, but herdr can still list an agent in
+    the pane for a beat, and cmd_retire refuses an occupied pane. Firing retire
+    once and ignoring the refusal is exactly what left the pane holding the key
+    so the implementer dispatch was declined every tick. So retire, re-check, and
+    give herdr time to catch up. True once the key is free."""
+    for _ in range(tries):
+        if not _handoff_member_present(skey, repo):
+            return True
+        try:
+            cmd_retire(skey)
+        except CrewError:
+            pass   # occupied-pane race or nothing to name; re-checked below
+        if not _handoff_member_present(skey, repo):
+            return True
+        time.sleep(delay)
+    return not _handoff_member_present(skey, repo)
+
+
 def _handoff(key, repo):
-    """Retire a finished planner keeping its worktree, then dispatch the
-    implementer onto it. --keep-worktree is why the plan survives the retire."""
-    close_crew = os.path.join(os.path.dirname(os.path.abspath(__file__)), "close-crew.py")
-    subprocess.run([sys.executable, close_crew, sanitize_name(key), "--keep-worktree"],
-                   capture_output=True, text=True)
-    subprocess.run([CREW_BIN, "retire", sanitize_name(key)], capture_output=True, text=True)
+    """Retire a finished planner, confirming its pane is gone, then dispatch the
+    implementer onto the worktree close-crew kept (--keep-worktree is why the
+    plan survives). Returns the implementer dispatch exit code, or None if the
+    planner could not be retired, so the runner counts the failure and moves on
+    rather than dispatching into a perpetual 'already holds this key' duplicate."""
+    skey = sanitize_name(key)
+    close_crew = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "close-crew.py")
+    # --allow-open-pr: a headless planner owns no PR, its deliverable is the
+    # PLAN.md already on disk in the kept worktree. Without it a flaky `gh pr
+    # list` (returns None -> close-crew fails closed) would block every handoff.
+    proc = subprocess.run(
+        [sys.executable, close_crew, skey, "--keep-worktree", "--allow-open-pr"],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        _runner_stamp("handoff %s: close-crew did not confirm the planner exited "
+                      "(rc=%d), leaving it for the next tick" % (key, proc.returncode))
+        return None
+    if not _retire_until_gone(skey, repo):
+        _runner_stamp("handoff %s: planner pane still holds the key after retire "
+                      "attempts, not dispatching the implementer" % key)
+        return None
     return cmd_dispatch(key, "implementer", repo, None, headless=True)
 
 
 def _runner_stamp(msg):
     print("[backlog] %s" % msg, flush=True)
+
+
+ACTION_MAX_FAILURES = 3
+
+
+def _action_key(a):
+    return "%s:%s" % (a["kind"], a["key"])
+
+
+def _next_actionable(actions, parked):
+    """The first action not parked (failed too many times), or None.
+
+    Handoffs sort first in `actions`, so a wedged handoff would otherwise starve
+    every queued plan behind it: only one action runs per tick. Once parked it is
+    stepped over so the rest of the queue still moves."""
+    for a in actions:
+        if _action_key(a) not in parked:
+            return a
+    return None
+
+
+def _record_action_failure(failures, parked, key, threshold=ACTION_MAX_FAILURES):
+    """Count a failed action; park it once it crosses the threshold so a stuck
+    head-of-queue never wedges the backlog. Returns True the tick it parks (so
+    the caller stamps it once, not every tick thereafter)."""
+    failures[key] = failures.get(key, 0) + 1
+    if failures[key] >= threshold and key not in parked:
+        parked.add(key)
+        return True
+    return False
 
 
 def cmd_backlog_run(target, interval, dry, once):
@@ -4494,6 +4625,7 @@ def cmd_backlog_run(target, interval, dry, once):
         return bool(wt) and os.path.exists(os.path.join(wt, PLAN_FILE))
 
     _runner_stamp("run: target=%d interval=%ds%s" % (target, interval, " DRY" if dry else ""))
+    failures, parked = {}, set()
     while True:
         snap = snapshot()
         members = crew_members(snap)
@@ -4502,23 +4634,53 @@ def cmd_backlog_run(target, interval, dry, once):
         # bug cannot burst paid sessions. Handoffs are prioritised so in-flight
         # work finishes before new work starts.
         actions = _backlog_plan_actions(members, backlog, target, plan_exists, _dagr_task_done)
-        if not actions:
-            _runner_stamp("idle: %d/%d live, %d queued" % (len(members), target, len(backlog)))
+        a = _next_actionable(actions, parked)
+        if a is None:
+            note = " (%d parked)" % len(parked) if parked else ""
+            _runner_stamp("idle: %d/%d live, %d queued%s"
+                          % (len(members), target, len(backlog), note))
         else:
-            a = actions[0]
+            fk = _action_key(a)
             try:
                 if dry:
                     _runner_stamp("DRY would %s %s (repo %s)" % (a["kind"], a["key"], a.get("repo")))
                 elif a["kind"] == "handoff":
                     _runner_stamp("handoff %s: retiring planner, dispatching implementer" % a["key"])
-                    _handoff(a["key"], a.get("repo"))
-                    _backlog_remove(a["key"])
+                    code = _handoff(a["key"], a.get("repo"))
+                    if code in (0, 6):   # 6: dispatched, delivery unconfirmed
+                        _backlog_remove(a["key"])
+                        failures.pop(fk, None)
+                    else:
+                        parked_now = _record_action_failure(failures, parked, fk)
+                        # code is None: planner not retired, still live -> the
+                        # handoff regenerates next tick and retries. code set:
+                        # planner retired but the implementer dispatch failed, so
+                        # there is no planner to regenerate from -> orphaned in the
+                        # kept worktree, which is why this is surfaced every time.
+                        detail = ("could not retire the planner, retrying next tick"
+                                  if code is None else
+                                  "planner retired but implementer dispatch returned "
+                                  "%s; its plan survives in the kept worktree, "
+                                  "recover by hand" % code)
+                        _runner_stamp("handoff %s failed: %s%s" % (a["key"], detail,
+                                      " (parked after %d)" % ACTION_MAX_FAILURES
+                                      if parked_now else ""))
                 else:
                     _runner_stamp("planning %s (fable)" % a["key"])
-                    if cmd_dispatch(a["key"], "planner", a.get("repo"), None, headless=True) == 0:
+                    code = cmd_dispatch(a["key"], "planner", a.get("repo"), None, headless=True)
+                    if code in (0, 6):
                         _backlog_remove(a["key"])  # picked up: drop from the queue
+                        failures.pop(fk, None)
+                    else:
+                        parked_now = _record_action_failure(failures, parked, fk)
+                        _runner_stamp("planning %s declined (exit %s); stays queued%s"
+                                      % (a["key"], code, " (parked after %d, dispatch "
+                                         "it by hand)" % ACTION_MAX_FAILURES
+                                         if parked_now else ""))
             except Exception as exc:
                 # One bad action must never kill the long-lived runner.
+                if _record_action_failure(failures, parked, fk):
+                    _runner_stamp("action %s %s parked after %d failures" % (a["kind"], a["key"], ACTION_MAX_FAILURES))
                 _runner_stamp("action %s %s failed, continuing: %s"
                               % (a.get("kind"), a.get("key"), exc))
         if once:
