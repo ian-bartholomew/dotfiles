@@ -17,6 +17,10 @@ import unittest
 from unittest import mock
 
 import crew
+# The suite must never touch the real ~/.crew (see module docstring). Default
+# CREW_DIR to a throwaway dir so a dispatch's crew-dagr run-file sync cannot write
+# the real run file from a test that does not isolate CREW_DIR itself.
+crew.CREW_DIR = tempfile.mkdtemp(prefix="crew-test-")
 from crew import (sanitize_name, pick_name, bucket, _probe, crew_members,
                    untagged_agents, render_ls, assert_snapshot_shape,
                    assert_schema_declares, CrewError, HerdrError,
@@ -1477,27 +1481,6 @@ class TestDispatchClearsTheConsumedArtifact(unittest.TestCase):
             # Narrated, like every other dry-run line, because the refusals
             # report the deletion in the past tense.
             self.assertIn("would delete %s" % artifact, out)
-
-
-class TestDispatchCarriesTheFleetIntoTheCrewPane(unittest.TestCase):
-    """A dispatched pane starts a fresh login shell that does not inherit the
-    foreman's exported CREW_DIR. Without the pane's own env, a non-default
-    foreman's crew member resolves CREW_DIR to the default ~/.crew and reports
-    to a mailbox that foreman never reads, so the second fleet looks empty. The
-    fleet must ride on the tab create, or multi-foreman is broken."""
-
-    def test_the_tab_create_sets_crew_dir_and_foreman_name(self):
-        with _repo_world() as (_, repo_root, worktree):
-            _write_artifact("FANDEVX-9401", worktree, "repo")
-            code, calls, _, err = _run_dispatch("FANDEVX-9401", repo_root,
-                                                "repo")
-            self.assertEqual(code, 0, err)
-            create = next(c for c in calls if c[:2] == ("tab", "create"))
-            self.assertIn("--env", create)
-            self.assertIn("CREW_DIR=%s" % crew.CREW_DIR, create,
-                          "the crew member cannot reach the dispatching "
-                          "foreman's mailbox without its CREW_DIR")
-            self.assertIn("CREW_FOREMAN_NAME=%s" % crew.FOREMAN_NAME, create)
 
 
 REVIEW_KEY = "FANDEVX-9201"
@@ -5802,16 +5785,6 @@ class TestWatchOpensAPaneWithNoAgent(unittest.TestCase):
         self.assertEqual(len(ran), 1)
         self.assertIn("watch-run %s" % RUN_ID, ran[0][3])
         self.assertIn(RUN_ID, out)
-
-    def test_the_watcher_tab_carries_the_fleet_env(self):
-        # watch-run runs as a fresh process in this pane and reads CREW_DIR from
-        # its env, so a non-default foreman's CI outcome would otherwise be
-        # written to the default ~/.crew mailbox it never reads.
-        _, calls, _, _ = _run_watch(RUN_ID)
-        create = next(c for c in calls if c[:2] == ("tab", "create"))
-        self.assertIn("--env", create)
-        self.assertIn("CREW_DIR=%s" % crew.CREW_DIR, create)
-        self.assertIn("CREW_FOREMAN_NAME=%s" % crew.FOREMAN_NAME, create)
 
     def test_no_agent_is_ever_started(self):
         _, calls, _, _ = _run_watch(RUN_ID)
