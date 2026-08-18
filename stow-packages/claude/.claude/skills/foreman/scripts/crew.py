@@ -3069,6 +3069,82 @@ def _close_or_warn(kind, target_id):
     return True
 
 
+# --- crew-dagr run-file sync -------------------------------------------------
+# The crew-dagr TUI renders a run file the foreman is the single writer of, so it
+# never otherwise learns a member was retired: it keeps showing that member's
+# task `awaiting` after its pane is gone. Retiring a member stamps its task
+# `done` here, through the same tmp -> check -> rename discipline the contract
+# requires, so the TUI cannot drift out of sync with the fleet. It only ever
+# updates an EXISTING task (authoring stays the foreman's) and never a terminal
+# one, and a failure here never breaks the retire it follows.
+
+DAGR_RUN = os.environ.get("CREW_DAGR_RUN") or os.path.join(CREW_DIR, "dagr.json")
+
+
+def _dagr_validate(tmp):
+    """True if the sibling crew-dagr.py `check` finds no errors, False if it does,
+    None if it could not be run. No `--strict`: a pre-existing warning elsewhere
+    in the file must not block a mechanical state update."""
+    checker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crew-dagr.py")
+    if not os.path.exists(checker):
+        return None
+    try:
+        result = subprocess.run([sys.executable, checker, "check", tmp],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.returncode == 0
+
+
+def _dagr_mark_done(key):
+    """Stamp the task whose id matches `key` as done in the run file. No-op if the
+    file or the task is absent, or the task is already terminal."""
+    path = DAGR_RUN
+    if not os.path.exists(path):
+        return
+    with open(path) as handle:
+        doc = json.load(handle)
+    task = next((t for t in (doc.get("tasks") or [])
+                 if str(t.get("id", "")).lower() == key.lower()), None)
+    if task is None or task.get("state") in ("done", "failed", "abandoned"):
+        return
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    task["state"] = "done"
+    attempts = task.get("attempts") or [{
+        "id": "%s·a1" % task["id"], "n": 1, "cause": {"type": "initial"},
+        "actor": task.get("owner", "foreman"), "started_at": now}]
+    task["attempts"] = attempts
+    last = attempts[-1]
+    last["state"] = "done"
+    last.pop("liveness", None)   # a done attempt is not live
+    last.pop("locator", None)    # volatile, live-only
+    last["ended_at"] = now
+    # `asserted`: retiring is the foreman's decision to close, not a mechanical
+    # check of the PR, so the tier is honest and the trace renders `!`. The TUI's
+    # own PR poller carries the real merged/open state alongside it.
+    last["outcome"] = {"result": "retired by foreman", "evidence": "asserted",
+                       "receipt": "crew retire %s" % key,
+                       "reason": "crew member retired"}
+    doc["generated_at"] = now
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(doc, handle, indent=2)
+    if _dagr_validate(tmp) is False:
+        os.unlink(tmp)
+        raise CrewError("crew-dagr check rejected the updated run file; left %s "
+                        "unchanged" % path)
+    os.replace(tmp, path)
+    print("dagr: marked %s done in %s" % (key, path))
+
+
+def _dagr_mark_done_safe(key):
+    """_dagr_mark_done, but a failure here never breaks the retire it follows."""
+    try:
+        _dagr_mark_done(key)
+    except (CrewError, OSError, ValueError) as exc:
+        print("dagr sync skipped: %s" % exc, file=sys.stderr)
+
+
 def cmd_retire(name):
     """Close a spent crew member's pane and the tab dispatch created for it.
 
@@ -3125,6 +3201,12 @@ def cmd_retire(name):
     done = True
     for pane_id in panes:
         done = _close_or_warn("pane", pane_id) and done
+
+    # A retired member's task is settled; stamp the crew-dagr run file so the TUI
+    # stops showing it awaiting. Member kind only: a failed-dispatch tab has no
+    # settled task. Never breaks the retire above.
+    if kind == "member":
+        _dagr_mark_done_safe(payload["key"])
 
     if not tab_id:
         return 0 if done else 3
