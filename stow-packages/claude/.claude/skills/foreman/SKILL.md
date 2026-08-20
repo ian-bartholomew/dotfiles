@@ -575,7 +575,13 @@ the pane. Do these in order:
    ad-hoc FANDEVX key there is usually no project and it refuses with "no project
    names <key>"; that is expected, skip it (or pass `--project`).
 4. **`close-crew.py <key>`** ends the session and removes its worktree (below).
-5. **`crew retire <handle>`** closes the now-vacant pane (below).
+5. **`crew retire <handle>`** closes the now-vacant pane (below). Add `--done`
+   when you are closing out a member that finished but never self-reported
+   `done`, a crew retired at `needs-input` or `blocked` whose work you have since
+   verified complete from outside its session (PR merged, run green). Without it
+   the run file stamps that member `abandoned` and the TUI shows a shipped crew
+   as abandoned; `--done` stamps it `done`. Use it only on a genuine close-out:
+   it also unblocks any backlog item that was waiting on this key.
 
 Do NOT run `/finish-work` yourself: it runs in the crew member's session, which is
 gone by step 5, and step 1 and 2 are the parts of it that matter to you.
@@ -644,8 +650,14 @@ command and stop. Do not run it, and do not reach for `herdr pane close`. If the
 human confirms, they run it, or they tell you to.
 
 ```bash
-crew retire <key|pane id|tab id>   # propose it; the human runs it
+crew retire <key|pane id|tab id>            # propose it; the human runs it
+crew retire <key|pane id|tab id> --done     # same, but stamp the task done not abandoned
 ```
+
+`--done` is the verified-close-out flag from the closeout list above: a member
+retired at `needs-input`/`blocked` that you have confirmed complete externally.
+It stamps the run file `done` instead of `abandoned` and unblocks dependents, so
+use it only when the work really shipped, not to tidy a genuine abandon.
 
 `crew ls` names what is retirable, so propose from that rather than from your
 own reading of the load table:
