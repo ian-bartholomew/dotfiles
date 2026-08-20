@@ -1007,6 +1007,12 @@ def mail_send(key, repo, state, msg):
         return 0
 
     append_record(lambda _entries: record)
+    # If the sentence names a PR, surface it on the task so the TUI can show it.
+    # Any report state carries it: a member names its PR at needs-input (up for
+    # review) as readily as at done (merged).
+    pr, pr_repo = parse_pr(record["msg"])
+    if pr:
+        _dagr_set_pr_safe(record["key"], pr, pr_repo)
     # A `needs-input` report is the member telling us it is alive and waiting on
     # a human; reflect that in the run file so the TUI stops showing it working.
     if state == "needs-input":
@@ -2009,11 +2015,14 @@ def _run(args):
         name = require_positional(args[1], "nudge name")
         return cmd_nudge(name, " ".join(args[2:]))
     if verb == "retire":
-        if len(args) < 2:
-            print("usage: crew retire <name|key|pane id|tab id>",
+        # --done is a bare flag; take it out first, then the name is positional.
+        rest = [a for a in args[1:] if a != "--done"]
+        done = "--done" in args[1:]
+        if not rest:
+            print("usage: crew retire <name|key|pane id|tab id> [--done]",
                   file=sys.stderr)
             return 2
-        return cmd_retire(require_positional(args[1], "retire name"))
+        return cmd_retire(require_positional(rest[0], "retire name"), mark_done=done)
     if verb == "watchdog":
         opts = {"--tick": None, "--stall": None}
         # --once is a bare flag, so it is taken out before take_flag walks the
@@ -3253,6 +3262,66 @@ def _dagr_add_task_safe(key, ctype, repo, branch, pane, model):
         print("dagr sync skipped: %s" % exc, file=sys.stderr)
 
 
+# --- crew-dagr PR capture ----------------------------------------------------
+# A crew member names its PR in its own mail sentence ("PR #36 up for review"),
+# but that number lived only in the mailbox, so the TUI never showed it. Parse it
+# from the report and stamp it on the task; crew-dagr already renders task.pr (the
+# #NNNN column and the link) and polls its status, it just had nothing to render.
+
+_PR_URL_RE = re.compile(r"github\.com/[\w.-]+/([\w.-]+)/pull/(\d+)", re.I)
+_PR_NUM_RE = re.compile(r"(?:\bPR\b|\bpull\s+request\b)\s*#?\s*(\d+)", re.I)
+_PR_HASH_RE = re.compile(r"#(\d+)")
+
+
+def parse_pr(msg):
+    """(pr_number:int, repo:str|None) from a report sentence, or (None, None).
+
+    Prefers a full GitHub PR URL (which also yields the repo), then 'PR #N' /
+    'PR N', then a bare '#N'. A JIRA key like FANDEVX-3593 has no '#' and does
+    not match. Pure."""
+    if not msg:
+        return None, None
+    m = _PR_URL_RE.search(msg)
+    if m:
+        return int(m.group(2)), m.group(1)
+    m = _PR_NUM_RE.search(msg) or _PR_HASH_RE.search(msg)
+    return (int(m.group(1)), None) if m else (None, None)
+
+
+def _dagr_set_pr(key, pr, repo=None):
+    """Stamp a PR number (and repo, when a full URL gave one) on the task whose id
+    matches `key`, so the TUI renders the PR and polls its status. No-op if the
+    run file or the task is absent, or nothing would change. Unlike the liveness
+    mutators this touches a task in ANY state: a member names its PR while still
+    working and a later terminal task must keep the number. Locked, and through
+    the same tmp -> check -> rename discipline as every other run-file write."""
+    path = _dagr_run_path()
+    with _locked(path + ".lock", "a+"):   # serialise with the backlog runner
+        if not os.path.exists(path):
+            return
+        with open(path) as handle:
+            doc = json.load(handle)
+        task = next((t for t in (doc.get("tasks") or [])
+                     if str(t.get("id", "")).lower() == key.lower()), None)
+        if task is None:
+            return
+        if task.get("pr") == pr and (not repo or task.get("repo") == repo):
+            return  # already recorded; do not rewrite the file for nothing
+        task["pr"] = pr
+        if repo:
+            task["repo"] = repo
+        doc["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _dagr_write(doc, path)
+
+
+def _dagr_set_pr_safe(key, pr, repo=None):
+    """_dagr_set_pr, but a failure here never breaks the report it rides."""
+    try:
+        _dagr_set_pr(key, pr, repo)
+    except Exception as exc:
+        print("dagr sync skipped: %s" % exc, file=sys.stderr)
+
+
 # --- crew-dagr live liveness -------------------------------------------------
 # Dispatch and retire only ever move a task between `working` and a terminal
 # state, so a member that pauses, blocks or dies mid-run stayed frozen at
@@ -3436,8 +3505,19 @@ def _dagr_reconcile_watchdog_safe(members, state):
         print("dagr sync skipped: %s" % exc, file=sys.stderr)
 
 
-def cmd_retire(name):
+def cmd_retire(name, mark_done=False):
     """Close a spent crew member's pane and the tab dispatch created for it.
+
+    `mark_done` is the foreman's explicit override for a member that finished but
+    never self-reported `done`: a crew retired at `needs-input` (PR up, awaiting
+    merge) or `blocked` that the foreman has since verified complete from outside
+    the session (PR merged, run green). Without it such a member stamps the run
+    file `abandoned`, which is right for a genuine mid-work abandon but wrong for
+    a verified close-out, so the TUI showed a shipped crew as abandoned. `--done`
+    is a deliberate assertion by the foreman, distinct from the per-pane
+    `_key_reported_done` inference #35 added to stop a premature retire faking
+    done, so it is safe to unblock a dependent on: the foreman is stating the
+    blocker is complete, not guessing it from an early retire.
 
     Dispatched panes and their tabs outlived their sessions and nothing ever
     removed them, so they accumulated, in two forms: a member whose session
@@ -3494,13 +3574,14 @@ def cmd_retire(name):
         done = _close_or_warn("pane", pane_id) and done
 
     # A retired member's task is settled; stamp the crew-dagr run file so the TUI
-    # stops showing it awaiting. `done` only if the member actually reported done,
-    # else `abandoned`: a needs-input/blocked member retired before completing must
-    # not be stamped done, or a dependent's blocked-skip dispatches past it. Member
-    # kind only: a failed-dispatch tab has no settled task. Never breaks the retire.
+    # stops showing it awaiting. `done` if the foreman passed --done (a verified
+    # external close-out) or the member itself reported done, else `abandoned`: a
+    # needs-input/blocked member retired before completing must not be stamped done,
+    # or a dependent's blocked-skip dispatches past it. Member kind only: a
+    # failed-dispatch tab has no settled task. Never breaks the retire.
     if kind == "member":
-        _dagr_mark_retired_safe(payload["key"],
-                                _key_reported_done(payload["key"], payload["pane"]))
+        completed = mark_done or _key_reported_done(payload["key"], payload["pane"])
+        _dagr_mark_retired_safe(payload["key"], completed)
 
     if not tab_id:
         return 0 if done else 3

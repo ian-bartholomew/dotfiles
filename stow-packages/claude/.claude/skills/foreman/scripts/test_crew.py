@@ -4020,13 +4020,15 @@ class TestMailUnreadPrintsOneLinePerRecord(unittest.TestCase):
         self.assertIn("'%s'" % self.FORGED, printed)
 
 
-def _run_retire(name, snap, caller=CALLER_PANE, fail=(), snaps=None, dry=False):
-    """crew.main(["retire", name]) with herdr and the snapshot faked. Returns
-    (code, herdr calls, stdout, stderr).
+def _run_retire(name, snap, caller=CALLER_PANE, fail=(), snaps=None, dry=False,
+                extra=()):
+    """crew.main(["retire", name, *extra]) with herdr and the snapshot faked.
+    Returns (code, herdr calls, stdout, stderr).
 
     `fail` names the ids whose close raises. `snaps` supplies a sequence of
     snapshots, because cmd_retire re-reads one to see whether the tab outlived
-    its last pane; the last entry is repeated."""
+    its last pane; the last entry is repeated. `extra` appends flags such as
+    `--done`."""
     calls = []
     remaining = list(snaps) if snaps else [snap]
 
@@ -4047,7 +4049,7 @@ def _run_retire(name, snap, caller=CALLER_PANE, fail=(), snaps=None, dry=False):
          mock.patch.dict(crew.os.environ, {"HERDR_PANE_ID": caller}), \
          contextlib.redirect_stdout(out), \
          mock.patch.object(crew.sys, "stderr", err):
-        code = crew.main(["retire", name])
+        code = crew.main(["retire", name, *extra])
     return code, calls, out.getvalue(), err.getvalue()
 
 
@@ -7133,6 +7135,165 @@ class TestDagrLivenessStates(unittest.TestCase):
                 [{"pane": "wQ:p1", "key": "fandevx-5"}],
                 {"wQ:p1": {"flags": ["dead"], "stalled_for": 0.0}})
             self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "done")
+
+
+class TestParsePr(unittest.TestCase):
+    """A crew member names its PR in its own sentence; parse_pr pulls it out so
+    the run file (and the TUI) can carry it."""
+
+    def test_full_github_url_yields_number_and_repo(self):
+        self.assertEqual(
+            crew.parse_pr("reported: https://github.com/fanatics-gaming/"
+                          "fanapp-terraform/pull/3126 merged"),
+            (3126, "fanapp-terraform"))
+
+    def test_pr_hash_number(self):
+        self.assertEqual(crew.parse_pr("needs-input: PR #36 up for review"),
+                         (36, None))
+
+    def test_pr_bare_number(self):
+        self.assertEqual(crew.parse_pr("opened PR 742, awaiting review"),
+                         (742, None))
+
+    def test_pull_request_phrase(self):
+        self.assertEqual(crew.parse_pr("verified: pull request 88 merged"),
+                         (88, None))
+
+    def test_bare_hash(self):
+        self.assertEqual(crew.parse_pr("verified: #36 merged and applied"),
+                         (36, None))
+
+    def test_a_jira_key_is_not_a_pr(self):
+        # No '#' and no 'PR', so the ticket number must not read as a PR number.
+        self.assertEqual(
+            crew.parse_pr("verified: FANDEVX-3593 migration green, JIRA Done"),
+            (None, None))
+
+    def test_no_pr(self):
+        self.assertEqual(crew.parse_pr("verified: tests 5/5 green"), (None, None))
+
+    def test_empty(self):
+        self.assertEqual(crew.parse_pr(""), (None, None))
+
+    def test_url_wins_over_a_bare_hash(self):
+        self.assertEqual(
+            crew.parse_pr("closes #99, see https://github.com/o/r/pull/12"),
+            (12, "r"))
+
+
+class TestReportCapturesPr(unittest.TestCase):
+    """Bug B: a reported PR reached only the mailbox, so the TUI never showed it.
+    A report now stamps the PR onto the task, which crew-dagr already renders."""
+
+    def _seed(self, key, run_path):
+        with contextlib.redirect_stdout(io.StringIO()):
+            crew._dagr_add_task(key, "implementer", "r", key + "-x", "wQ:p1", "opus")
+
+    def test_needs_input_report_stamps_pr(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "needs-input",
+                               "PR #36 up for review, awaiting merge")
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["pr"], 36)
+            self.assertEqual(task["state"], "awaiting")   # still reflects the report
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_done_report_stamps_pr_and_repo_from_url(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "done",
+                               "reported: https://github.com/ian-bartholomew/"
+                               "dotfiles/pull/36 merged")
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["pr"], 36)
+            self.assertEqual(task["repo"], "dotfiles")
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_report_without_a_pr_leaves_the_task_alone(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "done", "verified: tests 5/5 green")
+            self.assertNotIn("pr", _read_task(run_path, "fandevx-5"))
+
+    def test_pr_survives_a_later_terminal_retire(self):
+        # Captured at needs-input while working, it must persist through the
+        # retire that stamps the task done.
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "needs-input", "PR #36 up for review")
+                crew._dagr_mark_retired("fandevx-5", True)
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["pr"], 36)
+            self.assertEqual(task["state"], "done")
+
+    def test_capture_is_a_noop_without_a_run_file(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "done", "PR #36 merged")
+            self.assertFalse(os.path.exists(run_path))
+
+
+class TestRetireDoneOverride(unittest.TestCase):
+    """Bug A: a member that finished but was retired at needs-input/blocked was
+    stamped `abandoned`. `crew retire --done` is the foreman's verified close-out
+    override: it stamps `done` without a self-reported done, while a plain retire
+    of an unfinished member still abandons (keeping #35's blocked-skip safe)."""
+
+    def _seed(self, key, run_path):
+        with contextlib.redirect_stdout(io.StringIO()):
+            crew._dagr_add_task(key, "implementer", "r", key + "-x", "wV:pCrew", "opus")
+
+    def test_cli_passes_done_flag(self):
+        seen = {}
+        with mock.patch.object(crew, "cmd_retire",
+                               side_effect=lambda name, mark_done=False:
+                               seen.update(name=name, mark_done=mark_done) or 0):
+            crew.main(["retire", "wV:pCrew", "--done"])
+        self.assertEqual(seen, {"name": "wV:pCrew", "mark_done": True})
+
+    def test_cli_accepts_done_flag_before_the_name(self):
+        seen = {}
+        with mock.patch.object(crew, "cmd_retire",
+                               side_effect=lambda name, mark_done=False:
+                               seen.update(name=name, mark_done=mark_done) or 0):
+            crew.main(["retire", "--done", "wV:pCrew"])
+        self.assertEqual(seen, {"name": "wV:pCrew", "mark_done": True})
+
+    def test_cli_default_is_not_done(self):
+        seen = {}
+        with mock.patch.object(crew, "cmd_retire",
+                               side_effect=lambda name, mark_done=False:
+                               seen.update(name=name, mark_done=mark_done) or 0):
+            crew.main(["retire", "wV:pCrew"])
+        self.assertIs(seen["mark_done"], False)
+
+    def test_done_marks_the_task_done_without_a_self_report(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-3511", run_path)
+            code, _, out, err = _run_retire("fandevx-3511", _member_snap(),
+                                            extra=["--done"])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(_read_task(run_path, "fandevx-3511")["state"], "done")
+            self.assertTrue(crew._dagr_task_done("fandevx-3511"))
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_plain_retire_of_an_unfinished_member_still_abandons(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-3511", run_path)
+            code, _, out, err = _run_retire("fandevx-3511", _member_snap())
+            self.assertEqual(code, 0, err)
+            self.assertEqual(_read_task(run_path, "fandevx-3511")["state"],
+                             "abandoned")
 
 
 if __name__ == "__main__":
