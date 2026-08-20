@@ -91,7 +91,7 @@ EVIDENCE = {"verified", "reported", "heuristic", "asserted"}
 CAUSES = {"initial", "sent_back", "nudged", "gate_failed", "followup"}
 
 STATE_GLYPH = {"queued": "○", "working": "◐", "awaiting": "⋯", "blocked": "⊘",
-               "done": "●", "failed": "✗", "abandoned": "⊗"}
+               "done": "●", "failed": "✗", "abandoned": "⊗", "stalled": "◍"}
 ATT_GLYPH = {"working": "◐", "awaiting": "⋯", "done": "●", "failed": "✗", "lost": "⌁"}
 EV_GLYPH = {"verified": "◆", "reported": "◇", "heuristic": "≈", "asserted": "!"}
 CAUSE_GLYPH = {"initial": " ", "sent_back": "↩", "nudged": "↩", "gate_failed": "⨯", "followup": "↳"}
@@ -341,6 +341,7 @@ def view(doc):
                 stale = f"  {ago(ts, now)} silent" if ast == "working" else f"  {ago(ts, now)} ago"
             qi = live.get("queued_input")
             qtag = f"  [{qi} unsent]" if isinstance(qi, int) and qi > 0 else ""
+            ctag = f"  [{live['condition']}]" if live.get("condition") else ""
             c = a.get("cause") or {}
             ctxt = ""
             if c.get("type") not in (None, "initial"):
@@ -348,7 +349,7 @@ def view(doc):
                 if c.get("reason"):
                     ctxt += f' "{c["reason"]}"'
             short = str(a.get("id", "?")).split("·")[-1]
-            lines.append(f"  {cg}{ATT_GLYPH.get(ast, '?')} {short:<3} {ast:<8}{ev}  {a.get('actor', '')}{stale}{qtag}{ctxt}")
+            lines.append(f"  {cg}{ATT_GLYPH.get(ast, '?')} {short:<3} {ast:<8}{ev}  {a.get('actor', '')}{stale}{ctag}{qtag}{ctxt}")
     return "\n".join(lines)
 
 
@@ -424,6 +425,9 @@ def detail_lines(task, by_id, now):
         ts = _attempt_ts(a)
         if ts:
             line += f"  · {ago(ts, now)}" + (" silent" if ast == "working" else "")
+        cond = (a.get("liveness") or {}).get("condition")
+        if cond:
+            line += f"  [{cond}]"
         qi = (a.get("liveness") or {}).get("queued_input")
         if isinstance(qi, int) and qi > 0:
             line += f"  [{qi} unsent]"
@@ -464,7 +468,10 @@ def attention(doc, now):
             live = latest.get("liveness") or {}
             qi = live.get("queued_input")
             ts = _attempt_ts(latest)
-            if isinstance(qi, int) and qi > 0:
+            if live.get("condition") == "stalled":
+                mins = int((live.get("stalled_for") or 0) // 60)
+                out.append((1, t, "◍", f"stalled {mins}m" if mins else "stalled"))
+            elif isinstance(qi, int) and qi > 0:
                 out.append((1, t, "◐", f"{qi} unsent line(s)"))
             elif ts and (now - ts).total_seconds() > 1800:
                 out.append((2, t, "◐", f"silent {ago(ts, now)}"))
@@ -486,16 +493,31 @@ def age_bucket(secs):
     return "red-bold"
 
 
+def _live_condition(task):
+    """The watchdog's live liveness marker on the latest attempt, if any.
+    `stalled` is the one condition with no task-state of its own (the task stays
+    `working`), so the TUI reads it from here; blocked/dead show via task state."""
+    latest = _latest(task.get("attempts") or [])
+    return (latest.get("liveness") or {}).get("condition") if latest else None
+
+
 def trace_columns(task, now):
     """The evenly-spaced trace columns for one task. Pure. Returns a dict:
-    glyph, word (state), id, title, age, age_secs, model."""
+    glyph, word (state), id, title, age, age_secs, model, condition. A `stalled`
+    marker overrides the state word so a silent working pane reads as stalled."""
     latest = _latest(task.get("attempts") or [])
     ts = _attempt_ts(latest) if latest else None
     secs = (now - ts).total_seconds() if ts else None
     pr = task.get("pr")
+    cond = _live_condition(task)
+    glyph = STATE_GLYPH.get(task.get("state"), "?")
+    word = task.get("state", "?")
+    if cond == "stalled" and task.get("state") == "working":
+        glyph, word = STATE_GLYPH["stalled"], "stalled"
     return {
-        "glyph": STATE_GLYPH.get(task.get("state"), "?"),
-        "word": task.get("state", "?"),
+        "glyph": glyph,
+        "word": word,
+        "condition": cond or "",
         "id": task.get("id", "?"),
         "pr": f"#{pr}" if pr not in (None, "", 0) else "",
         "title": task.get("title", ""),
@@ -543,6 +565,9 @@ def focus_card_lines(task, by_id, now):
         ts = _attempt_ts(a)
         if ts:
             seg.append(ago(ts, now) + (" silent" if ast == "working" else ""))
+        cond = (a.get("liveness") or {}).get("condition")
+        if cond:
+            seg.append(f"[{cond}]")
         out.append("  ".join(seg))
     return out
 
@@ -620,6 +645,7 @@ HELP = [
     ("⋯ awaiting", "alive, waiting on you (open PR)"),
     ("○ queued", "dispatched, not started"),
     ("⊘ blocked", "stuck, needs an unblocker"),
+    ("◍ stalled", "working but silent, watchdog flagged"),
     ("✗ failed", "latest attempt failed"),
     ("⊗ abandoned", "given up"),
     ("⌁ lost", "the runtime died mid-attempt"),
@@ -1004,6 +1030,24 @@ def _selftest():
     assert pr_url({"pr": 3126}).endswith("/fanapp-terraform/pull/3126")
     assert pr_url({"pr": 742, "repo": "fes-identity"}).endswith("/fes-identity/pull/742")
     assert pr_url({}) is None
+
+    # live liveness: stalled rides in liveness.condition on a working attempt and
+    # overrides the trace word; blocked/dead show via task state as before.
+    stalled = {"id": "s1", "title": "x", "kind": "impl", "state": "working",
+               "attempts": [{"id": "s1·a1", "n": 1, "cause": {"type": "initial"},
+                             "state": "working", "locator": {"pane": "w1:p1"},
+                             "liveness": {"condition": "stalled", "stalled_for": 720}}]}
+    assert check({"version": 1, "run": {"id": "r"}, "tasks": [stalled]}) == [], \
+        [f.line() for f in check({"version": 1, "run": {"id": "r"}, "tasks": [stalled]})]
+    assert _live_condition(stalled) == "stalled"
+    sc = trace_columns(stalled, now)
+    assert sc["word"] == "stalled" and sc["glyph"] == STATE_GLYPH["stalled"], sc
+    aq = attention({"version": 1, "run": {"id": "r"}, "tasks": [stalled]}, now)
+    assert len(aq) == 1 and aq[0][2] == "stalled 12m", aq
+    assert any("[stalled]" in ln for ln in detail_lines(stalled, {"s1": stalled}, now))
+    assert "[stalled]" in view({"version": 1, "run": {"id": "r"}, "tasks": [stalled]})
+    # a working task with no marker is unchanged
+    assert trace_columns(good["tasks"][0], now)["condition"] == ""
 
     print("crew-dagr selftest: OK")
     return 0

@@ -1007,6 +1007,10 @@ def mail_send(key, repo, state, msg):
         return 0
 
     append_record(lambda _entries: record)
+    # A `needs-input` report is the member telling us it is alive and waiting on
+    # a human; reflect that in the run file so the TUI stops showing it working.
+    if state == "needs-input":
+        _dagr_mark_awaiting_safe(record["key"])
     return 0
 
 
@@ -1786,6 +1790,10 @@ def watchdog_pass(own_pane, stall_seconds, now=None, liveness=None,
             continue
         recorded.append((member, condition, msg))
     write_watchdog_state(state, state_path)
+    # Reflect the same live read into the crew-dagr run file, so a blocked,
+    # stalled or dead member shows as such in the TUI instead of frozen at
+    # working. Best effort: never breaks the tick or the mailbox alert above.
+    _dagr_reconcile_watchdog_safe(members, state)
     if recorded:
         watchdog_notify(recorded)
     return [m["pane"] for m in members], recorded, True
@@ -2981,6 +2989,9 @@ def cmd_peek(name, lines):
 def cmd_nudge(name, text):
     herdr("agent", "prompt", name, text)
     print("nudged %s" % name)
+    # A nudge answers a member that reported `needs-input`, so its task leaves
+    # `awaiting` for `working`. No-op for any other state or a non-key name.
+    _dagr_resume_safe(name)
     return 0
 
 
@@ -3238,6 +3249,189 @@ def _dagr_add_task_safe(key, ctype, repo, branch, pane, model):
     """_dagr_add_task, but a failure here never breaks the dispatch it follows."""
     try:
         _dagr_add_task(key, ctype, repo, branch, pane, model)
+    except Exception as exc:
+        print("dagr sync skipped: %s" % exc, file=sys.stderr)
+
+
+# --- crew-dagr live liveness -------------------------------------------------
+# Dispatch and retire only ever move a task between `working` and a terminal
+# state, so a member that pauses, blocks or dies mid-run stayed frozen at
+# `working` in the TUI. These reflect the live conditions the rest of the system
+# already knows but never wrote down: a crew member's own `needs-input` report
+# (-> awaiting), and the watchdog's blocked/stalled/dead reads (which a crew
+# member cannot report about itself). All go through the same locked
+# tmp -> check -> rename discipline, only ever touch an EXISTING non-terminal
+# task, and never author one. `stalled` has no task-state of its own (the task is
+# still working), so it rides in the attempt's `liveness.condition`; blocked maps
+# to task `blocked` and dead to `failed`+`lost`, states the contract already
+# defines and the TUI already renders.
+WATCHDOG_BLOCK_UNBLOCK = "watchdog: pane needs a human"
+
+
+def _dagr_latest_attempt(task):
+    atts = [a for a in (task.get("attempts") or [])
+            if isinstance(a, dict) and isinstance(a.get("n"), int)]
+    return max(atts, key=lambda a: a["n"]) if atts else None
+
+
+def _dagr_update_task(key, mutate):
+    """Locked read-modify-write of one EXISTING non-terminal task. `mutate(task,
+    now)` edits it in place and returns True to publish, False to leave the file
+    untouched. No-op if the run file or the task is absent, or the task is
+    already terminal. Never authors a task; shares the backlog runner's lock and
+    the tmp -> check -> rename discipline of _dagr_write."""
+    path = _dagr_run_path()
+    if not os.path.exists(path):
+        return
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with _locked(path + ".lock", "a+"):   # serialise with the backlog runner
+        if not os.path.exists(path):
+            return
+        with open(path) as handle:
+            doc = json.load(handle)
+        task = next((t for t in (doc.get("tasks") or [])
+                     if str(t.get("id", "")).lower() == key.lower()), None)
+        if task is None or task.get("state") in ("done", "failed", "abandoned"):
+            return
+        if mutate(task, now):
+            doc["generated_at"] = now
+            _dagr_write(doc, path)
+
+
+def _dagr_mark_awaiting(key):
+    """A crew member's `needs-input` report: it is alive and waiting on a human,
+    which is dagr `awaiting` (the healthy wait), distinct from `blocked`."""
+    def mut(task, _now):
+        latest = _dagr_latest_attempt(task)
+        if latest is None or task.get("state") == "awaiting":
+            return False
+        task["state"] = "awaiting"
+        latest["state"] = "awaiting"
+        return True
+    _dagr_update_task(key, mut)
+
+
+def _dagr_mark_awaiting_safe(key):
+    """_dagr_mark_awaiting, but a failure here never breaks the report it rides."""
+    try:
+        if not DRY_RUN and key:
+            _dagr_mark_awaiting(key)
+    except Exception as exc:
+        print("dagr sync skipped: %s" % exc, file=sys.stderr)
+
+
+def _dagr_resume(key):
+    """The inverse of _dagr_mark_awaiting: a nudge answers the wait, so an
+    `awaiting` task goes back to `working`. Scoped to `awaiting` so it never
+    disturbs a watchdog-set blocked/stalled (the watchdog reverts those itself)
+    or a foreman-authored dependency block."""
+    def mut(task, _now):
+        if task.get("state") != "awaiting":
+            return False
+        latest = _dagr_latest_attempt(task)
+        task["state"] = "working"
+        if latest is not None:
+            latest["state"] = "working"
+        return True
+    _dagr_update_task(key, mut)
+
+
+def _dagr_resume_safe(name):
+    """_dagr_resume for a nudge target `name`, sanitised to a task id. Best
+    effort: a pane/agent name that is not a task id simply matches nothing."""
+    try:
+        if not DRY_RUN:
+            _dagr_resume(sanitize_name(name))
+    except Exception as exc:
+        print("dagr sync skipped: %s" % exc, file=sys.stderr)
+
+
+def _dagr_apply_condition(key, cond, stalled_for):
+    """Reflect one watchdog read of one pane into its task. `cond` is `blocked`,
+    `stalled`, `dead`, or None (healthy). A watchdog marker the tick set is
+    reverted to `working` when the pane is healthy again; a state with no such
+    marker (a crew `awaiting`, a foreman dependency `blocked`) is left alone."""
+    def mut(task, now):
+        latest = _dagr_latest_attempt(task)
+        if latest is None:
+            return False
+        if cond == "dead":
+            task["state"] = "failed"
+            latest["state"] = "lost"
+            latest["ended_at"] = now
+            latest.pop("liveness", None)   # a settled attempt is not live
+            latest.pop("locator", None)
+            return True
+        # blocked/stalled are the watchdog's to set only on a task it already
+        # owns: one still `working`, or one already carrying its own marker. A
+        # crew `awaiting` (idle at a prompt reads as herdr `blocked`) and a
+        # foreman dependency `blocked` (unblocker named, no marker) are left
+        # alone, or the watchdog would stomp a real signal and, once it owned the
+        # state, wrongly release it on a later healthy tick.
+        marked = (latest.get("liveness") or {}).get("condition") in ("blocked", "stalled")
+        if cond in ("blocked", "stalled") and not marked and task.get("state") != "working":
+            return False
+        if cond == "blocked":
+            changed = task.get("state") != "blocked"
+            task["state"] = "blocked"
+            if not task.get("unblock"):
+                task["unblock"] = WATCHDOG_BLOCK_UNBLOCK
+            live = latest.setdefault("liveness", {})
+            live.pop("stalled_for", None)
+            if live.get("condition") != "blocked":
+                live["condition"] = "blocked"
+                changed = True
+            return changed
+        if cond == "stalled":
+            live = latest.setdefault("liveness", {})
+            new_for = int(stalled_for or 0)
+            changed = (task.get("state") != "working"
+                       or latest.get("state") != "working"
+                       or live.get("condition") != "stalled"
+                       or live.get("stalled_for") != new_for)
+            task["state"] = "working"
+            latest["state"] = "working"
+            if task.get("unblock") == WATCHDOG_BLOCK_UNBLOCK:
+                task.pop("unblock", None)
+            live["condition"] = "stalled"
+            live["stalled_for"] = new_for
+            return changed
+        # healthy: revert only a marker the watchdog itself left.
+        live = latest.get("liveness") or {}
+        if live.get("condition") in ("blocked", "stalled"):
+            live.pop("condition", None)
+            live.pop("stalled_for", None)
+            latest["state"] = "working"
+            task["state"] = "working"
+            if task.get("unblock") == WATCHDOG_BLOCK_UNBLOCK:
+                task.pop("unblock", None)
+            return True
+        return False
+    _dagr_update_task(key, mut)
+
+
+def _dagr_reconcile_watchdog(members, state):
+    """Reflect the watchdog's live read of every crew pane into the run file:
+    blocked/stalled/dead as the tick decided, and a revert to `working` for a
+    pane the watchdog had flagged and now finds healthy. `state` is the post-tick
+    watchdog state, whose per-pane `flags` hold the current conditions (at most
+    one), so a pane present with no flags is healthy."""
+    if DRY_RUN or not os.path.exists(_dagr_run_path()):
+        return
+    by_pane = {m.get("pane"): m for m in members}
+    for pane, entry in state.items():
+        member = by_pane.get(pane)
+        if not member or not member.get("key"):
+            continue
+        flags = entry.get("flags") or []
+        _dagr_apply_condition(member["key"], flags[0] if flags else None,
+                              entry.get("stalled_for", 0.0))
+
+
+def _dagr_reconcile_watchdog_safe(members, state):
+    """_dagr_reconcile_watchdog, but a failure never breaks the watchdog tick."""
+    try:
+        _dagr_reconcile_watchdog(members, state)
     except Exception as exc:
         print("dagr sync skipped: %s" % exc, file=sys.stderr)
 
