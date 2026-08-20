@@ -6820,10 +6820,16 @@ class TestRunnerParksStuckActions(unittest.TestCase):
 @contextlib.contextmanager
 def _dagr_world():
     """A private CREW_DIR and run-file path, so the mailbox and dagr sync a test
-    exercises never touch the developer's own ~/.crew."""
+    exercises never touch the developer's own ~/.crew. MAILBOX and CURSOR are
+    module constants bound at import, so redirecting CREW_DIR alone is NOT enough
+    for anything that writes the mailbox (mail_send): those must be patched too,
+    the same as _wd_dir does."""
     with tempfile.TemporaryDirectory() as tmp:
         run_path = os.path.join(tmp, "dagr.json")
         with mock.patch.object(crew, "CREW_DIR", tmp), \
+                mock.patch.object(crew, "MAILBOX",
+                                  os.path.join(tmp, "mailbox.jsonl")), \
+                mock.patch.object(crew, "CURSOR", os.path.join(tmp, "cursor")), \
                 mock.patch.dict(os.environ, {"CREW_DAGR_RUN": run_path}):
             yield tmp, run_path
 
@@ -6898,6 +6904,235 @@ class TestRetireSyncReflectsTrueState(unittest.TestCase):
             actions = crew._backlog_plan_actions([], backlog, 3, lambda wt: False,
                                                  is_done=crew._dagr_task_done)
             self.assertEqual(actions, [])   # dependent stays queued, not dispatched
+
+
+def _read_task(run_path, tid):
+    with open(run_path) as handle:
+        doc = json.load(handle)
+    return next(t for t in doc["tasks"] if str(t["id"]).lower() == tid.lower())
+
+
+def _dagr_check_rc(run_path):
+    """Run the sibling checker; 0 means the file still validates (no E-level)."""
+    checker = os.path.join(os.path.dirname(crew.__file__), "crew-dagr.py")
+    return subprocess.run([sys.executable, checker, "check", run_path],
+                          capture_output=True, text=True).returncode
+
+
+class TestDagrLivenessStates(unittest.TestCase):
+    """The live-state writes that stop a paused/blocked/dead member from staying
+    frozen at `working` in the TUI. The watchdog->dagr path cannot be exercised
+    end to end from a worktree (no live herdr fleet), so the state-write logic is
+    tested directly and the reconcile is fed a hand-built post-tick state."""
+
+    def _seed(self, key, run_path):
+        with contextlib.redirect_stdout(io.StringIO()):
+            crew._dagr_add_task(key, "implementer", "r", key + "-x", "wQ:p1", "opus")
+        self.assertEqual(_read_task(run_path, key)["state"], "working")
+
+    def test_needs_input_marks_awaiting(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_mark_awaiting("fandevx-5")
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "awaiting")
+            self.assertEqual(task["attempts"][-1]["state"], "awaiting")
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_mail_send_needs_input_reflects_awaiting(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "needs-input", "waiting on a value")
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "awaiting")
+
+    def test_done_report_does_not_touch_the_run_file(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "calling_pane", lambda: None):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.mail_send("fandevx-5", "r", "done", "verified: shipped")
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "working")
+
+    def test_resume_reverts_awaiting_to_working(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_mark_awaiting("fandevx-5")
+            crew._dagr_resume("fandevx-5")
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "working")
+            self.assertEqual(task["attempts"][-1]["state"], "working")
+
+    def test_resume_leaves_a_working_task_alone(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            before = _read_task(run_path, "fandevx-5")
+            crew._dagr_resume("fandevx-5")
+            self.assertEqual(_read_task(run_path, "fandevx-5"), before)
+
+    def test_nudge_resumes_by_key(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "herdr", lambda *a, **k: ""):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_mark_awaiting("fandevx-5")
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.cmd_nudge("FANDEVX-5", "here is the value")
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "working")
+
+    def test_watchdog_blocked_marks_task_blocked(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["blocked"], "stalled_for": 0.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "blocked")
+            self.assertTrue(task["unblock"])
+            self.assertEqual(task["attempts"][-1]["liveness"]["condition"], "blocked")
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_watchdog_stalled_keeps_working_with_marker(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["stalled"], "stalled_for": 900.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "working")
+            live = task["attempts"][-1]["liveness"]
+            self.assertEqual(live["condition"], "stalled")
+            self.assertEqual(live["stalled_for"], 900)
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_watchdog_dead_marks_failed_and_lost(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["dead"], "stalled_for": 0.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "failed")
+            self.assertEqual(task["attempts"][-1]["state"], "lost")
+            self.assertEqual(_dagr_check_rc(run_path), 0)
+
+    def test_watchdog_healthy_reverts_a_block_it_set(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            members = [{"pane": "wQ:p1", "key": "fandevx-5"}]
+            crew._dagr_reconcile_watchdog(
+                members, {"wQ:p1": {"flags": ["blocked"], "stalled_for": 0.0}})
+            crew._dagr_reconcile_watchdog(
+                members, {"wQ:p1": {"flags": [], "stalled_for": 0.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "working")
+            self.assertNotIn("condition", task["attempts"][-1].get("liveness", {}))
+            self.assertNotIn("unblock", task)
+
+    def test_watchdog_leaves_crew_awaiting_alone(self):
+        # An awaiting member carries no watchdog marker, so a healthy tick must
+        # not stomp the crew's own `needs-input` report back to working.
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_mark_awaiting("fandevx-5")
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": [], "stalled_for": 0.0}})
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "awaiting")
+
+    def test_watchdog_leaves_a_foreman_dependency_block_alone(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            # A dependency block the foreman authored: state blocked, an unblocker
+            # named, and no watchdog liveness marker.
+            with open(run_path) as handle:
+                doc = json.load(handle)
+            doc["tasks"][0]["state"] = "blocked"
+            doc["tasks"][0]["unblock"] = "PR 9"
+            with open(run_path, "w") as handle:
+                json.dump(doc, handle)
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": [], "stalled_for": 0.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "blocked")
+            self.assertEqual(task["unblock"], "PR 9")
+
+    def test_watchdog_blocked_does_not_stomp_a_crew_awaiting(self):
+        # An idle member that reported needs-input reads as herdr `blocked`; the
+        # watchdog must not overwrite the crew's `awaiting`, or a nudge (which
+        # only reverts `awaiting`) could never clear it.
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_mark_awaiting("fandevx-5")
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["blocked"], "stalled_for": 0.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["state"], "awaiting")
+            self.assertNotIn("condition", task["attempts"][-1].get("liveness", {}))
+
+    def test_watchdog_blocked_does_not_adopt_a_foreman_block(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            with open(run_path) as handle:
+                doc = json.load(handle)
+            doc["tasks"][0]["state"] = "blocked"
+            doc["tasks"][0]["unblock"] = "PR 9"
+            with open(run_path, "w") as handle:
+                json.dump(doc, handle)
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["blocked"], "stalled_for": 0.0}})
+            task = _read_task(run_path, "fandevx-5")
+            self.assertEqual(task["unblock"], "PR 9")   # foreman reason untouched
+            self.assertNotIn("condition", task["attempts"][-1].get("liveness", {}))
+
+    def test_watchdog_stalled_does_not_release_a_foreman_block(self):
+        # A foreman-blocked task whose pane is working-but-silent must stay
+        # blocked, not get flipped to working by the stalled branch.
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            with open(run_path) as handle:
+                doc = json.load(handle)
+            doc["tasks"][0]["state"] = "blocked"
+            doc["tasks"][0]["unblock"] = "PR 9"
+            with open(run_path, "w") as handle:
+                json.dump(doc, handle)
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["stalled"], "stalled_for": 900.0}})
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "blocked")
+
+    def test_nudge_still_clears_awaiting_after_a_blocked_tick(self):
+        with _dagr_world() as (_, run_path), \
+                mock.patch.object(crew, "herdr", lambda *a, **k: ""):
+            self._seed("fandevx-5", run_path)
+            crew._dagr_mark_awaiting("fandevx-5")
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["blocked"], "stalled_for": 0.0}})
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew.cmd_nudge("FANDEVX-5", "the value")
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "working")
+
+    def test_reconcile_is_a_noop_without_a_run_file(self):
+        with _dagr_world() as (_, run_path):
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["blocked"], "stalled_for": 0.0}})
+            self.assertFalse(os.path.exists(run_path))
+
+    def test_update_task_never_resurrects_a_terminal_task(self):
+        with _dagr_world() as (_, run_path):
+            self._seed("fandevx-5", run_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                crew._dagr_mark_retired("fandevx-5", True)   # -> done
+            crew._dagr_mark_awaiting("fandevx-5")
+            crew._dagr_reconcile_watchdog(
+                [{"pane": "wQ:p1", "key": "fandevx-5"}],
+                {"wQ:p1": {"flags": ["dead"], "stalled_for": 0.0}})
+            self.assertEqual(_read_task(run_path, "fandevx-5")["state"], "done")
 
 
 if __name__ == "__main__":
