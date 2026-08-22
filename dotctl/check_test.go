@@ -1,14 +1,21 @@
 package main
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 type fakeRunner struct {
-	present map[string]bool
-	calls   [][]string
+	present  map[string]bool
+	calls    [][]string
+	failCmds map[string]bool
 }
 
 func (f *fakeRunner) Run(name string, args ...string) error {
 	f.calls = append(f.calls, append([]string{name}, args...))
+	if f.failCmds != nil && f.failCmds[name] {
+		return fmt.Errorf("mock failure: %s", name)
+	}
 	return nil
 }
 func (f *fakeRunner) Look(name string) bool { return f.present[name] }

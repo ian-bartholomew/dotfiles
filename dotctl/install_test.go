@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -36,5 +37,21 @@ func TestInstallRunsEachPackage(t *testing.T) {
 	}
 	if !reflect.DeepEqual(r.calls[0], []string{"apt-get", "install", "-y", "bat"}) {
 		t.Fatalf("call0 = %v", r.calls[0])
+	}
+}
+
+func TestInstallCollectsErrors(t *testing.T) {
+	r := &fakeRunner{present: map[string]bool{}, failCmds: map[string]bool{"apt-get": true}}
+	plan := []Resolved{{Name: "bat", Kind: KindNormal}, {Name: "jq", Kind: KindNormal}}
+	err := Install(PlatformUbuntu, plan, r)
+	if err == nil {
+		t.Fatalf("Install should return error when runner fails")
+	}
+	if len(r.calls) != 2 {
+		t.Fatalf("made %d calls, want 2 (no fail-fast): %v", len(r.calls), r.calls)
+	}
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "bat") {
+		t.Fatalf("error should mention failing package 'bat': %s", errMsg)
 	}
 }
