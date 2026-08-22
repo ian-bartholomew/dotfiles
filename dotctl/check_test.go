@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -10,6 +11,11 @@ type fakeRunner struct {
 	calls    [][]string
 	failCmds map[string]bool
 	outputs  map[string]string
+	// failArgs injects a RunOut error keyed by the full command line
+	// ("name arg1 arg2 ..."), for callers that invoke the same command name
+	// with different args expecting different results (e.g. per-package
+	// install checks).
+	failArgs map[string]bool
 }
 
 func (f *fakeRunner) Run(name string, args ...string) error {
@@ -25,6 +31,9 @@ func (f *fakeRunner) RunOut(name string, args ...string) (string, error) {
 	f.calls = append(f.calls, append([]string{name}, args...))
 	if f.failCmds != nil && f.failCmds[name] {
 		return "", fmt.Errorf("mock failure: %s", name)
+	}
+	if f.failArgs != nil && f.failArgs[strings.Join(append([]string{name}, args...), " ")] {
+		return "", fmt.Errorf("mock failure: %s %s", name, strings.Join(args, " "))
 	}
 	return f.outputs[name], nil
 }

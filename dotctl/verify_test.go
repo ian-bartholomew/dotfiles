@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -26,11 +27,51 @@ func TestCheckTools(t *testing.T) {
 }
 
 func TestCheckRequiredInstalled(t *testing.T) {
-	r := &fakeRunner{present: map[string]bool{"git": true}} // jq missing
+	r := &fakeRunner{failArgs: map[string]bool{
+		"brew list --versions jq": true, // jq reported missing by brew
+	}}
 	plan := []Resolved{{Name: "git"}, {Name: "jq"}}
-	errs := checkRequiredInstalled(r, plan)
+	errs := checkRequiredInstalled(PlatformMacOS, r, plan)
 	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "jq") {
 		t.Fatalf("errs = %v, want one about jq", errs)
+	}
+}
+
+func TestInstalledCheckCmd(t *testing.T) {
+	cases := []struct {
+		name string
+		plat Platform
+		pkg  Resolved
+		want []string
+	}{
+		{"macos formula", PlatformMacOS, Resolved{Name: "jq"}, []string{"brew", "list", "--versions", "jq"}},
+		{"macos cask", PlatformMacOS, Resolved{Name: "docker", Kind: KindCask}, []string{"brew", "list", "--cask", "docker"}},
+		{"arch", PlatformArch, Resolved{Name: "jq"}, []string{"pacman", "-Q", "jq"}},
+		{"debian", PlatformUbuntu, Resolved{Name: "jq"}, []string{"dpkg", "-s", "jq"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := installedCheckCmd(c.plat, c.pkg)
+			if strings.Join(got, " ") != strings.Join(c.want, " ") {
+				t.Fatalf("installedCheckCmd(%v, %v) = %v, want %v", c.plat, c.pkg, got, c.want)
+			}
+		})
+	}
+}
+
+func TestLoadRequiredPlanMissingFileDoesNotFail(t *testing.T) {
+	var errb bytes.Buffer
+	plan := loadRequiredPlan(PlatformMacOS, "/nonexistent/dir/packages.csv", &errb)
+	if plan != nil {
+		t.Fatalf("plan = %v, want nil for missing file", plan)
+	}
+	if !strings.Contains(errb.String(), "warning") {
+		t.Fatalf("stderr = %q, want a warning about the missing file", errb.String())
+	}
+
+	errs := checkRequiredInstalled(PlatformMacOS, &fakeRunner{}, plan)
+	if len(errs) != 0 {
+		t.Fatalf("errs = %v, want none when the required-package check is skipped", errs)
 	}
 }
 

@@ -26,10 +26,29 @@ func checkTools(r Runner, tools []string) []error {
 	return errs
 }
 
-func checkRequiredInstalled(r Runner, plan []Resolved) []error {
+// installedCheckCmd returns the package-manager invocation that reports
+// whether p is installed. Resolved.Name is the package-manager name, not
+// necessarily an executable on PATH (e.g. neovim's binary is nvim, coreutils
+// has no eponymous binary), so this must query the manager, not exec.LookPath.
+func installedCheckCmd(plat Platform, p Resolved) []string {
+	switch plat {
+	case PlatformMacOS:
+		if p.Kind == KindCask {
+			return []string{"brew", "list", "--cask", p.Name}
+		}
+		return []string{"brew", "list", "--versions", p.Name}
+	case PlatformArch:
+		return []string{"pacman", "-Q", p.Name}
+	default:
+		return []string{"dpkg", "-s", p.Name}
+	}
+}
+
+func checkRequiredInstalled(plat Platform, r Runner, plan []Resolved) []error {
 	var errs []error
 	for _, p := range plan {
-		if !r.Look(p.Name) {
+		argv := installedCheckCmd(plat, p)
+		if _, err := r.RunOut(argv[0], argv[1:]...); err != nil {
 			errs = append(errs, fmt.Errorf("required package %q not installed", p.Name))
 		}
 	}
@@ -111,8 +130,10 @@ func verifyRemote(r Runner, stdout io.Writer) []error {
 	}
 
 	if _, err := r.RunOut("git", "rev-parse", "--verify", "HEAD"); err != nil {
-		fmt.Fprintln(stdout, "verify: no commits yet, skipping signature check")
+		fmt.Fprintln(stdout, "verify: no signed HEAD to verify (no commits or not a git repository)")
 	} else if out, err := r.RunOut("git", "verify-commit", "HEAD"); err != nil {
+		// git verify-commit checks that HEAD is signed by a trusted key; it
+		// does not confirm this machine can itself produce a new signature.
 		msg := strings.TrimSpace(out)
 		if msg == "" {
 			msg = err.Error()
@@ -121,6 +142,25 @@ func verifyRemote(r Runner, stdout io.Writer) []error {
 	}
 
 	return errs
+}
+
+// loadRequiredPlan reads and parses file to build the required-package plan.
+// If the file cannot be read or parsed (e.g. verify is run from outside the
+// dotfiles repo with the default cwd-relative path), it prints a warning to
+// stderr and returns a nil plan rather than failing verify.
+func loadRequiredPlan(plat Platform, file string, stderr io.Writer) []Resolved {
+	f, err := os.Open(file)
+	if err != nil {
+		fmt.Fprintf(stderr, "verify: warning: cannot read %s, skipping required-package check: %v\n", file, err)
+		return nil
+	}
+	defer f.Close()
+	pkgs, err := ParsePackages(f)
+	if err != nil {
+		fmt.Fprintf(stderr, "verify: warning: cannot parse %s, skipping required-package check: %v\n", file, err)
+		return nil
+	}
+	return BuildPlan(pkgs, plat, Selection{})
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {
@@ -156,17 +196,8 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		})...)
 	}
 
-	if f, err := os.Open(*file); err != nil {
-		errs = append(errs, fmt.Errorf("cannot read %s: %w", *file, err))
-	} else {
-		defer f.Close()
-		if pkgs, err := ParsePackages(f); err != nil {
-			errs = append(errs, fmt.Errorf("cannot parse %s: %w", *file, err))
-		} else {
-			plan := BuildPlan(pkgs, plat, Selection{})
-			errs = append(errs, checkRequiredInstalled(r, plan)...)
-		}
-	}
+	plan := loadRequiredPlan(plat, *file, stderr)
+	errs = append(errs, checkRequiredInstalled(plat, r, plan)...)
 
 	if *remote {
 		errs = append(errs, verifyRemote(r, stdout)...)
