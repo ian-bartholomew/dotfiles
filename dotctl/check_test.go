@@ -9,6 +9,7 @@ type fakeRunner struct {
 	present  map[string]bool
 	calls    [][]string
 	failCmds map[string]bool
+	outputs  map[string]string
 }
 
 func (f *fakeRunner) Run(name string, args ...string) error {
@@ -19,6 +20,14 @@ func (f *fakeRunner) Run(name string, args ...string) error {
 	return nil
 }
 func (f *fakeRunner) Look(name string) bool { return f.present[name] }
+
+func (f *fakeRunner) RunOut(name string, args ...string) (string, error) {
+	f.calls = append(f.calls, append([]string{name}, args...))
+	if f.failCmds != nil && f.failCmds[name] {
+		return "", fmt.Errorf("mock failure: %s", name)
+	}
+	return f.outputs[name], nil
+}
 
 func TestCheckMissingTools(t *testing.T) {
 	r := &fakeRunner{present: map[string]bool{"brew": true}} // git and curl missing
