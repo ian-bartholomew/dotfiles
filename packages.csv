@@ -1,5 +1,5 @@
 # Cross-platform package list
-# Format: category | brew_name | pacman_name | apt_name | notes
+# Format: category | required | brew | pacman | apt | notes
 # "-" = skip on this platform
 # "AUR:name" = Arch AUR package (installed via yay)
 # "CASK:name" = macOS cask app (brew install --cask)
