@@ -12,7 +12,7 @@ func main() {
 
 func dispatch(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install> [flags]")
+		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig|allowed-signers> [flags]")
 		return 2
 	}
 	switch args[0] {
@@ -26,9 +26,11 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return runInstall(args[1:], stdout, stderr)
 	case "gitconfig":
 		return runGitconfig(args[1:], stdout, stderr)
+	case "allowed-signers":
+		return runAllowedSigners(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "dotctl: unknown command %q\n", args[0])
-		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig> [flags]")
+		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig|allowed-signers> [flags]")
 		return 2
 	}
 }
