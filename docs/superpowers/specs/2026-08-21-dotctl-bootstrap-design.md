@@ -258,6 +258,14 @@ parse and lint, per-platform name resolution, plan building (required plus
 selection), and `config.local` rendering. `verify` logic is tested against
 mocked command execution. No frameworks beyond the standard `testing` package.
 
+Beyond unit tests, a containerized end-to-end harness builds `dotctl` from
+source inside clean ubuntu/debian/arch containers, runs the real required-only
+package install, and asserts `dotctl verify` local checks pass. This is what
+makes cross-distro parity measurable and catches wrong per-platform package
+names that unit tests cannot. It runs in CI as a per-distro matrix and must be
+green before the install.sh cutover. macOS is not containerizable and is
+smoked manually or on a macOS CI runner.
+
 ## Migration
 
 - Run `dotctl migrate` to add the `required` column to `packages.csv` programmatically and populate the required set above; do not hand-edit the ~100 rows. Add a `gh` row at the same time.

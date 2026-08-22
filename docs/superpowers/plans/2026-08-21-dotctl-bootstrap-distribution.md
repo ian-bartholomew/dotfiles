@@ -414,7 +414,7 @@ git commit -m "chore(dotctl): pin v0.1.0 release checksums"
 
 - [ ] **Step 4: End-to-end smoke on a clean environment**
 
-In a throwaway container/VM (or a fresh user), run the documented bare-machine prereqs then `git clone ... && ./bootstrap.sh` and confirm it reaches `verify` with local checks green. Record any gaps.
+Run the containerized end-to-end harness from Task 8 (`make -C dotctl/test e2e` or the CI `e2e` job) and confirm the Linux distros reach `dotctl verify` (local) green. macOS is not containerizable; smoke it manually or on a macOS CI runner. Record any gaps.
 
 ---
 
@@ -474,9 +474,122 @@ git commit -m "chore(bootstrap): cut over to dotctl; retire install.sh and prefl
 
 ---
 
+### Task 8: containerized end-to-end tests
+
+**Files:**
+
+- Create: `dotctl/test/Dockerfile` (parametrized base image)
+- Create: `dotctl/test/e2e.sh` (the in-container assertions)
+- Create: `dotctl/test/Makefile` (convenience targets)
+- Modify: `.github/workflows/ci.yml` (add the `e2e` matrix job)
+- Test: the containers exit 0; the CI `e2e` job is green.
+
+**Interfaces:**
+
+- Produces: a repeatable, real-distro end-to-end check that builds `dotctl` from source inside a clean container, installs the required set with the actual package manager, and asserts `dotctl verify` local checks pass. This is what makes cross-distro parity measurable, and it should be green before the Task 7 cutover. It builds from source (not the release binary) so it runs on any branch before a release exists.
+
+Scope and limits (stated so no one assumes more coverage than exists):
+
+- Covers Linux only (macOS cannot run in Docker); macOS parity is a separate manual or macOS-runner smoke.
+- Exercises the required-only install (`install --yes`), which on Arch is entirely official `pacman` packages, so it needs no `yay`/AUR and sidesteps the yay-as-root problem. It does not test AUR packages or `chsh`/GitHub-remote steps.
+
+- [ ] **Step 1: Write the in-container assertions**
+
+`dotctl/test/e2e.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail
+fail() { echo "E2E FAIL: $*" >&2; exit 1; }
+
+cd /repo/dotctl || fail "repo not mounted at /repo"
+go build -o /usr/local/bin/dotctl . || fail "go build"
+
+dotctl lint -file /repo/packages.csv                 || fail "lint"
+dotctl check                                         || fail "check"
+dotctl install -file /repo/packages.csv --yes        || fail "install (required-only)"
+
+# assert a sample of the required set actually installed
+for b in git jq tmux nvim go; do
+  command -v "$b" >/dev/null 2>&1 || fail "expected required binary missing: $b"
+done
+
+# local verify: stow/shell/ssh not set up in this harness, so run the package/tool checks only
+dotctl verify 2>&1 | tee /tmp/verify.out
+grep -Eq "GitHub auth/signing pending|verify: OK" /tmp/verify.out || fail "verify did not run local checks"
+
+echo "E2E OK on $(. /etc/os-release; echo "$ID")"
+```
+
+Note for executors: if `dotctl verify` hard-fails purely because stow symlinks or the default shell are absent in the bare container, add a `--local-only` or `--skip=stow,shell` flag to `verify` (small addition in Plan 2's verify) so the container can assert the package/tool checks without the machine-setup checks. Prefer that over weakening the real `verify`.
+
+- [ ] **Step 2: Write the Dockerfile**
+
+`dotctl/test/Dockerfile`:
+
+```dockerfile
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+# minimal bare-machine prereqs; the rest is installed by dotctl install
+RUN if command -v apt-get >/dev/null; then apt-get update && apt-get install -y git curl golang-go ca-certificates; \
+    elif command -v pacman  >/dev/null; then pacman -Sy --noconfirm git curl go; \
+    fi
+COPY . /repo
+RUN chmod +x /repo/dotctl/test/e2e.sh
+CMD ["/repo/dotctl/test/e2e.sh"]
+```
+
+- [ ] **Step 3: Write the Makefile convenience targets**
+
+`dotctl/test/Makefile`:
+
+```make
+REPO := $(shell cd ../.. && pwd)
+e2e: e2e-ubuntu e2e-debian e2e-arch
+e2e-ubuntu:
+ docker build -t dotctl-e2e-ubuntu --build-arg BASE=ubuntu:24.04 -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-ubuntu
+e2e-debian:
+ docker build -t dotctl-e2e-debian --build-arg BASE=debian:12 -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-debian
+e2e-arch:
+ docker build -t dotctl-e2e-arch --build-arg BASE=archlinux:latest -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-arch
+```
+
+- [ ] **Step 4: Run the containers locally**
+
+Run: `cd dotctl/test && make e2e-ubuntu && make e2e-debian && make e2e-arch`
+Expected: each prints `E2E OK on <id>` and exits 0. Fix any package-name resolution failures surfaced here (this is exactly where a wrong apt/pacman name in `packages.csv` shows up) before wiring CI.
+
+- [ ] **Step 5: Add the CI e2e job**
+
+Append to `.github/workflows/ci.yml`:
+
+```yaml
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        base: ["ubuntu:24.04", "debian:12", "archlinux:latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dotctl-e2e --build-arg BASE=${{ matrix.base }} -f dotctl/test/Dockerfile .
+      - run: docker run --rm dotctl-e2e
+```
+
+- [ ] **Step 6: Verify CI e2e is green and commit**
+
+Push and confirm the `e2e` matrix passes for all three bases (`fail-fast: false` so one distro's failure still shows the others). Then:
+
+```bash
+git add dotctl/test/Dockerfile dotctl/test/e2e.sh dotctl/test/Makefile .github/workflows/ci.yml
+git commit -m "test(dotctl): containerized cross-distro end-to-end harness"
+```
+
+---
+
 ## Self-Review
 
-**1. Spec coverage (bootstrap + distribution scope):** ensure_dotctl fetch + sha256-over-TLS + quarantine strip + `~/.local/bin` PATH: Task 2. ensure_pkg_mgr (brew NONINTERACTIVE, yay caveat, apt no-op): Task 3. chsh non-fatal + `/etc/shells` both platforms: Task 4. Ordered flow (check -> install -> stow -> gitconfig -> keygen -> allowed-signers -> print -> shell -> verify -> post-registration remote switch + push): Task 4. goreleaser static builds + darwin ad-hoc codesign + tag release: Task 5. CI build/test/lint-gate/shellcheck + first release + pinned checksum: Task 6. Migration: seed config.machine + ssh config.local, allowed_signers with the 1Password key, retire install.sh/preflight.sh, remote switch: Task 7. Release discipline (schema + pin together) is in Global Constraints and enforced by the CI lint gate.
+**1. Spec coverage (bootstrap + distribution scope):** ensure_dotctl fetch + sha256-over-TLS + quarantine strip + `~/.local/bin` PATH: Task 2. ensure_pkg_mgr (brew NONINTERACTIVE, yay caveat, apt no-op): Task 3. chsh non-fatal + `/etc/shells` both platforms: Task 4. Ordered flow (check -> install -> stow -> gitconfig -> keygen -> allowed-signers -> print -> shell -> verify -> post-registration remote switch + push): Task 4. goreleaser static builds + darwin ad-hoc codesign + tag release: Task 5. CI build/test/lint-gate/shellcheck + first release + pinned checksum: Task 6. Migration: seed config.machine + ssh config.local, allowed_signers with the 1Password key, retire install.sh/preflight.sh, remote switch: Task 7. Release discipline (schema + pin together) is in Global Constraints and enforced by the CI lint gate. Cross-distro parity is made measurable by the containerized end-to-end harness (Task 8), which builds from source and runs the real package install on ubuntu/debian/arch; it must be green before the Task 7 cutover.
 
 **2. Placeholder scan:** No TBD/TODO. Two items are explicit executor instructions with the exact action, not placeholders: the yay manual-install steps (Task 3, because yay has no root-safe one-liner) and the `FETCH_OVERRIDE` test hook (Task 2). The log-timestamp note in Task 1 is a runtime-vs-CI caveat, not a missing value.
 
