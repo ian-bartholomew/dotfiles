@@ -20,9 +20,9 @@ func installCmd(plat Platform, r Resolved) [][]string {
 		if r.Kind == KindAUR {
 			return [][]string{{"yay", "-S", "--needed", "--noconfirm", r.Name}}
 		}
-		return [][]string{{"pacman", "-S", "--needed", "--noconfirm", r.Name}}
+		return [][]string{{"sudo", "pacman", "-S", "--needed", "--noconfirm", r.Name}}
 	default:
-		return [][]string{{"apt-get", "install", "-y", r.Name}}
+		return [][]string{{"sudo", "apt-get", "install", "-y", r.Name}}
 	}
 }
 

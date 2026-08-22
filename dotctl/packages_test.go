@@ -38,3 +38,13 @@ func TestParsePackagesWrongColumnCount(t *testing.T) {
 		t.Fatalf("error = %q, want it to cite line 1", err)
 	}
 }
+
+func TestParsePackagesInvalidRequired(t *testing.T) {
+	_, err := ParsePackages(strings.NewReader("system | maybe | stow | stow | stow |\n"))
+	if err == nil {
+		t.Fatal("expected error for invalid required value, got nil")
+	}
+	if !strings.Contains(err.Error(), "line 1") {
+		t.Fatalf("error = %q, want it to cite line 1", err)
+	}
+}

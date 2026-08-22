@@ -8,11 +8,11 @@ import (
 )
 
 type Pkg struct {
-	Category         string
-	Required         bool
+	Category          string
+	Required          bool
 	Brew, Pacman, Apt string
-	Notes            string
-	Line             int
+	Notes             string
+	Line              int
 }
 
 func ParsePackages(r io.Reader) ([]Pkg, error) {
@@ -32,6 +32,9 @@ func ParsePackages(r io.Reader) ([]Pkg, error) {
 		}
 		for i := range fields {
 			fields[i] = strings.TrimSpace(fields[i])
+		}
+		if fields[1] != "" && fields[1] != "yes" {
+			return nil, fmt.Errorf("line %d: invalid required value %q (want \"yes\" or empty)", n, fields[1])
 		}
 		out = append(out, Pkg{
 			Category: fields[0],
