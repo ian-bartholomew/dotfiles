@@ -1,64 +1,213 @@
-# dotctl Bootstrap and Distribution Implementation Plan
+# dotctl Bootstrap and Distribution Implementation Plan (revised)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rewrite `bootstrap.sh` as the slim orchestration entry point that drives the `dotctl` subcommands and the pure-CLI steps (fetch binary, package-manager bootstrap, stow, ssh-keygen, chsh), and set up distribution (goreleaser + GitHub Actions release) plus CI (build, test, lint gate, shellcheck). Ends with the migration runbook that cuts over from the old scripts.
+**Goal:** Rewrite `bootstrap.sh` as the slim orchestration entry point that drives the `dotctl` subcommands and the pure-CLI steps (fetch binary, package-manager bootstrap, stow, ssh-keygen, chsh), add the small dotctl changes the bootstrap and CI depend on (`version` subcommand, `verify --skip`, root-aware install), set up distribution (goreleaser + GitHub Actions) and CI, verify cross-distro parity in containers, then cut over from the old scripts.
 
-**Architecture:** `bootstrap.sh` is pure orchestration in bash: it fetches a pinned `dotctl` release binary (sha256-verified over TLS), ensures a package manager, then calls `dotctl check/install/gitconfig/allowed-signers add/verify` in order, with the bash-native steps (stow, ssh-keygen, chsh, print-key) interleaved per the spec's flow. goreleaser cross-compiles static binaries; a tag-triggered workflow publishes them; a push/PR workflow runs Go tests, `dotctl lint`, and shellcheck. Since bash resists unit testing, each bash task is gated by `bash -n`, `shellcheck`, and a dry-run smoke invocation.
+**Architecture:** `bootstrap.sh` is pure bash orchestration, run from a cloned repo (not `curl | bash`): it fetches a pinned `dotctl` release binary (sha256-verified over TLS), ensures a package manager, then calls `dotctl check/install/gitconfig/allowed-signers add/verify` in a fail-fast, rc-accumulating flow with the bash-native steps interleaved. Every bootstrap step's failure is surfaced (the script exits non-zero if any step fails). goreleaser cross-compiles static binaries; a tag-triggered workflow publishes them from `main`; a push/PR workflow runs Go tests, `dotctl lint`, shellcheck, and a container e2e matrix.
 
-**Tech Stack:** bash, GNU stow, ssh-keygen, chsh; goreleaser + GitHub Actions; shellcheck. `dotctl` from Plans 1 and 2.
+**Tech Stack:** bash, GNU stow, ssh-keygen, chsh; Go (small dotctl additions); goreleaser + GitHub Actions; shellcheck; Docker. `dotctl` from Plans 1 and 2 (already merged on this branch).
 
 **Spec:** `docs/superpowers/specs/2026-08-21-dotctl-bootstrap-design.md`
 
-**Depends on:** Plan 1 (core) and Plan 2 (git identity) merged, so all `dotctl` subcommands exist.
+**Depends on:** Plans 1 and 2 (merged on this branch): all `dotctl` subcommands exist; the layered base gitconfig and this machine's `~/.config/git/config.machine` (1Password signing) are already committed/seeded.
+
+## Revision note
+
+This plan was adversarially reviewed (4 reviewers, all reject) before implementation. The rewrite folds in every confirmed finding: rc-accumulating fail-fast `main`; Homebrew `shellenv` + fetch-rc capture; missing-`yay` is a warning not fatal; goreleaser de-nesting + `formats:` + pinned version + version ldflags; Go installed via pinned tarball in the e2e (Debian 12 ships Go 1.19); a real `verify --skip` task (was only a parenthetical); root-aware `install` so containers/root need no `sudo`; a `dotctl version` subcommand so the VERSION pin actually triggers upgrades; gated `ssh-keygen` (skip on 1Password machines) with `mkdir -p ~/.ssh`; idempotent, backup-guarded, already-done-aware migration; `git rm` that locates tracked-vs-untracked scripts; `.gitignore` for build artifacts + explicit `git add`; `${USER:-$(id -un)}`; a clone-first invocation contract; robust checksum parsing; `sudo -n` guard; merge-to-main-before-release ordering.
 
 ## Global Constraints
 
-- `bootstrap.sh` must not abort a non-interactive run on a `read` EOF; guard reads and default sensibly. It must not use `set -e` in a way that dies on an expected non-zero (e.g. `xattr -d` when the attr is absent -> guard with `|| true`).
+- `bootstrap.sh` is run from a cloned repo (`git clone https://github.com/ian-bartholomew/dotfiles && cd dotfiles && ./stow-packages/bootstrap.sh`). It is NOT a `curl | bash` target (`DOTFILES_ROOT` is derived from `$0`).
+- `set -uo pipefail` (not `-e`): the script must survive `read` EOF and expected non-zero (guard with `|| true`), but `main` accumulates an rc and exits non-zero if any real step failed. Never report success on a failed step.
 - Bare-machine prerequisites installed by hand: `git` plus `curl` or `wget`. The shim tries `curl` then `wget`.
 - Binary lands at `~/.local/bin/dotctl`; ensure that dir is on PATH for the run and persisted for future shells (via the stowed zsh config).
-- Integrity: verify the release asset's sha256 against a checksum pinned in the repo, over TLS. Signing (minisign/cosign) is deferred; document the TLS-only threat model (this is the spec's stated alternative).
-- Release discipline: any `packages.csv` schema bump and the `dotctl` version pin are committed together and a matching release is cut, so a fresh clone's CSV schema always matches the pinned binary (prevents the pin-vs-HEAD lint brick).
-- `chsh`/`/etc/shells` steps are non-fatal and skipped when non-interactive or non-root.
-- Do not use em dashes or emojis in any file content, comment, or commit message.
+- Integrity: verify the release asset's sha256 against a checksum pinned in the repo, over TLS. Signing (minisign/cosign) is deferred; this is the spec's stated alternative.
+- Release discipline: `packages.csv` schema, `dotctl/VERSION`, and `dotctl/checksums/<version>.txt` are committed to `main`; the tag/release is cut from `main` so a fresh clone of `main` matches the pinned binary.
+- `chsh`/`/etc/shells` steps are non-fatal, skipped when non-interactive, no passwordless sudo, or already correct.
+- Do not use em dashes or emojis in any file content, comment, or commit message. Do not hardcode secrets; public SSH keys are not secret but use placeholders in docs.
 
 ---
 
-### Task 1: bootstrap.sh safe scaffold
+### Task 1: dotctl `version` subcommand (+ ldflags)
 
 **Files:**
 
-- Modify: `stow-packages/.../bootstrap.sh` is not the target; rewrite the repo-root `bootstrap.sh` (currently at `stow-packages/bootstrap.sh` per the repo). Confirm the path with `git ls-files | grep bootstrap.sh` before editing.
-- Test: `bash -n` + `shellcheck`.
+- Modify: `dotctl/main.go` (register `version`; add a `version` var)
+- Test: `dotctl/version_test.go`
 
 **Interfaces:**
 
-- Produces: functions `log()`, `have(cmd)`, `fetch(url, dest)` (curl-or-wget), and a `main()` that sequences the flow (filled in later tasks). Logging writes to both stdout and a timestamped file under `${XDG_STATE_HOME:-$HOME/.local/state}/dotctl/`.
+- Produces: a package-level `var version = "dev"` overridable at build time via `-ldflags "-X main.version=..."`; `case "version"` prints it. `ensure_dotctl` (Task 5) compares `dotctl version` output to the pin.
 
-- [ ] **Step 1: Locate the current bootstrap.sh**
+- [ ] **Step 1: Write the failing test**
 
-Run: `cd /Users/ian.bartholomew/.dotfiles && git ls-files | grep -n bootstrap.sh`
-Record the path (expected `stow-packages/bootstrap.sh`). Use that path everywhere below as `$BOOTSTRAP`.
+```go
+package main
+
+import (
+ "bytes"
+ "strings"
+ "testing"
+)
+
+func TestDispatchVersion(t *testing.T) {
+ var out bytes.Buffer
+ if code := dispatch([]string{"version"}, &out, &out); code != 0 {
+  t.Fatalf("exit=%d, want 0", code)
+ }
+ if strings.TrimSpace(out.String()) == "" {
+  t.Fatal("version printed nothing")
+ }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cd dotctl && go test ./... -run TestDispatchVersion -v` -> FAIL (unknown command).
+
+- [ ] **Step 3: Implement**
+
+In `main.go`, add at package level `var version = "dev"`, and in `dispatch`'s switch:
+
+```go
+ case "version":
+  fmt.Fprintln(stdout, version)
+  return 0
+```
+
+Add `version` to the usage string.
+
+- [ ] **Step 4: Run test** -> PASS. Then `go test ./...` (whole suite green).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add dotctl/main.go dotctl/version_test.go
+git commit -m "feat(dotctl): version subcommand for the release pin"
+```
+
+---
+
+### Task 2: dotctl `verify --skip`
+
+**Files:**
+
+- Modify: `dotctl/verify.go` (add `-skip` flag), `dotctl/verify_test.go`
+
+**Interfaces:**
+
+- Produces: `runVerify` accepts `-skip <comma-list>` naming local checks to skip (`stow`, `shell`, and/or `packages`). Skipped checks print a `verify: skipped <name>` line and add no error. Used by the container e2e (no stow symlinks, non-zsh shell in a bare container).
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+func TestVerifySkipParsing(t *testing.T) {
+ got := parseSkips("stow,shell")
+ if !got["stow"] || !got["shell"] || got["packages"] {
+  t.Fatalf("parseSkips = %v", got)
+ }
+ if len(parseSkips("")) != 0 {
+  t.Fatal("empty skip should be empty set")
+ }
+}
+```
+
+- [ ] **Step 2: Run** -> FAIL (`parseSkips` undefined).
+
+- [ ] **Step 3: Implement**
+
+Add `func parseSkips(s string) map[string]bool` (reuse the `splitList` shape). Add a `-skip` string flag to `runVerify`; before each of the stow/shell/packages local checks, `if skips["stow"] { fmt.Fprintln(stdout, "verify: skipped stow"); } else { ...run check... }` (same for shell/packages).
+
+- [ ] **Step 4: Run** the new test and `go test ./...` -> all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add dotctl/verify.go dotctl/verify_test.go
+git commit -m "feat(dotctl): verify --skip for bare-container checks"
+```
+
+---
+
+### Task 3: root-aware install (no sudo when euid 0)
+
+**Files:**
+
+- Modify: `dotctl/install.go` (drop the `sudo` prefix when running as root), `dotctl/install_test.go`
+
+**Interfaces:**
+
+- Produces: `installCmd(plat, r)` gains awareness of effective uid. Signature becomes `installCmd(plat Platform, r Resolved, root bool)`; when `root` is true, the pacman/apt-get argvs omit `sudo` (yay/brew never had it). `Install` passes `os.Geteuid() == 0`. This lets the container e2e (root, no sudo) and root users work, while non-root keeps `sudo`.
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+func TestInstallCmdRootDropsSudo(t *testing.T) {
+ got := installCmd(PlatformUbuntu, Resolved{Name: "bat", Kind: KindNormal}, true)
+ want := [][]string{{"apt-get", "install", "-y", "bat"}}
+ if !reflect.DeepEqual(got, want) {
+  t.Fatalf("root ubuntu = %v, want %v (no sudo)", got, want)
+ }
+ got = installCmd(PlatformArch, Resolved{Name: "bat", Kind: KindNormal}, false)
+ want = [][]string{{"sudo", "pacman", "-S", "--needed", "--noconfirm", "bat"}}
+ if !reflect.DeepEqual(got, want) {
+  t.Fatalf("non-root arch = %v, want sudo-prefixed", got)
+ }
+}
+```
+
+- [ ] **Step 2: Run** -> FAIL (arity). Update the existing `TestInstallCmd`/`Install` call sites for the new `root` parameter (non-root = current behavior).
+
+- [ ] **Step 3: Implement**
+
+Add a `root bool` param to `installCmd`; guard the `sudo` prefix on the pacman and apt-get branches with `if !root`. In `Install`, compute `root := os.Geteuid() == 0` once and pass it. Update all callers and the existing tests to the new signature (existing tests pass `false`).
+
+- [ ] **Step 4: Run** `go test ./...` -> all PASS (existing sudo tests still green with `false`).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add dotctl/install.go dotctl/install_test.go
+git commit -m "fix(dotctl): omit sudo for installs when running as root"
+```
+
+---
+
+### Task 4: bootstrap.sh safe scaffold
+
+**Files:**
+
+- Modify: the repo bootstrap script (locate first; expected `stow-packages/bootstrap.sh`)
+- Test: `bash -n` + `shellcheck`
+
+**Interfaces:**
+
+- Produces: `log()`, `have(cmd)`, `fetch(url,dest)` (curl-or-wget), and a `main()` filled in later. Logging tees to `$STATE_DIR/bootstrap.log`.
+
+- [ ] **Step 1: Locate the script**
+
+Run: `git ls-files | grep -n bootstrap.sh` (expected `stow-packages/bootstrap.sh`). Use that path as `$BOOTSTRAP`.
 
 - [ ] **Step 2: Write the scaffold**
-
-Replace `$BOOTSTRAP` contents with:
 
 ```bash
 #!/usr/bin/env bash
 # bootstrap.sh - slim orchestration entry point for dotfiles.
+# Run from a cloned repo: git clone <repo> && cd dotfiles && ./stow-packages/bootstrap.sh
 # Pure CLI orchestration; all data/logic lives in the dotctl binary.
-set -uo pipefail  # not -e: we handle failures explicitly and must survive read EOF
+set -uo pipefail  # not -e: main accumulates rc and exits non-zero on real failure
 
 DOTFILES_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dotctl"
 mkdir -p "$STATE_DIR"
-LOG="$STATE_DIR/bootstrap.log"   # executors: add a timestamp suffix via a value passed in, since scripts cannot call date reproducibly in CI; a plain name is fine at runtime
+LOG="$STATE_DIR/bootstrap.log"
+USER_NAME="${USER:-$(id -un)}"
 
 log() { printf '%s\n' "$*" | tee -a "$LOG" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-fetch() { # fetch <url> <dest>
+fetch() { # fetch <url> <dest>; returns non-zero on failure
   if have curl; then curl -fsSL "$1" -o "$2"
   elif have wget; then wget -qO "$2" "$1"
   else log "FATAL: need curl or wget"; return 1
@@ -67,16 +216,13 @@ fetch() { # fetch <url> <dest>
 
 main() {
   log "dotfiles bootstrap starting ($(uname -s) $(uname -m))"
-  # steps wired in later tasks
+  # steps wired in Task 7
 }
 
 main "$@"
 ```
 
-- [ ] **Step 3: Verify syntax and lint**
-
-Run: `bash -n "$BOOTSTRAP" && shellcheck "$BOOTSTRAP"`
-Expected: no syntax errors; shellcheck clean (or only benign informational notes, which you address).
+- [ ] **Step 3: Gate** `bash -n "$BOOTSTRAP" && shellcheck "$BOOTSTRAP"` (address any SC warnings, e.g. avoid `cat file | tee`; here `printf | tee` is fine).
 
 - [ ] **Step 4: Commit**
 
@@ -87,89 +233,76 @@ git commit -m "refactor(bootstrap): slim scaffold with logging and curl/wget fet
 
 ---
 
-### Task 2: ensure_dotctl (fetch + verify + PATH)
+### Task 5: ensure_dotctl (fetch + verify + PATH + version recheck)
 
 **Files:**
 
-- Modify: `$BOOTSTRAP`
-- Create: `dotctl/VERSION` (the pinned version string, e.g. `v0.1.0`)
-- Test: `bash -n` + `shellcheck` + a mocked dry-run.
+- Modify: `$BOOTSTRAP`; Create: `dotctl/VERSION`
+- Test: `bash -n` + `shellcheck` + mocked mismatch smoke
 
 **Interfaces:**
 
-- Produces: `ensure_dotctl()` that reads the pin from `dotctl/VERSION`, maps `uname` to the goreleaser asset name, downloads the asset and the `checksums.txt` from that release, verifies the asset's sha256 against the pinned checksum committed at `dotctl/checksums/<version>.txt`, strips macOS quarantine, installs to `~/.local/bin/dotctl`, and prepends `~/.local/bin` to PATH.
+- Produces: `ensure_dotctl()` that reads the pin from `dotctl/VERSION`, and if the installed `dotctl version` already equals the pin, returns; otherwise downloads the asset, verifies sha256 against `dotctl/checksums/<version>.txt` (robust awk parse), strips quarantine, installs to `~/.local/bin/dotctl`, prepends `~/.local/bin` to PATH.
 
-- [ ] **Step 1: Add the version pin**
+- [ ] **Step 1: Add the pin**
 
-Create `dotctl/VERSION` containing a single line (the first release you will cut in Task 6):
+`dotctl/VERSION` = `v0.1.0`.
 
-```
-v0.1.0
-```
-
-- [ ] **Step 2: Write ensure_dotctl**
-
-Add to `$BOOTSTRAP` (before `main`):
+- [ ] **Step 2: Write ensure_dotctl** (before `main`)
 
 ```bash
 BIN_DIR="$HOME/.local/bin"
 DOTCTL="$BIN_DIR/dotctl"
 
 asset_name() {
-  local os arch
+  local os="" arch=""
   case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) return 1 ;; esac
   case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) return 1 ;; esac
   printf 'dotctl_%s_%s' "$os" "$arch"
 }
 
 ensure_dotctl() {
-  have "$DOTCTL" 2>/dev/null && { log "dotctl already present"; return 0; }
-  mkdir -p "$BIN_DIR"
-  local version asset tmp
+  local version asset tmp want got
   version="$(cat "$DOTFILES_ROOT/dotctl/VERSION")"
+  if [ -x "$DOTCTL" ] && [ "$("$DOTCTL" version 2>/dev/null)" = "$version" ]; then
+    log "dotctl $version already installed"; return 0
+  fi
+  mkdir -p "$BIN_DIR"
   asset="$(asset_name)" || { log "FATAL: unsupported platform for dotctl asset"; return 1; }
   tmp="$(mktemp -d)"
   local base="https://github.com/ian-bartholomew/dotfiles/releases/download/$version"
-  fetch "$base/$asset" "$tmp/dotctl" || return 1
-  # integrity: compare against the checksum pinned in the repo (TLS-only trust; signing deferred)
-  local want got
-  want="$(grep " $asset\$" "$DOTFILES_ROOT/dotctl/checksums/$version.txt" | awk '{print $1}')"
+  fetch "$base/$asset" "$tmp/dotctl" || { log "FATAL: download failed"; return 1; }
+  want="$(awk -v a="$asset" '$2==a{print $1}' "$DOTFILES_ROOT/dotctl/checksums/$version.txt")"
   if have sha256sum; then got="$(sha256sum "$tmp/dotctl" | awk '{print $1}')"
   else got="$(shasum -a 256 "$tmp/dotctl" | awk '{print $1}')"; fi
   [ -n "$want" ] && [ "$want" = "$got" ] || { log "FATAL: checksum mismatch for $asset"; return 1; }
   xattr -d com.apple.quarantine "$tmp/dotctl" 2>/dev/null || true
-  chmod +x "$tmp/dotctl"
-  mv "$tmp/dotctl" "$DOTCTL"
+  chmod +x "$tmp/dotctl"; mv "$tmp/dotctl" "$DOTCTL"
   case ":$PATH:" in *":$BIN_DIR:"*) ;; *) export PATH="$BIN_DIR:$PATH" ;; esac
   log "installed dotctl $version to $DOTCTL"
 }
 ```
 
-- [ ] **Step 3: Verify syntax, lint, and a mocked run**
+- [ ] **Step 3: Gate + mocked smoke**
 
-Run: `bash -n "$BOOTSTRAP" && shellcheck "$BOOTSTRAP"`
-Then a mocked smoke test (no network): create `dotctl/checksums/v0.1.0.txt` with a dummy line, point `fetch` at a local file via a `FETCH_OVERRIDE` you add, and confirm `ensure_dotctl` fails closed on a checksum mismatch. Document the override hook in a comment.
-Expected: clean lint; `ensure_dotctl` returns non-zero on mismatch.
+`bash -n` + `shellcheck`. Then a no-network smoke: create `dotctl/checksums/v0.1.0.txt` with a bogus line, add a `FETCH_OVERRIDE` env hook in `fetch` (if set, `cp "$FETCH_OVERRIDE" "$2"`), point it at a local file, and confirm `ensure_dotctl` returns non-zero on checksum mismatch. Document the hook in a comment.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add "$BOOTSTRAP" dotctl/VERSION
-git commit -m "feat(bootstrap): ensure_dotctl fetch with pinned sha256 verify"
+git commit -m "feat(bootstrap): ensure_dotctl fetch, pinned sha256 verify, version recheck"
 ```
 
 ---
 
-### Task 3: ensure_pkg_mgr
+### Task 6: ensure_pkg_mgr
 
-**Files:**
-
-- Modify: `$BOOTSTRAP`
-- Test: `bash -n` + `shellcheck`.
+**Files:** Modify `$BOOTSTRAP`. Test: `bash -n` + `shellcheck`.
 
 **Interfaces:**
 
-- Produces: `ensure_pkg_mgr()` that installs Homebrew (macOS) with `NONINTERACTIVE=1` or bootstraps `yay` (Arch, only when missing and only via non-root user with base-devel) if absent; Debian/Ubuntu is a no-op (apt ships). Runs BEFORE any system-mutating install but AFTER the immutable `dotctl check` in the flow ordering (Task 4 sequences this correctly).
+- Produces: `ensure_pkg_mgr()` that on macOS installs Homebrew non-interactively AND puts it on PATH (`brew shellenv`), re-asserting `have brew`; on Arch warns (does not fail) if `yay` is missing (the required set is official pacman); Debian/Ubuntu is a no-op.
 
 - [ ] **Step 1: Write ensure_pkg_mgr**
 
@@ -179,152 +312,159 @@ ensure_pkg_mgr() {
     Darwin)
       have brew && return 0
       log "installing Homebrew (non-interactive)"
-      NONINTERACTIVE=1 /bin/bash -c \
-        "$(fetch https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh /dev/stdout)"
+      local installer; installer="$(mktemp)"
+      fetch "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh" "$installer" \
+        || { log "FATAL: could not download Homebrew installer"; return 1; }
+      NONINTERACTIVE=1 /bin/bash "$installer" || { log "FATAL: Homebrew install failed"; return 1; }
+      # put brew on PATH for the rest of this run (Apple Silicon: /opt/homebrew)
+      local brew_bin=/opt/homebrew/bin/brew; [ -x "$brew_bin" ] || brew_bin=/usr/local/bin/brew
+      [ -x "$brew_bin" ] && eval "$("$brew_bin" shellenv)"
+      have brew || { log "FATAL: brew not on PATH after install"; return 1; }
       ;;
     Linux)
       if have pacman && ! have yay; then
-        log "yay missing; install it manually (needs base-devel and a non-root user), then re-run"
-        # Executors: yay has no official one-line installer and cannot build as root.
-        # Document the manual clone+makepkg steps here; do not attempt as root.
-        return 1
+        log "warning: yay not found; AUR packages will be skipped (required set is official pacman)"
       fi
       ;;
   esac
 }
 ```
 
-- [ ] **Step 2: Verify syntax and lint**
-
-Run: `bash -n "$BOOTSTRAP" && shellcheck "$BOOTSTRAP"`
-Expected: clean.
+- [ ] **Step 2: Gate** `bash -n` + `shellcheck`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add "$BOOTSTRAP"
-git commit -m "feat(bootstrap): ensure_pkg_mgr for brew and yay"
+git commit -m "feat(bootstrap): ensure_pkg_mgr with brew shellenv and non-fatal yay"
 ```
 
 ---
 
-### Task 4: chsh helper and full flow wiring
+### Task 7: main flow, shell, and key handling
 
-**Files:**
-
-- Modify: `$BOOTSTRAP`
-- Test: `bash -n` + `shellcheck` + `main` dry-run with `DOTCTL` mocked.
+**Files:** Modify `$BOOTSTRAP`. Test: `bash -n` + `shellcheck` + mocked dry-run.
 
 **Interfaces:**
 
-- Produces: `set_default_shell()` (non-fatal; adds zsh to `/etc/shells` if writable/sudo available, else warns and skips), `print_key_instructions()`, and a `main()` that runs the spec's ordered flow.
+- Produces: `set_default_shell()` (non-fatal, `sudo -n` guarded, `${USER_NAME}`), `print_key_instructions()`, `stow_all()` (captures per-package rc, backs up conflicts), `setup_ssh_key()` (gated on absence of a 1Password signer; `mkdir -p ~/.ssh`), and an rc-accumulating `main()` that exits non-zero if any step failed.
 
-- [ ] **Step 1: Write set_default_shell**
+- [ ] **Step 1: Write the helpers**
 
 ```bash
-set_default_shell() {
-  local zsh_path; zsh_path="$(command -v zsh || true)"
-  [ -n "$zsh_path" ] || { log "zsh not found; skipping shell change"; return 0; }
-  case "$(dscl . -read "/Users/$USER" UserShell 2>/dev/null || getent passwd "$USER")" in
-    *"$zsh_path"*|*"/zsh") log "zsh already default"; return 0 ;;
-  esac
-  if ! grep -qx "$zsh_path" /etc/shells 2>/dev/null; then
-    if [ -w /etc/shells ] || have sudo; then
-      printf '%s\n' "$zsh_path" | sudo tee -a /etc/shells >/dev/null 2>&1 || {
-        log "could not add $zsh_path to /etc/shells; change shell manually"; return 0; }
-    else
-      log "cannot edit /etc/shells (no sudo); change shell manually"; return 0
-    fi
-  fi
-  chsh -s "$zsh_path" 2>/dev/null || log "chsh failed (interactive/no perms); run: chsh -s $zsh_path"
+uses_1password_signing() {
+  # this machine signs via 1Password if config.machine names op-ssh-sign
+  grep -q 'op-ssh-sign' "$HOME/.config/git/config.machine" 2>/dev/null
 }
-```
 
-- [ ] **Step 2: Wire main() to the spec flow**
-
-```bash
-main() {
-  log "dotfiles bootstrap starting ($(uname -s) $(uname -m))"
-  ensure_dotctl        || { log "FATAL: could not obtain dotctl"; exit 1; }
-  ensure_pkg_mgr       || { log "FATAL: package manager unavailable"; exit 1; }
-  "$DOTCTL" check      || { log "FATAL: preflight failed"; exit 1; }
-  "$DOTCTL" install -file "$DOTFILES_ROOT/packages.csv"
-  ( cd "$DOTFILES_ROOT/stow-packages" && for p in */; do
-      stow -v -t "$HOME" --ignore='\.DS_Store' "${p%/}"; done )
-  "$DOTCTL" gitconfig   # prompts for email (or pass -email in non-interactive use)
-  if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
-    ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+setup_ssh_key() {
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+  if uses_1password_signing; then
+    log "1Password signing detected (config.machine); skipping on-disk key generation"
+    return 0
   fi
-  "$DOTCTL" allowed-signers add -file "$DOTFILES_ROOT/stow-packages/git/.config/git/allowed_signers" \
+  [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+  "$DOTCTL" allowed-signers add \
+    -file "$DOTFILES_ROOT/stow-packages/git/.config/git/allowed_signers" \
     -email "$(git config user.email)" -pubkey "$HOME/.ssh/id_ed25519.pub" || true
   print_key_instructions
-  set_default_shell
-  "$DOTCTL" verify
-  log "bootstrap done. After registering the key on GitHub:"
-  log "  git -C '$DOTFILES_ROOT' remote set-url origin git@github.com:ian-bartholomew/dotfiles.git"
-  log "  $DOTCTL verify --remote"
-  log "  git -C '$DOTFILES_ROOT' add stow-packages/git/.config/git/allowed_signers && git commit && git push"
 }
 
 print_key_instructions() {
-  log "== Register this key on GitHub (BOTH sections) =="
-  log "Authentication keys AND Signing keys: https://github.com/settings/keys"
-  cat "$HOME/.ssh/id_ed25519.pub" | tee -a "$LOG" >&2
+  log "== Register ~/.ssh/id_ed25519.pub on GitHub in BOTH Authentication and Signing sections: https://github.com/settings/keys"
+  [ -f "$HOME/.ssh/id_ed25519.pub" ] && log "$(cat "$HOME/.ssh/id_ed25519.pub")"
+}
+
+stow_all() {
+  local rc=0 p
+  ( cd "$DOTFILES_ROOT/stow-packages" || return 1
+    for p in */; do
+      p="${p%/}"
+      git -C "$DOTFILES_ROOT" check-ignore "$p" >/dev/null 2>&1 && continue
+      stow -v -t "$HOME" --ignore='\.DS_Store' "$p" || { echo "stow conflict: $p" >&2; rc=1; }
+    done
+    return $rc )
+}
+
+set_default_shell() {
+  local zsh_path; zsh_path="$(command -v zsh || true)"
+  [ -n "$zsh_path" ] || { log "zsh not found; skipping shell change"; return 0; }
+  case "$(dscl . -read "/Users/$USER_NAME" UserShell 2>/dev/null || getent passwd "$USER_NAME")" in
+    *"$zsh_path"*|*/zsh) log "zsh already default"; return 0 ;;
+  esac
+  if ! grep -qx "$zsh_path" /etc/shells 2>/dev/null; then
+    if [ -w /etc/shells ]; then printf '%s\n' "$zsh_path" >> /etc/shells
+    elif have sudo && sudo -n true 2>/dev/null; then printf '%s\n' "$zsh_path" | sudo tee -a /etc/shells >/dev/null
+    else log "cannot edit /etc/shells non-interactively; run: sudo sh -c 'echo $zsh_path >> /etc/shells' && chsh -s $zsh_path"; return 0; fi
+  fi
+  chsh -s "$zsh_path" 2>/dev/null || log "chsh needs interaction; run: chsh -s $zsh_path"
 }
 ```
 
-- [ ] **Step 3: Verify syntax, lint, mocked dry-run**
+- [ ] **Step 2: Wire main() with rc accumulation**
 
-Run: `bash -n "$BOOTSTRAP" && shellcheck "$BOOTSTRAP"`.
-Then a mocked run: create a fake `dotctl` on PATH that echoes its args and exits 0, stub `stow`/`ssh-keygen`/`chsh` similarly, and run `bash "$BOOTSTRAP"` in a temp HOME to confirm the ordering (check -> install -> stow -> gitconfig -> keygen -> allowed-signers -> print -> shell -> verify) prints as expected and nothing aborts non-interactively.
-Expected: the ordered log lines appear; exit 0.
+```bash
+main() {
+  local rc=0
+  log "dotfiles bootstrap starting ($(uname -s) $(uname -m))"
+  ensure_dotctl  || { log "FATAL: could not obtain dotctl"; exit 1; }
+  ensure_pkg_mgr || { log "FATAL: package manager unavailable"; exit 1; }
+  "$DOTCTL" check || { log "FATAL: preflight failed"; exit 1; }
+  "$DOTCTL" install -file "$DOTFILES_ROOT/packages.csv" ${DOTCTL_YES:+--yes} || rc=1
+  stow_all || rc=1
+  "$DOTCTL" gitconfig ${DOTCTL_EMAIL:+-email "$DOTCTL_EMAIL"} || rc=1
+  setup_ssh_key || rc=1
+  set_default_shell || rc=1
+  "$DOTCTL" verify || rc=1   # local checks; GitHub checks pending until key registered
+  if [ "$rc" -eq 0 ]; then log "bootstrap OK"; else log "bootstrap finished with errors (rc=$rc); see $LOG"; fi
+  log "after registering the key on GitHub, run: git -C '$DOTFILES_ROOT' remote set-url origin git@github.com:ian-bartholomew/dotfiles.git && '$DOTCTL' verify --remote"
+  exit "$rc"
+}
+```
+
+Note: `dotctl gitconfig` prompts for email interactively in a normal (attended) bootstrap; `DOTCTL_EMAIL`/`DOTCTL_YES` make it scriptable.
+
+- [ ] **Step 3: Gate + mocked dry-run**
+
+`bash -n` + `shellcheck`. Then stub `dotctl`, `stow`, `ssh-keygen`, `chsh`, `git` as fake PATH executables that echo+exit 0, run `bash "$BOOTSTRAP"` in a temp HOME (with `config.machine` present in one run and absent in another) and confirm: correct ordering; `setup_ssh_key` skips keygen when `config.machine` has op-ssh-sign; non-interactive run does not hang; `main` exits 0 on all-success and non-zero when a stub returns non-zero.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add "$BOOTSTRAP"
-git commit -m "feat(bootstrap): non-fatal shell change and full ordered flow"
+git commit -m "feat(bootstrap): rc-accumulating flow, gated ssh key, safe shell change, stow conflict handling"
 ```
 
 ---
 
-### Task 5: goreleaser + release workflow
+### Task 8: goreleaser + release workflow
 
-**Files:**
+**Files:** Create `dotctl/.goreleaser.yaml`, `.github/workflows/release.yml`. Test: `goreleaser check` + `goreleaser release --snapshot --clean`.
 
-- Create: `dotctl/.goreleaser.yaml`
-- Create: `.github/workflows/release.yml`
-- Test: `goreleaser check` + a local `goreleaser release --snapshot --clean`.
-
-**Interfaces:**
-
-- Produces: cross-compiled static binaries `dotctl_{darwin,linux}_{amd64,arm64}` with a `checksums.txt`, published on tag push. Darwin binaries get an ad-hoc codesign so arm64 macOS will execute them.
-
-- [ ] **Step 1: Write .goreleaser.yaml**
+- [ ] **Step 1: `.goreleaser.yaml`** (no `dir:` since the workflow sets `workdir: dotctl`; `formats:`; version ldflags)
 
 ```yaml
+version: 2
 project_name: dotctl
 builds:
   - main: .
-    dir: dotctl
     binary: dotctl
     env: [CGO_ENABLED=0]
     goos: [darwin, linux]
     goarch: [amd64, arm64]
-    # ad-hoc codesign so arm64 macOS runs the binary (no notarization)
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
     hooks:
       post:
         - cmd: sh -c 'case "{{ .Os }}" in darwin) codesign -s - "{{ .Path }}" ;; esac'
 archives:
-  - format: binary
+  - formats: [binary]
     name_template: "dotctl_{{ .Os }}_{{ .Arch }}"
 checksum:
   name_template: "checksums.txt"
 ```
 
-- [ ] **Step 2: Write the release workflow**
-
-`.github/workflows/release.yml`:
+- [ ] **Step 2: `.github/workflows/release.yml`** (pin goreleaser)
 
 ```yaml
 name: release
@@ -335,22 +475,19 @@ permissions:
   contents: write
 jobs:
   release:
-    runs-on: macos-latest   # macOS runner so darwin codesign is available
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.22" }
       - uses: goreleaser/goreleaser-action@v6
-        with: { version: latest, args: release --clean, workdir: dotctl }
+        with: { version: "~> v2", args: release --clean, workdir: dotctl }
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
 ```
 
-- [ ] **Step 3: Validate locally**
+- [ ] **Step 3: Validate** `cd dotctl && goreleaser check && goreleaser release --snapshot --clean`. Confirm `dotctl/dist/` has the four `dotctl_<os>_<arch>` binaries + `checksums.txt`, and that a built binary reports the injected version (`dist/.../dotctl version`).
 
-Run: `cd dotctl && goreleaser check && goreleaser release --snapshot --clean`
-Expected: config valid; snapshot produces the four binaries + `checksums.txt` under `dotctl/dist/`.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Commit** (dist/ is gitignored in Task 9)
 
 ```bash
 git add dotctl/.goreleaser.yaml .github/workflows/release.yml
@@ -359,21 +496,18 @@ git commit -m "ci(dotctl): goreleaser config and tag-triggered release"
 
 ---
 
-### Task 6: CI (build, test, lint gate, shellcheck) and cut the first release
+### Task 9: CI, gitignore, merge, cut the first release
 
-**Files:**
+**Files:** Create `.github/workflows/ci.yml`, `dotctl/.gitignore`, `dotctl/checksums/v0.1.0.txt`.
 
-- Create: `.github/workflows/ci.yml`
-- Create: `dotctl/checksums/v0.1.0.txt` (populated after cutting the release)
-- Test: the workflow runs green on a branch.
+- [ ] **Step 1: `dotctl/.gitignore`**
 
-**Interfaces:**
+```
+/dotctl
+/dist/
+```
 
-- Produces: a push/PR workflow gating Go build+test, `dotctl lint` on the committed `packages.csv`, and shellcheck on `bootstrap.sh`. Then the first tagged release `v0.1.0` and its pinned checksum.
-
-- [ ] **Step 1: Write the CI workflow**
-
-`.github/workflows/ci.yml`:
+- [ ] **Step 2: `.github/workflows/ci.yml`** (go job; shell job)
 
 ```yaml
 name: ci
@@ -385,8 +519,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.22" }
+      - run: cd dotctl && gofmt -l . | tee /tmp/f && test ! -s /tmp/f
       - run: cd dotctl && go vet ./... && go test ./...
-      - run: cd dotctl && go run . lint -file ../packages.csv   # gate the miscolumn bug at CI, not bootstrap
+      - run: cd dotctl && go run . lint -file ../packages.csv
   shell:
     runs-on: ubuntu-latest
     steps:
@@ -395,173 +530,84 @@ jobs:
       - run: shellcheck stow-packages/bootstrap.sh
 ```
 
-- [ ] **Step 2: Verify the CI passes on the branch**
+(The `e2e` job is added in Task 10.)
 
-Push the branch and confirm both jobs are green (`gh run watch` or the Actions tab). Fix any lint/test failures before proceeding.
+- [ ] **Step 3: Verify CI green on the branch**, then get the branch merged to `main` (open the PR, let CI pass, merge). The release is cut from `main` so fresh clones match.
 
-- [ ] **Step 3: Cut the first release and pin its checksum**
-
-Tag and push `v0.1.0`; wait for the release workflow to publish `checksums.txt`; copy it into the repo so the shim can verify against a repo-pinned copy:
+- [ ] **Step 4: Cut the first release from main and pin its checksums**
 
 ```bash
+git checkout main && git pull
 git tag v0.1.0 && git push origin v0.1.0
-# after the release workflow finishes:
+# after the release workflow publishes:
 mkdir -p dotctl/checksums
 gh release download v0.1.0 -p checksums.txt -O dotctl/checksums/v0.1.0.txt
 git add dotctl/checksums/v0.1.0.txt
 git commit -m "chore(dotctl): pin v0.1.0 release checksums"
+git push
 ```
 
-- [ ] **Step 4: End-to-end smoke on a clean environment**
+(This is an outward action; do it only with explicit go-ahead.)
 
-Run the containerized end-to-end harness from Task 8 (`make -C dotctl/test e2e` or the CI `e2e` job) and confirm the Linux distros reach `dotctl verify` (local) green. macOS is not containerizable; smoke it manually or on a macOS CI runner. Record any gaps.
+- [ ] **Step 5: Real fetch smoke** against the cut release: on a scratch checkout, run `ensure_dotctl` for real (no override) and confirm it downloads, checksum-verifies, and `dotctl version` prints `v0.1.0`. This is the first real exercise of the download/verify path.
 
 ---
 
-### Task 7: migration cutover and retire old scripts
+### Task 10: containerized end-to-end tests
 
-**Files:**
-
-- Modify: `install.sh` (delete), `preflight.sh` (delete), repo `README`/docs referencing them
-- Create (once, on this machine): `~/.config/git/config.machine`, `~/.ssh/config.local`
-- Test: `dotctl verify` green locally; `dotctl verify --remote` green after registration.
+**Files:** Create `dotctl/test/Dockerfile`, `dotctl/test/e2e.sh`, `dotctl/test/Makefile`; modify `.github/workflows/ci.yml`.
 
 **Interfaces:**
 
-- Produces: the cutover from the old bash installer to dotctl, with this machine's 1Password signing preserved.
+- Produces: a real-distro e2e that builds `dotctl` from source (Go via a pinned tarball, since Debian 12 ships Go 1.19), runs `dotctl install --yes` as root (root-aware, no sudo needed), and asserts `dotctl verify --skip=stow,shell` passes. Linux only (macOS is a separate manual/macOS-runner smoke).
 
-- [ ] **Step 1: Seed this machine's per-machine overrides**
-
-Create `~/.config/git/config.machine` (never generated, never committed):
-
-```
-[gpg "ssh"]
- program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
-[user]
- signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKWX9s/d4lN6z0w85HvUFSLesri72mA99ua/etjOx2Cc ian.bartholomew@FBG-K919PM6F64
-```
-
-Create `~/.ssh/config.local` if this machine routes `Host *` through the 1Password agent:
-
-```
-Host github.com
- IdentityAgent none
-```
-
-- [ ] **Step 2: Add this machine's signing key to allowed_signers**
-
-Run: `dotctl allowed-signers add -file stow-packages/git/.config/git/allowed_signers -email "$(git config user.email)" -pubkey <path-to-1password-pubkey>`
-(For this machine the entry must carry the 1Password signing key, since that is what it signs with.)
-
-- [ ] **Step 3: Verify signing still works on this machine**
-
-Run: `git commit --allow-empty -m "test: signing" && git verify-commit HEAD && git reset --soft HEAD~1`
-Expected: verification succeeds (1Password may prompt once). If it fails, fix `config.machine` before deleting anything.
-
-- [ ] **Step 4: Retire the old scripts**
-
-Run: `git rm install.sh preflight.sh`
-Update any README/docs references to point at `dotctl` and the new `bootstrap.sh`.
-
-- [ ] **Step 5: Final verify and commit**
-
-Run: `dotctl verify` (local green) and, after the key is registered on GitHub, `dotctl verify --remote`.
-
-```bash
-git add -A
-git commit -m "chore(bootstrap): cut over to dotctl; retire install.sh and preflight.sh"
-```
-
----
-
-### Task 8: containerized end-to-end tests
-
-**Files:**
-
-- Create: `dotctl/test/Dockerfile` (parametrized base image)
-- Create: `dotctl/test/e2e.sh` (the in-container assertions)
-- Create: `dotctl/test/Makefile` (convenience targets)
-- Modify: `.github/workflows/ci.yml` (add the `e2e` matrix job)
-- Test: the containers exit 0; the CI `e2e` job is green.
-
-**Interfaces:**
-
-- Produces: a repeatable, real-distro end-to-end check that builds `dotctl` from source inside a clean container, installs the required set with the actual package manager, and asserts `dotctl verify` local checks pass. This is what makes cross-distro parity measurable, and it should be green before the Task 7 cutover. It builds from source (not the release binary) so it runs on any branch before a release exists.
-
-Scope and limits (stated so no one assumes more coverage than exists):
-
-- Covers Linux only (macOS cannot run in Docker); macOS parity is a separate manual or macOS-runner smoke.
-- Exercises the required-only install (`install --yes`), which on Arch is entirely official `pacman` packages, so it needs no `yay`/AUR and sidesteps the yay-as-root problem. It does not test AUR packages or `chsh`/GitHub-remote steps.
-
-- [ ] **Step 1: Write the in-container assertions**
-
-`dotctl/test/e2e.sh`:
+- [ ] **Step 1: `dotctl/test/e2e.sh`**
 
 ```bash
 #!/usr/bin/env bash
 set -uo pipefail
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
-
 cd /repo/dotctl || fail "repo not mounted at /repo"
 go build -o /usr/local/bin/dotctl . || fail "go build"
-
-dotctl lint -file /repo/packages.csv                 || fail "lint"
-dotctl check                                         || fail "check"
-dotctl install -file /repo/packages.csv --yes        || fail "install (required-only)"
-
-# assert a sample of the required set actually installed
-for b in git jq tmux nvim go; do
-  command -v "$b" >/dev/null 2>&1 || fail "expected required binary missing: $b"
-done
-
-# local verify: stow/shell/ssh not set up in this harness, so run the package/tool checks only
-dotctl verify 2>&1 | tee /tmp/verify.out
-grep -Eq "GitHub auth/signing pending|verify: OK" /tmp/verify.out || fail "verify did not run local checks"
-
+dotctl lint -file /repo/packages.csv          || fail "lint"
+dotctl check                                  || fail "check"
+dotctl install -file /repo/packages.csv --yes || fail "install (required-only)"
+for b in git jq tmux nvim go; do command -v "$b" >/dev/null 2>&1 || fail "required binary missing: $b"; done
+dotctl verify -file /repo/packages.csv --skip=stow,shell || fail "verify (local, minus stow/shell)"
 echo "E2E OK on $(. /etc/os-release; echo "$ID")"
 ```
 
-Note for executors: if `dotctl verify` hard-fails purely because stow symlinks or the default shell are absent in the bare container, add a `--local-only` or `--skip=stow,shell` flag to `verify` (small addition in Plan 2's verify) so the container can assert the package/tool checks without the machine-setup checks. Prefer that over weakening the real `verify`.
-
-- [ ] **Step 2: Write the Dockerfile**
-
-`dotctl/test/Dockerfile`:
+- [ ] **Step 2: `dotctl/test/Dockerfile`** (pinned Go tarball; arch-aware)
 
 ```dockerfile
 ARG BASE=ubuntu:24.04
 FROM ${BASE}
-# minimal bare-machine prereqs; the rest is installed by dotctl install
-RUN if command -v apt-get >/dev/null; then apt-get update && apt-get install -y git curl golang-go ca-certificates; \
-    elif command -v pacman  >/dev/null; then pacman -Sy --noconfirm git curl go; \
-    fi
+ARG GO_VERSION=1.22.12
+RUN if command -v apt-get >/dev/null; then apt-get update && apt-get install -y git curl ca-certificates; \
+    elif command -v pacman >/dev/null; then pacman -Sy --noconfirm git curl; fi
+RUN set -eux; a="$(uname -m)"; case "$a" in x86_64) g=amd64;; aarch64|arm64) g=arm64;; esac; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${g}.tar.gz" | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}"
 COPY . /repo
 RUN chmod +x /repo/dotctl/test/e2e.sh
 CMD ["/repo/dotctl/test/e2e.sh"]
 ```
 
-- [ ] **Step 3: Write the Makefile convenience targets**
-
-`dotctl/test/Makefile`:
+- [ ] **Step 3: `dotctl/test/Makefile`**
 
 ```make
 REPO := $(shell cd ../.. && pwd)
 e2e: e2e-ubuntu e2e-debian e2e-arch
-e2e-ubuntu:
- docker build -t dotctl-e2e-ubuntu --build-arg BASE=ubuntu:24.04 -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-ubuntu
-e2e-debian:
- docker build -t dotctl-e2e-debian --build-arg BASE=debian:12 -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-debian
-e2e-arch:
- docker build -t dotctl-e2e-arch --build-arg BASE=archlinux:latest -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-arch
+e2e-%:
+ docker build -t dotctl-e2e-$* --build-arg BASE=$(BASE_$*) -f Dockerfile $(REPO) && docker run --rm dotctl-e2e-$*
+BASE_ubuntu := ubuntu:24.04
+BASE_debian := debian:12
+BASE_arch := archlinux:latest
 ```
 
-- [ ] **Step 4: Run the containers locally**
+- [ ] **Step 4: Run locally** `cd dotctl/test && make e2e-ubuntu e2e-debian e2e-arch` (needs Docker). Each prints `E2E OK on <id>`. Fix any package-name resolution failures surfaced here (this is where a wrong apt/pacman name in `packages.csv` shows up).
 
-Run: `cd dotctl/test && make e2e-ubuntu && make e2e-debian && make e2e-arch`
-Expected: each prints `E2E OK on <id>` and exits 0. Fix any package-name resolution failures surfaced here (this is exactly where a wrong apt/pacman name in `packages.csv` shows up) before wiring CI.
-
-- [ ] **Step 5: Add the CI e2e job**
-
-Append to `.github/workflows/ci.yml`:
+- [ ] **Step 5: Add the CI e2e job** to `.github/workflows/ci.yml`
 
 ```yaml
   e2e:
@@ -576,9 +622,7 @@ Append to `.github/workflows/ci.yml`:
       - run: docker run --rm dotctl-e2e
 ```
 
-- [ ] **Step 6: Verify CI e2e is green and commit**
-
-Push and confirm the `e2e` matrix passes for all three bases (`fail-fast: false` so one distro's failure still shows the others). Then:
+- [ ] **Step 6: Verify + commit**
 
 ```bash
 git add dotctl/test/Dockerfile dotctl/test/e2e.sh dotctl/test/Makefile .github/workflows/ci.yml
@@ -587,12 +631,66 @@ git commit -m "test(dotctl): containerized cross-distro end-to-end harness"
 
 ---
 
+### Task 11: migration cutover (idempotent, backup-guarded)
+
+**Files:** delete `install.sh` (tracked) and `preflight.sh` (untracked); update README refs. Per-machine files (`~/.config/git/config.machine`, `~/.ssh/config.local`) are already seeded on this machine (Plan 2), so this task is idempotent about them.
+
+**Interfaces:**
+
+- Produces: the cutover, with signing preserved and nothing clobbered.
+
+- [ ] **Step 1: Ensure per-machine overrides exist (idempotent, backup-guarded)**
+
+```bash
+mkdir -p ~/.config/git
+if [ ! -f ~/.config/git/config.machine ]; then
+  # only on a machine that signs via 1Password; seed with THIS machine's values
+  cat > ~/.config/git/config.machine <<'EOF'
+[gpg "ssh"]
+ program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
+[user]
+ signingkey = <your 1Password ssh signing public key>
+EOF
+  echo "seeded config.machine (edit signingkey to your 1Password pubkey)"
+else
+  echo "config.machine already present; leaving it untouched"
+fi
+```
+
+(On this machine it already exists and holds the real values, so this is a no-op. Do NOT hardcode the real key in the committed plan.)
+
+- [ ] **Step 2: Confirm signing works BEFORE deleting anything**
+
+Run: `git config --global --includes --get user.signingkey` and `... --get gpg.ssh.program` resolve to the 1Password values; and `dotctl verify` local checks are green. If not, stop and fix `config.machine` (restore from the migration backup) before proceeding.
+
+- [ ] **Step 3: Retire the old scripts (locate tracked vs untracked)**
+
+```bash
+git rm --ignore-unmatch install.sh preflight.sh    # removes whatever is tracked
+rm -f preflight.sh                                  # remove if it was untracked on disk
+```
+
+Then update any README/docs references to point at `dotctl` + the new `bootstrap.sh`.
+
+- [ ] **Step 4: Final verify and commit (explicit paths, no `git add -A`)**
+
+Run `dotctl verify` (local green) and, after the key is registered, `dotctl verify --remote`.
+
+```bash
+git add -- install.sh preflight.sh README.md   # only the intended paths (git handles the deletions)
+git commit -m "chore(bootstrap): cut over to dotctl; retire install.sh and preflight.sh"
+```
+
+Rollback: if anything regresses, `git revert` this commit restores the old scripts, and the migration backup restores `config.machine`.
+
+---
+
 ## Self-Review
 
-**1. Spec coverage (bootstrap + distribution scope):** ensure_dotctl fetch + sha256-over-TLS + quarantine strip + `~/.local/bin` PATH: Task 2. ensure_pkg_mgr (brew NONINTERACTIVE, yay caveat, apt no-op): Task 3. chsh non-fatal + `/etc/shells` both platforms: Task 4. Ordered flow (check -> install -> stow -> gitconfig -> keygen -> allowed-signers -> print -> shell -> verify -> post-registration remote switch + push): Task 4. goreleaser static builds + darwin ad-hoc codesign + tag release: Task 5. CI build/test/lint-gate/shellcheck + first release + pinned checksum: Task 6. Migration: seed config.machine + ssh config.local, allowed_signers with the 1Password key, retire install.sh/preflight.sh, remote switch: Task 7. Release discipline (schema + pin together) is in Global Constraints and enforced by the CI lint gate. Cross-distro parity is made measurable by the containerized end-to-end harness (Task 8), which builds from source and runs the real package install on ubuntu/debian/arch; it must be green before the Task 7 cutover.
+**1. Spec coverage:** ensure_dotctl fetch + sha256-over-TLS + PATH + version-recheck: Task 5. ensure_pkg_mgr (brew shellenv, non-fatal yay, apt no-op): Task 6. rc-accumulating flow + gated ssh key + safe shell + stow conflicts: Task 7. goreleaser + release: Task 8. CI + gitignore + merge + release + pinned checksums + real fetch smoke: Task 9. Container e2e (pinned Go, root-aware install, verify --skip): Task 10. Idempotent, backup-guarded migration: Task 11. Supporting dotctl changes the bootstrap/CI need: `version` (Task 1), `verify --skip` (Task 2), root-aware install (Task 3).
 
-**2. Placeholder scan:** No TBD/TODO. Two items are explicit executor instructions with the exact action, not placeholders: the yay manual-install steps (Task 3, because yay has no root-safe one-liner) and the `FETCH_OVERRIDE` test hook (Task 2). The log-timestamp note in Task 1 is a runtime-vs-CI caveat, not a missing value.
+**2. Placeholder scan:** No TBD/TODO. `config.machine` signingkey is an intentional `<placeholder>` (do not commit the real key; it is a public key but kept out of the doc). The `FETCH_OVERRIDE` hook (Task 5) is a real, documented test seam.
 
-**3. Consistency:** `$DOTCTL`, `$BIN_DIR`, `$DOTFILES_ROOT`, `asset_name`, the `dotctl/VERSION` pin, and `dotctl/checksums/<version>.txt` are used consistently across Tasks 2, 4, 6. The allowed_signers path (`stow-packages/git/.config/git/allowed_signers`) matches Plan 2 Task 5. Subcommand invocations (`check`, `install -file`, `gitconfig`, `allowed-signers add`, `verify [--remote]`) match the signatures defined in Plans 1 and 2.
+**3. Consistency:** `$DOTCTL`/`$BIN_DIR`/`$DOTFILES_ROOT`/`asset_name`/`USER_NAME` used consistently. The `version` subcommand (Task 1) is what `ensure_dotctl` (Task 5) compares against `dotctl/VERSION`. `verify --skip` (Task 2) is what the e2e (Task 10) calls. Root-aware `installCmd` (Task 3) is what lets the root container skip sudo. Sequencing: dotctl code changes (1-3) land before the bash that depends on them; e2e (10) before the cutover (11); release cut from main (9) before the shim is relied on.
 
-**Known deviations from the spec, accepted (round-2 findings the user chose to disregard, noted so executors are not surprised):** the shim verifies sha256 over TLS rather than a minisign/cosign signature (the spec's stated deferred-signing alternative); `pacman -Syu` full-system-upgrade blast radius on Arch is inherent to installing new packages safely there and is left as-is. These are documented, not silently dropped.
+**Adversarial review:** 4 reviewers, all reject on the prior draft; every confirmed finding folded in (see Revision note). One false positive (undefined `assert` in e2e.sh) was an artifact of the review prompt, not the plan. Accepted deviations unchanged: sha256-over-TLS (not signing); `pacman -Syu` blast radius on Arch.
