@@ -1,6 +1,12 @@
 package main
 
-import "fmt"
+import (
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+)
 
 func genericHelper(plat Platform) string {
 	if plat == PlatformMacOS {
@@ -19,4 +25,48 @@ func RenderConfigLocal(email string, plat Platform) string {
 	helper =
 	helper = !gh auth git-credential
 `, email, genericHelper(plat))
+}
+
+func writeConfigLocal(dir, email string, plat Platform, force bool) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "config.local")
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil // exists; do not clobber
+		}
+	}
+	if err := os.WriteFile(path, []byte(RenderConfigLocal(email, plat)), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func runGitconfig(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gitconfig", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	email := fs.String("email", "", "git email for this machine (work or home)")
+	force := fs.Bool("force", false, "re-render config.local even if it exists")
+	home, _ := os.UserHomeDir()
+	dir := fs.String("dir", filepath.Join(home, ".config", "git"), "config dir")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *email == "" {
+		fmt.Fprintln(stderr, "dotctl gitconfig: -email is required")
+		return 2
+	}
+	plat, err := Detect()
+	if err != nil {
+		fmt.Fprintf(stderr, "dotctl gitconfig: %v\n", err)
+		return 1
+	}
+	path, err := writeConfigLocal(*dir, *email, plat, *force)
+	if err != nil {
+		fmt.Fprintf(stderr, "dotctl gitconfig: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "gitconfig: wrote %s\n", path)
+	return 0
 }

@@ -24,9 +24,11 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return runMigrate(args[1:], stdout, stderr)
 	case "install":
 		return runInstall(args[1:], stdout, stderr)
+	case "gitconfig":
+		return runGitconfig(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "dotctl: unknown command %q\n", args[0])
-		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install> [flags]")
+		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig> [flags]")
 		return 2
 	}
 }
