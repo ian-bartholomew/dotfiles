@@ -16,6 +16,8 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch args[0] {
+	case "check":
+		return runCheck(args[1:], stdout, stderr)
 	case "lint":
 		return runLint(args[1:], stdout, stderr)
 	default:
