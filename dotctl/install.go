@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-func installCmd(plat Platform, r Resolved) [][]string {
+func installCmd(plat Platform, r Resolved, root bool) [][]string {
 	switch plat {
 	case PlatformMacOS:
 		if r.Kind == KindCask {
@@ -20,16 +20,22 @@ func installCmd(plat Platform, r Resolved) [][]string {
 		if r.Kind == KindAUR {
 			return [][]string{{"yay", "-S", "--needed", "--noconfirm", r.Name}}
 		}
+		if root {
+			return [][]string{{"pacman", "-S", "--needed", "--noconfirm", r.Name}}
+		}
 		return [][]string{{"sudo", "pacman", "-S", "--needed", "--noconfirm", r.Name}}
 	default:
+		if root {
+			return [][]string{{"apt-get", "install", "-y", r.Name}}
+		}
 		return [][]string{{"sudo", "apt-get", "install", "-y", r.Name}}
 	}
 }
 
-func Install(plat Platform, plan []Resolved, run Runner) error {
+func Install(plat Platform, plan []Resolved, run Runner, root bool) error {
 	var errs []error
 	for _, r := range plan {
-		for _, argv := range installCmd(plat, r) {
+		for _, argv := range installCmd(plat, r, root) {
 			if err := run.Run(argv[0], argv[1:]...); err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
 			}
@@ -88,7 +94,8 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "install (dry-run): %d packages\n", len(plan))
 		return 0
 	}
-	if err := Install(plat, plan, ExecRunner{}); err != nil {
+	root := os.Geteuid() == 0
+	if err := Install(plat, plan, ExecRunner{}, root); err != nil {
 		fmt.Fprintf(stderr, "dotctl install: %v\n", err)
 		return 1
 	}
