@@ -90,12 +90,17 @@ print_key_instructions() {
 }
 
 setup_ssh_key() {
+  local email="${1:-}"
   mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
   if uses_1password_signing; then log "1Password signing detected (config.machine); skipping on-disk key generation"; return 0; fi
   [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
-  "$DOTCTL" allowed-signers add \
-    -file "$DOTFILES_ROOT/stow-packages/git/.config/git/allowed_signers" \
-    -email "$(git config user.email)" -pubkey "$HOME/.ssh/id_ed25519.pub" || true
+  if [ -n "$email" ]; then
+    "$DOTCTL" allowed-signers add \
+      -file "$DOTFILES_ROOT/stow-packages/git/.config/git/allowed_signers" \
+      -email "$email" -pubkey "$HOME/.ssh/id_ed25519.pub" || true
+  else
+    log "no email available; skipping allowed-signers registration"
+  fi
   print_key_instructions
 }
 
@@ -107,9 +112,11 @@ stow_all() {
       git -C "$DOTFILES_ROOT" check-ignore "stow-packages/$p" >/dev/null 2>&1 && continue
       if ! stow -v -t "$HOME" --ignore='\.DS_Store' "$p" 2>/dev/null; then
         # back up conflicting targets then retry (best-effort)
+        # parses stow's own conflict wording ("... over existing target X since
+        # neither a link nor a directory ..."); verified against installed Stow.pm
         while IFS= read -r target; do
           [ -e "$HOME/$target" ] && [ ! -L "$HOME/$target" ] && mv "$HOME/$target" "$HOME/$target.pre-dotctl.$$"
-        done < <(stow -n -v -t "$HOME" "$p" 2>&1 | awk '/existing target/{print $NF}')
+        done < <(stow -n -v -t "$HOME" --ignore='\.DS_Store' "$p" 2>&1 | sed -n 's/.*over existing target \(.*\) since neither a link.*/\1/p')
         stow -v -t "$HOME" --ignore='\.DS_Store' "$p" || { log "stow conflict: $p"; rc=1; }
       fi
     done
@@ -140,7 +147,7 @@ main() {
   stow_all || rc=1
   email="$(prompt_email)"
   if [ -n "$email" ]; then "$DOTCTL" gitconfig -email "$email" || rc=1; else log "no email provided; skipping gitconfig (set DOTCTL_EMAIL or run interactively)"; fi
-  setup_ssh_key || rc=1
+  setup_ssh_key "$email" || rc=1
   set_default_shell || rc=1
   "$DOTCTL" verify || rc=1
   if [ "$rc" -eq 0 ]; then log "bootstrap OK"; else log "bootstrap finished with errors (rc=$rc); see $LOG"; fi
