@@ -6,13 +6,15 @@ import (
 	"os"
 )
 
+var version = "dev"
+
 func main() {
 	os.Exit(dispatch(os.Args[1:], os.Stdout, os.Stderr))
 }
 
 func dispatch(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig|allowed-signers|verify> [flags]")
+		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig|allowed-signers|verify|version> [flags]")
 		return 2
 	}
 	switch args[0] {
@@ -30,9 +32,12 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return runAllowedSigners(args[1:], stdout, stderr)
 	case "verify":
 		return runVerify(args[1:], stdout, stderr)
+	case "version":
+		fmt.Fprintln(stdout, version)
+		return 0
 	default:
 		fmt.Fprintf(stderr, "dotctl: unknown command %q\n", args[0])
-		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig|allowed-signers|verify> [flags]")
+		fmt.Fprintln(stderr, "usage: dotctl <check|lint|migrate|install|gitconfig|allowed-signers|verify|version> [flags]")
 		return 2
 	}
 }
