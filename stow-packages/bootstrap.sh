@@ -1,104 +1,32 @@
 #!/usr/bin/env bash
-#
-# bootstrap installs things using GNU Stow.
+# bootstrap.sh - slim orchestration entry point for dotfiles.
+# Run from a cloned repo: git clone <repo> && cd dotfiles && ./stow-packages/bootstrap.sh
+# Pure CLI orchestration; all data/logic lives in the dotctl binary.
+set -uo pipefail  # not -e: main accumulates rc and exits non-zero on real failure
 
-cd "$(dirname "$0")/.."
-DOTFILES_ROOT=$(pwd -P)
+# shellcheck disable=SC2034  # consumed by functions defined later in this file
+DOTFILES_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dotctl"
+mkdir -p "$STATE_DIR"
+LOG="$STATE_DIR/bootstrap.log"
+# shellcheck disable=SC2034  # consumed by functions defined later in this file
+USER_NAME="${USER:-$(id -un)}"
 
-set -e
+log() { printf '%s\n' "$*" | tee -a "$LOG" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# Install system dependencies if requested
-if [[ "${1:-}" == "--install-deps" ]]; then
-  "$DOTFILES_ROOT/install.sh"
-fi
-
-echo ''
-
-info () {
-  printf "\r  [ \033[00;34m..\033[0m ] $1\n"
-}
-
-user () {
-  printf "\r  [ \033[0;33m??\033[0m ] $1\n"
-}
-
-success () {
-  printf "\r\033[2K  [ \033[00;32mOK\033[0m ] $1\n"
-}
-
-fail () {
-  printf "\r\033[2K  [\033[0;31mFAIL\033[0m] $1\n"
-  echo ''
-  exit
-}
-
-check_stow () {
-  if ! command -v stow &> /dev/null
-  then
-    local hint="./install.sh or your package manager"
-    case "$(uname -s)" in
-      Darwin) hint="brew install stow" ;;
-      Linux)
-        if command -v pacman &>/dev/null; then
-          hint="sudo pacman -S stow"
-        elif command -v apt-get &>/dev/null; then
-          hint="sudo apt-get install stow"
-        fi
-        ;;
-    esac
-    fail "GNU Stow is not installed. Install it with: $hint"
+# fetch <url> <dest>; FETCH_OVERRIDE is a test-only seam (copies a local file instead of downloading)
+fetch() {
+  if [ -n "${FETCH_OVERRIDE:-}" ]; then cp "$FETCH_OVERRIDE" "$2"; return; fi
+  if have curl; then curl -fsSL "$1" -o "$2"
+  elif have wget; then wget -qO "$2" "$1"
+  else log "FATAL: need curl or wget"; return 1
   fi
 }
 
-setup_gitconfig () {
-  if ! [ -f stow-packages/git/.gitconfig ]
-  then
-    info 'setup gitconfig'
-
-    git_credential='cache'
-    if [ "$(uname -s)" == "Darwin" ]
-    then
-      git_credential='osxkeychain'
-    fi
-
-    user ' - What is your github author name?'
-    read -e git_authorname
-    user ' - What is your github author email?'
-    read -e git_authoremail
-
-    sed -e "s/AUTHORNAME/$git_authorname/g" -e "s/AUTHOREMAIL/$git_authoremail/g" -e "s/GIT_CREDENTIAL_HELPER/$git_credential/g" git/gitconfig.symlink.example > stow-packages/git/.gitconfig
-
-    success 'gitconfig'
-  fi
+main() {
+  log "dotfiles bootstrap starting ($(uname -s) $(uname -m))"
+  # steps wired in later tasks
 }
 
-install_dotfiles () {
-  info 'installing dotfiles with stow'
-
-  cd stow-packages
-  
-  # Stow each package, but skip if it's ignored by git
-  for package in */
-  do
-    package_name=$(basename "$package")
-    
-    # Check if package is ignored by git
-    if git -C .. check-ignore "$package" >/dev/null 2>&1; then
-      info "skipping ignored package: $package_name"
-      continue
-    fi
-    
-    info "stowing $package_name"
-    stow -v -t "$HOME" --ignore="\.DS_Store" "$package_name"
-    success "stowed $package_name"
-  done
-  
-  cd ..
-}
-
-check_stow
-setup_gitconfig
-install_dotfiles
-
-echo ''
-echo '  All installed!'
+main "$@"
