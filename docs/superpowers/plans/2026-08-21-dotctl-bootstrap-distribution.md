@@ -6,7 +6,7 @@
 
 **Architecture:** `bootstrap.sh` is pure bash orchestration, run from a cloned repo (not `curl | bash`): it fetches a pinned `dotctl` release binary (sha256-verified over TLS against a repo-committed checksum), ensures a package manager, then calls `dotctl check/install/gitconfig/allowed-signers add/verify` in a fail-fast, rc-accumulating flow with the bash-native steps interleaved. The script exits non-zero if any step fails. goreleaser cross-compiles static binaries; a tag-triggered workflow publishes them from `main`; a push/PR workflow runs Go tests, `dotctl lint`, shellcheck, and a container e2e matrix that must be green before the release is cut.
 
-**Tech Stack:** bash, GNU stow, ssh-keygen, chsh; Go (small dotctl additions); goreleaser v2 (local >= 2.4) + GitHub Actions; shellcheck; Docker. `dotctl` from Plans 1 and 2 (merged on this branch).
+**Tech Stack:** bash, GNU stow, ssh-keygen, chsh; Go (small dotctl additions); goreleaser v2 (local >= 2.4) + GitHub Actions; shellcheck; Podman (podman reads the Dockerfile as-is; pre-installed on GitHub Actions ubuntu-latest). `dotctl` from Plans 1 and 2 (merged on this branch).
 
 **Spec:** `docs/superpowers/specs/2026-08-21-dotctl-bootstrap-design.md`
 
@@ -252,9 +252,9 @@ RUN chmod +x /repo/dotctl/test/e2e.sh
 CMD ["/repo/dotctl/test/e2e.sh"]
 ```
 
-- [ ] **Step 4: `Makefile`** targets e2e-ubuntu/debian/arch (docker build --build-arg BASE + run).
-- [ ] **Step 5: Run locally** (needs Docker) for all three bases; each prints `E2E OK`. Fix any real package-name resolution failure here (this is the gate for wrong apt/pacman names).
-- [ ] **Step 6: Add CI `e2e` job** (matrix ubuntu:24.04/debian:12/archlinux:latest, `fail-fast: false`, docker build+run) and commit `git add dotctl/test dotctl/.gitignore .github/workflows/ci.yml && git commit -m "test(dotctl): containerized cross-distro end-to-end harness"`
+- [ ] **Step 4: `Makefile`** targets e2e-ubuntu/debian/arch (`podman build --build-arg BASE=... -f Dockerfile <repo>` then `podman run --rm ...`).
+- [ ] **Step 5: Run locally** (needs Podman) for all three bases; each prints `E2E OK`. Fix any real package-name resolution failure here (this is the gate for wrong apt/pacman names).
+- [ ] **Step 6: Add CI `e2e` job** (matrix ubuntu:24.04/debian:12/archlinux:latest, `fail-fast: false`, `podman build` + `podman run` -- podman is pre-installed on ubuntu-latest, no setup step needed) and commit `git add dotctl/test dotctl/.gitignore .github/workflows/ci.yml && git commit -m "test(dotctl): containerized cross-distro end-to-end harness"`
 
 ---
 
