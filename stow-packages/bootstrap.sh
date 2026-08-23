@@ -8,7 +8,6 @@ DOTFILES_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dotctl"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/bootstrap.log"
-# shellcheck disable=SC2034  # consumed by functions defined later in this file
 USER_NAME="${USER:-$(id -un)}"
 
 log() { printf '%s\n' "$*" | tee -a "$LOG" >&2; }
@@ -77,9 +76,76 @@ ensure_pkg_mgr() {
   esac
 }
 
+prompt_email() {
+  if [ -n "${DOTCTL_EMAIL:-}" ]; then printf '%s' "$DOTCTL_EMAIL"; return; fi
+  if [ -t 0 ]; then local e; read -r -p "git email for this machine: " e; printf '%s' "$e"; fi
+  # non-interactive with no DOTCTL_EMAIL: print nothing (caller skips gitconfig)
+}
+
+uses_1password_signing() { grep -q 'op-ssh-sign' "$HOME/.config/git/config.machine" 2>/dev/null; }
+
+print_key_instructions() {
+  log "== Register ~/.ssh/id_ed25519.pub on GitHub in BOTH Authentication and Signing sections: https://github.com/settings/keys"
+  [ -f "$HOME/.ssh/id_ed25519.pub" ] && log "$(cat "$HOME/.ssh/id_ed25519.pub")"
+}
+
+setup_ssh_key() {
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+  if uses_1password_signing; then log "1Password signing detected (config.machine); skipping on-disk key generation"; return 0; fi
+  [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+  "$DOTCTL" allowed-signers add \
+    -file "$DOTFILES_ROOT/stow-packages/git/.config/git/allowed_signers" \
+    -email "$(git config user.email)" -pubkey "$HOME/.ssh/id_ed25519.pub" || true
+  print_key_instructions
+}
+
+stow_all() {
+  local rc=0 p target
+  ( cd "$DOTFILES_ROOT/stow-packages" || return 1
+    for p in */; do
+      p="${p%/}"
+      git -C "$DOTFILES_ROOT" check-ignore "stow-packages/$p" >/dev/null 2>&1 && continue
+      if ! stow -v -t "$HOME" --ignore='\.DS_Store' "$p" 2>/dev/null; then
+        # back up conflicting targets then retry (best-effort)
+        while IFS= read -r target; do
+          [ -e "$HOME/$target" ] && [ ! -L "$HOME/$target" ] && mv "$HOME/$target" "$HOME/$target.pre-dotctl.$$"
+        done < <(stow -n -v -t "$HOME" "$p" 2>&1 | awk '/existing target/{print $NF}')
+        stow -v -t "$HOME" --ignore='\.DS_Store' "$p" || { log "stow conflict: $p"; rc=1; }
+      fi
+    done
+    return $rc )
+}
+
+set_default_shell() {
+  local zsh_path; zsh_path="$(command -v zsh || true)"
+  [ -n "$zsh_path" ] || { log "zsh not found; skipping shell change"; return 0; }
+  case "$(dscl . -read "/Users/$USER_NAME" UserShell 2>/dev/null || getent passwd "$USER_NAME")" in
+    *"$zsh_path"*|*/zsh) log "zsh already default"; return 0 ;;
+  esac
+  if ! grep -qx "$zsh_path" /etc/shells 2>/dev/null; then
+    if [ -w /etc/shells ]; then printf '%s\n' "$zsh_path" >> /etc/shells
+    elif have sudo && sudo -n true 2>/dev/null; then printf '%s\n' "$zsh_path" | sudo tee -a /etc/shells >/dev/null
+    else log "cannot edit /etc/shells non-interactively; run: sudo sh -c 'echo $zsh_path >> /etc/shells' && chsh -s $zsh_path"; return 0; fi
+  fi
+  chsh -s "$zsh_path" 2>/dev/null || log "chsh needs interaction; run: chsh -s $zsh_path"
+}
+
 main() {
+  local rc=0 email
   log "dotfiles bootstrap starting ($(uname -s) $(uname -m))"
-  # steps wired in later tasks
+  ensure_dotctl  || { log "FATAL: could not obtain dotctl"; exit 1; }
+  ensure_pkg_mgr || { log "FATAL: package manager unavailable"; exit 1; }
+  "$DOTCTL" check || { log "FATAL: preflight failed"; exit 1; }
+  "$DOTCTL" install -file "$DOTFILES_ROOT/packages.csv" ${DOTCTL_YES:+--yes} || rc=1
+  stow_all || rc=1
+  email="$(prompt_email)"
+  if [ -n "$email" ]; then "$DOTCTL" gitconfig -email "$email" || rc=1; else log "no email provided; skipping gitconfig (set DOTCTL_EMAIL or run interactively)"; fi
+  setup_ssh_key || rc=1
+  set_default_shell || rc=1
+  "$DOTCTL" verify || rc=1
+  if [ "$rc" -eq 0 ]; then log "bootstrap OK"; else log "bootstrap finished with errors (rc=$rc); see $LOG"; fi
+  log "after registering the key on GitHub: git -C '$DOTFILES_ROOT' remote set-url origin git@github.com:ian-bartholomew/dotfiles.git && '$DOTCTL' verify --remote"
+  exit "$rc"
 }
 
 main "$@"
