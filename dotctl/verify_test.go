@@ -115,3 +115,40 @@ func TestLoginShellPropagatesRunError(t *testing.T) {
 		t.Fatal("expected error when getent fails")
 	}
 }
+
+func TestVerifyLocalSkipStowAndShell(t *testing.T) {
+	r := &fakeRunner{present: map[string]bool{"git": true, "curl": true, "stow": true}}
+	var stdout, stderr bytes.Buffer
+
+	errs := verifyLocal(PlatformMacOS, r, "/nonexistent/dir/packages.csv", splitList("stow,shell"), &stdout, &stderr)
+
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "shell") || strings.Contains(e.Error(), "symlink") {
+			t.Fatalf("errs = %v, want no shell/stow errors when both are skipped", errs)
+		}
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "verify: skipped stow") {
+		t.Fatalf("stdout = %q, want a skipped-stow line", out)
+	}
+	if !strings.Contains(out, "verify: skipped shell") {
+		t.Fatalf("stdout = %q, want a skipped-shell line", out)
+	}
+}
+
+func TestVerifyLocalNoSkipStillRunsShellCheck(t *testing.T) {
+	r := &fakeRunner{present: map[string]bool{"git": true, "curl": true, "stow": true}}
+	var stdout, stderr bytes.Buffer
+
+	errs := verifyLocal(PlatformUbuntu, r, "/nonexistent/dir/packages.csv", splitList(""), &stdout, &stderr)
+
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "login shell lookup failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("errs = %v, want a login shell lookup failure since it is not skipped and the fake getent output is unparsable", errs)
+	}
+}

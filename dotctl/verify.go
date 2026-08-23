@@ -163,11 +163,50 @@ func loadRequiredPlan(plat Platform, file string, stderr io.Writer) []Resolved {
 	return BuildPlan(pkgs, plat, Selection{})
 }
 
+// verifyLocal runs the local (non-remote) verify checks: tool presence, the
+// default shell, stow symlinks, and required-package installation. skip
+// gates the shell, stow, and packages checks off entirely (including their
+// preconditions, e.g. loginShell itself) rather than just their assertions,
+// since loginShell errors when $USER/user lookup is empty on bare containers.
+func verifyLocal(plat Platform, r Runner, file string, skip map[string]bool, stdout, stderr io.Writer) []error {
+	var errs []error
+
+	errs = append(errs, checkTools(r, []string{"git", "curl", "stow"})...)
+
+	if skip["shell"] {
+		fmt.Fprintln(stdout, "verify: skipped shell")
+	} else if sh, err := loginShell(plat, r); err != nil {
+		errs = append(errs, fmt.Errorf("login shell lookup failed: %w", err))
+	} else if err := checkDefaultShell(sh); err != nil {
+		errs = append(errs, err)
+	}
+
+	if skip["stow"] {
+		fmt.Fprintln(stdout, "verify: skipped stow")
+	} else if home, err := os.UserHomeDir(); err != nil {
+		errs = append(errs, fmt.Errorf("cannot determine home dir: %w", err))
+	} else {
+		errs = append(errs, checkSymlinks(isSymlink, []string{
+			filepath.Join(home, ".gitconfig"),
+		})...)
+	}
+
+	if skip["packages"] {
+		fmt.Fprintln(stdout, "verify: skipped packages")
+	} else {
+		plan := loadRequiredPlan(plat, file, stderr)
+		errs = append(errs, checkRequiredInstalled(plat, r, plan)...)
+	}
+
+	return errs
+}
+
 func runVerify(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	remote := fs.Bool("remote", false, "also run GitHub auth and signing checks")
 	file := fs.String("file", "packages.csv", "path to packages.csv")
+	skipFlag := fs.String("skip", "", "comma-separated local checks to skip: stow,shell,packages")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -178,26 +217,9 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	r := ExecRunner{}
-	var errs []error
+	skip := splitList(*skipFlag)
 
-	errs = append(errs, checkTools(r, []string{"git", "curl", "stow"})...)
-
-	if sh, err := loginShell(plat, r); err != nil {
-		errs = append(errs, fmt.Errorf("login shell lookup failed: %w", err))
-	} else if err := checkDefaultShell(sh); err != nil {
-		errs = append(errs, err)
-	}
-
-	if home, err := os.UserHomeDir(); err != nil {
-		errs = append(errs, fmt.Errorf("cannot determine home dir: %w", err))
-	} else {
-		errs = append(errs, checkSymlinks(isSymlink, []string{
-			filepath.Join(home, ".gitconfig"),
-		})...)
-	}
-
-	plan := loadRequiredPlan(plat, *file, stderr)
-	errs = append(errs, checkRequiredInstalled(plat, r, plan)...)
+	errs := verifyLocal(plat, r, *file, skip, stdout, stderr)
 
 	if *remote {
 		errs = append(errs, verifyRemote(r, stdout)...)
