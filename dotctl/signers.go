@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -65,6 +66,10 @@ func runAllowedSigners(args []string, stdout, stderr io.Writer) int {
 	if !changed {
 		fmt.Fprintln(stdout, "allowed-signers: already present")
 		return 0
+	}
+	if err := os.MkdirAll(filepath.Dir(*file), 0o755); err != nil {
+		fmt.Fprintf(stderr, "dotctl allowed-signers add: %v\n", err)
+		return 1
 	}
 	if err := os.WriteFile(*file, []byte(strings.Join(updated, "\n")+"\n"), 0o644); err != nil {
 		fmt.Fprintf(stderr, "dotctl allowed-signers add: %v\n", err)

@@ -102,6 +102,7 @@ setup_ssh_key() {
     log "no email available; skipping allowed-signers registration"
   fi
   print_key_instructions
+  return 0
 }
 
 stow_all() {
