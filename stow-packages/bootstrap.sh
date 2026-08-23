@@ -56,6 +56,27 @@ ensure_dotctl() {
   log "installed dotctl $version to $DOTCTL"
 }
 
+ensure_pkg_mgr() {
+  case "$(uname -s)" in
+    Darwin)
+      have brew && return 0
+      log "installing Homebrew (non-interactive)"
+      local installer; installer="$(mktemp)"
+      fetch "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh" "$installer" \
+        || { log "FATAL: could not download Homebrew installer"; return 1; }
+      NONINTERACTIVE=1 /bin/bash "$installer" || { log "FATAL: Homebrew install failed"; return 1; }
+      local brew_bin=/opt/homebrew/bin/brew; [ -x "$brew_bin" ] || brew_bin=/usr/local/bin/brew
+      [ -x "$brew_bin" ] && eval "$("$brew_bin" shellenv)"
+      have brew || { log "FATAL: brew not on PATH after install"; return 1; }
+      ;;
+    Linux)
+      if have pacman && ! have yay; then
+        log "warning: yay not found; AUR packages will be skipped (required set is official pacman)"
+      fi
+      ;;
+  esac
+}
+
 main() {
   log "dotfiles bootstrap starting ($(uname -s) $(uname -m))"
   # steps wired in later tasks
