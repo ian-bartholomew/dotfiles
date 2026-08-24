@@ -48,7 +48,7 @@ ensure_dotctl() {
   want="$(awk -v a="$asset" '$2==a{print $1}' "$DOTFILES_ROOT/dotctl/checksums/$version.txt")"
   if have sha256sum; then got="$(sha256sum "$tmp/dotctl" | awk '{print $1}')"
   else got="$(shasum -a 256 "$tmp/dotctl" | awk '{print $1}')"; fi
-  [ -n "$want" ] && [ "$want" = "$got" ] || { log "FATAL: checksum mismatch for $asset"; return 1; }
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then log "FATAL: checksum mismatch for $asset"; return 1; fi
   xattr -d com.apple.quarantine "$tmp/dotctl" 2>/dev/null || true
   chmod +x "$tmp/dotctl"; mv "$tmp/dotctl" "$DOTCTL"
   case ":$PATH:" in *":$BIN_DIR:"*) ;; *) export PATH="$BIN_DIR:$PATH" ;; esac
