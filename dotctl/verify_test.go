@@ -116,6 +116,24 @@ func TestLoginShellPropagatesRunError(t *testing.T) {
 	}
 }
 
+// Regression: $USER is unset in containers/cron/non-login su. loginShell must
+// fall back to the passwd DB via uid instead of erroring. Before the fix this
+// returned "cannot determine current user".
+func TestLoginShellFallsBackWhenUSERUnset(t *testing.T) {
+	t.Setenv("USER", "")
+	t.Setenv("LOGNAME", "")
+	r := &fakeRunner{outputs: map[string]string{
+		"getent": "root:x:0:0::/root:/usr/bin/zsh\n",
+	}}
+	got, err := loginShell(PlatformUbuntu, r)
+	if err != nil {
+		t.Fatalf("loginShell should fall back to os/user.Current() when $USER is empty, got error: %v", err)
+	}
+	if got != "/usr/bin/zsh" {
+		t.Fatalf("loginShell = %q, want /usr/bin/zsh", got)
+	}
+}
+
 func TestVerifyLocalSkipStowAndShell(t *testing.T) {
 	r := &fakeRunner{present: map[string]bool{"git": true, "curl": true, "stow": true}}
 	var stdout, stderr bytes.Buffer

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strings"
 )
@@ -70,12 +71,28 @@ func isSymlink(path string) bool {
 	return err == nil && fi.Mode()&os.ModeSymlink != 0
 }
 
+// currentUsername resolves the login user without trusting $USER alone, which
+// is unset in containers, cron, and non-login su. Mirrors bootstrap.sh's
+// ${USER:-$(id -un)}: env first (so tests can pin it), then the passwd DB via uid.
+func currentUsername() string {
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	if u := os.Getenv("LOGNAME"); u != "" {
+		return u
+	}
+	if u, err := osuser.Current(); err == nil {
+		return u.Username
+	}
+	return ""
+}
+
 // loginShell reports the user's configured login shell (not $SHELL, which
 // reflects the running shell and may already be zsh from a temporary sub-shell).
 func loginShell(plat Platform, r Runner) (string, error) {
-	user := os.Getenv("USER")
+	user := currentUsername()
 	if user == "" {
-		return "", fmt.Errorf("cannot determine current user: $USER is empty")
+		return "", fmt.Errorf("cannot determine current user")
 	}
 
 	if plat == PlatformMacOS {
@@ -166,8 +183,8 @@ func loadRequiredPlan(plat Platform, file string, stderr io.Writer) []Resolved {
 // verifyLocal runs the local (non-remote) verify checks: tool presence, the
 // default shell, stow symlinks, and required-package installation. skip
 // gates the shell, stow, and packages checks off entirely (including their
-// preconditions, e.g. loginShell itself) rather than just their assertions,
-// since loginShell errors when $USER/user lookup is empty on bare containers.
+// preconditions) rather than just their assertions, so a caller can verify a
+// subset (e.g. the CI e2e skips the shell/stow/packages it does not set up).
 func verifyLocal(plat Platform, r Runner, file string, skip map[string]bool, stdout, stderr io.Writer) []error {
 	var errs []error
 
