@@ -16,6 +16,7 @@ system | yes | btop | btop | btop |
 system | yes | tree | tree | tree |
 system | yes | stow | stow | stow |
 system | yes | less | less | less |
+system | yes | - | openssh | openssh-client | ssh-keygen for on-disk signing key (macOS ships it)
 #
 # Shell and terminal
 shell | yes | zsh | zsh | zsh |
