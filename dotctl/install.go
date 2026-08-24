@@ -63,7 +63,6 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	all := fs.Bool("all", false, "install every category")
 	cats := fs.String("categories", "", "comma-separated categories to add")
 	pkgsFlag := fs.String("packages", "", "comma-separated individual packages to add")
-	_ = fs.Bool("yes", false, "non-interactive; required set plus any --categories/--packages/--all")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
