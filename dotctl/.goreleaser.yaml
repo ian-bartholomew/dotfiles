@@ -1,0 +1,17 @@
+version: 2
+project_name: dotctl
+builds:
+  - main: .
+    binary: dotctl
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w -X main.version={{ .Tag }}"]
+    hooks:
+      post:
+        - cmd: sh -c 'case "{{ .Os }}" in darwin) codesign -s - "{{ .Path }}" ;; esac'
+archives:
+  - formats: [binary]
+    name_template: "dotctl_{{ .Os }}_{{ .Arch }}"
+checksum:
+  name_template: "checksums.txt"

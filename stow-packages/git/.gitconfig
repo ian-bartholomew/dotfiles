@@ -1,98 +1,61 @@
-# Sample gitconfig
-#
+# Committed base gitconfig (stowed to ~/.gitconfig). Uniform across machines.
+# Per-machine values live in the gitignored includes at the end:
+#   ~/.config/git/config.local   (dotctl-generated: email, credential.helper)
+#   ~/.config/git/config.machine (hand-maintained: e.g. 1Password op-ssh-sign)
 
 [hub]
-        protocol = https
+	protocol = https
 [user]
 	name = Ian Bartholomew
-	email = ian.bartholomew@betfanatics.com
-;	signingkey = 387AAFDDD84741AC
-  signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKWX9s/d4lN6z0w85HvUFSLesri72mA99ua/etjOx2Cc ian.bartholomew@FBG-K919PM6F64
-[credential]
-        helper = osxkeychain
+	signingkey = ~/.ssh/id_ed25519.pub
 [alias]
-        co = checkout
-        ci = commit
-        promote = !$ZSH/bin/git-promote
-        wtf     = !$ZSH/bin/git-wtf
-        rank-contributors = !$ZSH/bin/git-rank-contributors
-        count   = !git shortlog -sn
-        gone = "!f() { git fetch --all --prune; git branch -vv | awk '/: gone]/{print $1}' | xargs git branch -D; }; f"
-        lg = !git log --pretty=format:\"%C(magenta)%h%Creset -%C(red)%d%Creset %s %C(dim green)(%cr) [%an]\" --abbrev-commit -30
-        undo = reset HEAD~1 --mixed
-        ll = log --oneline
-        se = !git rev-list --all | xargs git grep -F
-        save = !git add -A && git commit -m 'chore: commit save point'
+	co = checkout
+	ci = commit
+	promote = !$ZSH/bin/git-promote
+	wtf = !$ZSH/bin/git-wtf
+	rank-contributors = !$ZSH/bin/git-rank-contributors
+	count = !git shortlog -sn
+	gone = "!f() { git fetch --all --prune; git branch -vv | awk '/: gone]/{print $1}' | xargs git branch -D; }; f"
+	lg = !git log --pretty=format:\"%C(magenta)%h%Creset -%C(red)%d%Creset %s %C(dim green)(%cr) [%an]\" --abbrev-commit -30
+	undo = reset HEAD~1 --mixed
+	ll = log --oneline
+	se = !git rev-list --all | xargs git grep -F
+	save = !git add -A && git commit -m 'chore: commit save point'
 [color]
-        diff = auto
-        status = auto
-        branch = auto
-        ui = true
+	diff = auto
+	status = auto
+	branch = auto
+	ui = true
 [core]
-        excludesfile = ~/.gitignore
-	      editor = nvim
-
+	excludesfile = ~/.gitignore
+	editor = nvim
 [apply]
-        whitespace = nowarn
-
+	whitespace = nowarn
 [help]
-        autocorrect = 1
-
+	autocorrect = 1
 [push]
-        # See `git help config` (search for push.default)
-        # for more information on different options of the below setting.
-        #
-        # Setting to git 2.0 default to suppress warning message
-        default = simple
+	default = simple
 [commit]
 	gpgsign = true
-
 [tag]
-  gpgSign = true
-
+	gpgSign = true
 [init]
-	templateDir = /Users/ibartholomew/.git-template
 	defaultBranch = main
-
-
-# [diff]
-#         external = difft
 [difftool]
-        prompt = false
+	prompt = false
 [merge]
-	tool = kdiff3
-; [diff]
-;     tool = nvimdiff
-; [difftool]
-;     prompt = false
-; [difftool "nvimdiff"]
-;     cmd = "nvim -d \"$LOCAL\" \"$REMOTE\""
-; [merge]
-;     tool = nvimdiff
-; [mergetool]
-;     prompt = true
-; [mergetool "nvimdiff"]
-;     cmd = "nvim -d \"$LOCAL\" \"$MERGED\" \"$BASE\" \"$REMOTE\" -c 'wincmd w' -c 'wincmd J'"
-; [mergetool]
-;     prompt = true
-;     keepBackup = false
-;     path = nvim
-
+	tool = nvimdiff
+[mergetool]
+	prompt = true
+[mergetool "nvimdiff"]
+	cmd = "nvim -d \"$LOCAL\" \"$MERGED\" \"$BASE\" \"$REMOTE\" -c 'wincmd w' -c 'wincmd J'"
 [pull]
 	rebase = false
-; [url "https://gitlab.com/"]
-; 	insteadOf = git@gitlab.com:
-[http]
-	sslVerify = false
 [gpg]
-  ; program = gpg
-  format = ssh 
+	format = ssh
 [gpg "ssh"]
-  program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
-	allowedSignersFile = /Users/ian.bartholomew/.config/git/allowed_signers
-[credential "https://github.com"]
-	helper = 
-	helper = !/opt/homebrew/bin/gh auth git-credential
-[credential "https://gist.github.com"]
-	helper = 
-	helper = !/opt/homebrew/bin/gh auth git-credential
+	allowedSignersFile = ~/.config/git/allowed_signers
+[include]
+	path = ~/.config/git/config.local
+[include]
+	path = ~/.config/git/config.machine
