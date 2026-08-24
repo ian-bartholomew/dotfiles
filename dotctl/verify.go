@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	osuser "os/user"
 	"path/filepath"
 	"strings"
@@ -128,12 +130,11 @@ func parseDsclUserShell(out string) (string, error) {
 	return strings.TrimSpace(shell), nil
 }
 
-// verifyRemote runs the GitHub-dependent checks gated behind -remote. The ssh
-// check never fails fast on a non-zero exit: `ssh -T git@github.com` always
-// exits 1 on a successful auth, so success is read from the banner text
-// (which lands on stderr, hence RunOut using CombinedOutput). The signing
-// check verifies HEAD's existing signature read-only; it must never create a
-// new signature, so it uses `git verify-commit`, never `git commit -S`.
+// verifyRemote runs the checks gated behind -remote: GitHub ssh auth and
+// commit signing. The ssh check never fails fast on a non-zero exit:
+// `ssh -T git@github.com` always exits 1 on a successful auth, so success is
+// read from the banner text (which lands on stderr, hence RunOut using
+// CombinedOutput).
 func verifyRemote(r Runner, stdout io.Writer) []error {
 	var errs []error
 
@@ -146,19 +147,187 @@ func verifyRemote(r Runner, stdout io.Writer) []error {
 		errs = append(errs, fmt.Errorf("github ssh auth check failed: %s", msg))
 	}
 
-	if _, err := r.RunOut("git", "rev-parse", "--verify", "HEAD"); err != nil {
-		fmt.Fprintln(stdout, "verify: no signed HEAD to verify (no commits or not a git repository)")
-	} else if out, err := r.RunOut("git", "verify-commit", "HEAD"); err != nil {
-		// git verify-commit checks that HEAD is signed by a trusted key; it
-		// does not confirm this machine can itself produce a new signature.
-		msg := strings.TrimSpace(out)
-		if msg == "" {
-			msg = err.Error()
+	return append(errs, checkSigning(r, stdout)...)
+}
+
+// gitConfigValue reads a single git config key. An unset key (git config
+// --get exits 1) returns ("", nil); any other failure (git absent, dubious
+// ownership, unparseable config) returns a non-nil error so a broken machine
+// cannot masquerade as one that simply has the key unset. It reads stdout
+// only, so a git warning on stderr never contaminates the value.
+func gitConfigValue(r Runner, key string) (string, error) {
+	out, err := r.RunOutStdout("git", "config", "--get", key)
+	if err == nil {
+		return strings.TrimSpace(out), nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return "", nil // key unset
+	}
+	return "", fmt.Errorf("reading git config %s: %w", key, err)
+}
+
+// expandHome resolves a leading ~ the way git does for path-valued config.
+// Values reach us verbatim from `git config --get`, so ~/.ssh/id_ed25519.pub
+// would otherwise be passed to ssh-keygen as a literal relative path.
+func expandHome(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(home, strings.TrimPrefix(p, "~"))
+}
+
+// isInlineKey reports whether a user.signingkey value is literal key material
+// rather than a path. Git accepts both; 1Password's documented setup uses the
+// inline form.
+func isInlineKey(s string) bool {
+	for _, p := range []string{"ssh-", "ecdsa-", "sk-ssh-", "sk-ecdsa-"} {
+		if strings.HasPrefix(s, p) {
+			return true
 		}
-		errs = append(errs, fmt.Errorf("signature verify failed for HEAD: %s", msg))
+	}
+	return false
+}
+
+// resolveSigningKey turns a user.signingkey value into a filesystem path for
+// `ssh-keygen -f`. A path is expanded; inline key material (a bare "ssh-ed25519
+// AAAA..." or an explicit "key::"-prefixed value, as 1Password configures) is
+// written to a file inside dir, mirroring what git itself does before invoking
+// the signer.
+func resolveSigningKey(raw, dir string) (string, error) {
+	lit, hadPrefix := strings.CutPrefix(raw, "key::")
+	if !hadPrefix && !isInlineKey(raw) {
+		return expandHome(raw), nil
+	}
+	path := filepath.Join(dir, "signingkey.pub")
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(lit)+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// principalTrusted reports whether email appears as a principal in the output
+// of `ssh-keygen -Y find-principals` (one principal per line).
+func principalTrusted(findPrincipalsOut, email string) bool {
+	for _, line := range strings.Split(findPrincipalsOut, "\n") {
+		if strings.TrimSpace(line) == email {
+			return true
+		}
+	}
+	return false
+}
+
+// checkSigning confirms this machine can produce a git signature with its
+// configured key, and that the resulting signature is trusted by the
+// configured allowed_signers file for the machine's committing identity.
+//
+// It deliberately does not inspect HEAD. On a repo whose commits land via
+// GitHub squash-merge, HEAD is committed by GitHub and signed with GitHub's
+// own GPG key, so `git verify-commit HEAD` only asks whether GitHub's public
+// key sits in the local GPG keyring: unrelated to this machine's signing
+// setup, and false on every freshly bootstrapped box.
+//
+// Signing happens over a throwaway file in a fresh temp dir. Git history is
+// never touched and no commit is ever created. The temp dir must be fresh:
+// `ssh-keygen -Y sign` prompts interactively rather than clobbering an
+// existing <file>.sig, which would hang a non-interactive bootstrap.
+func checkSigning(r Runner, stdout io.Writer) []error {
+	format, err := gitConfigValue(r, "gpg.format")
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+	switch format {
+	case "ssh":
+		// proceed
+	case "":
+		// The committed .gitconfig always sets gpg.format=ssh, so an empty
+		// value means it is not in effect (e.g. stow has not linked
+		// ~/.gitconfig yet) rather than a machine that opted out of signing.
+		return []error{fmt.Errorf("signing check failed: gpg.format is unset (expected ssh); is ~/.gitconfig linked?")}
+	default:
+		fmt.Fprintf(stdout, "verify: skipped signing (gpg.format=%s; this check covers ssh signing only)\n", format)
+		return nil
 	}
 
-	return errs
+	rawKey, err := gitConfigValue(r, "user.signingkey")
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+	if rawKey == "" {
+		return []error{fmt.Errorf("signing check failed: user.signingkey is unset")}
+	}
+	rawSigners, err := gitConfigValue(r, "gpg.ssh.allowedSignersFile")
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+	if rawSigners == "" {
+		return []error{fmt.Errorf("signing check failed: gpg.ssh.allowedSignersFile is unset")}
+	}
+	signers := expandHome(rawSigners)
+	email, err := gitConfigValue(r, "user.email")
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+
+	// gpg.ssh.program is the configured signer when set (1Password's
+	// op-ssh-sign is a drop-in for `ssh-keygen -Y sign`, and on those machines
+	// no private key exists on disk for ssh-keygen to find). Verification is
+	// always ssh-keygen: op-ssh-sign only signs.
+	signer, err := gitConfigValue(r, "gpg.ssh.program")
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+	if signer == "" {
+		signer = "ssh-keygen"
+	}
+
+	dir, err := os.MkdirTemp("", "dotctl-signing-")
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+	defer os.RemoveAll(dir)
+
+	key, err := resolveSigningKey(rawKey, dir)
+	if err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+
+	probe := filepath.Join(dir, "probe")
+	if err := os.WriteFile(probe, []byte("dotctl signing probe\n"), 0o600); err != nil {
+		return []error{fmt.Errorf("signing check failed: %w", err)}
+	}
+
+	if out, err := r.RunOut(signer, "-Y", "sign", "-f", key, "-n", "git", probe); err != nil {
+		return []error{fmt.Errorf("cannot sign with %s via %s: %s", rawKey, signer, runMsg(out, err))}
+	}
+	// find-principals resolves the signature's public key against
+	// allowed_signers. Paired with the sign step above it establishes both
+	// properties bootstrap needs, and unlike `-Y verify` it takes the signed
+	// data as a file rather than on stdin, which Runner does not plumb.
+	out, err := r.RunOut("ssh-keygen", "-Y", "find-principals", "-s", probe+".sig", "-f", signers)
+	if err != nil {
+		return []error{fmt.Errorf("signing key %s is not trusted by %s: %s", rawKey, signers, runMsg(out, err))}
+	}
+	// find-principals matching the key is not enough: the key must be trusted
+	// for the email this machine commits under, or real commits verify as
+	// "No principal matched" despite the key being present under another email.
+	if email != "" && !principalTrusted(out, email) {
+		return []error{fmt.Errorf("signing key %s is in %s but not for committing identity %s; add an entry for that email", rawKey, signers, email)}
+	}
+
+	return nil
+}
+
+// runMsg prefers a failed command's own output over Go's generic exit error.
+func runMsg(out string, err error) string {
+	if msg := strings.TrimSpace(out); msg != "" {
+		return msg
+	}
+	return err.Error()
 }
 
 // loadRequiredPlan reads and parses file to build the required-package plan.

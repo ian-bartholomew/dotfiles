@@ -16,6 +16,14 @@ type fakeRunner struct {
 	// with different args expecting different results (e.g. per-package
 	// install checks).
 	failArgs map[string]bool
+	// outArgs supplies RunOut output keyed by the full command line, for
+	// callers that invoke one command name with different args expecting
+	// different results (e.g. several `git config --get <key>` reads).
+	outArgs map[string]string
+	// failPrefix injects a RunOut error for any command line starting with
+	// the key, for callers whose args include a value the test cannot predict
+	// (e.g. a path under a fresh temp dir).
+	failPrefix map[string]bool
 }
 
 func (f *fakeRunner) Run(name string, args ...string) error {
@@ -32,10 +40,25 @@ func (f *fakeRunner) RunOut(name string, args ...string) (string, error) {
 	if f.failCmds != nil && f.failCmds[name] {
 		return "", fmt.Errorf("mock failure: %s", name)
 	}
-	if f.failArgs != nil && f.failArgs[strings.Join(append([]string{name}, args...), " ")] {
+	line := strings.Join(append([]string{name}, args...), " ")
+	if f.failArgs != nil && f.failArgs[line] {
 		return "", fmt.Errorf("mock failure: %s %s", name, strings.Join(args, " "))
 	}
+	for prefix := range f.failPrefix {
+		if strings.HasPrefix(line, prefix) {
+			return "", fmt.Errorf("mock failure: %s", line)
+		}
+	}
+	if out, ok := f.outArgs[line]; ok {
+		return out, nil
+	}
 	return f.outputs[name], nil
+}
+
+// RunOutStdout mirrors RunOut for the fake: the combined-vs-stdout distinction
+// is an ExecRunner concern (see runner_test.go), irrelevant to the maps here.
+func (f *fakeRunner) RunOutStdout(name string, args ...string) (string, error) {
+	return f.RunOut(name, args...)
 }
 
 func TestCheckMissingTools(t *testing.T) {
