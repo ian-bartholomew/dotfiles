@@ -144,7 +144,7 @@ main() {
   ensure_dotctl  || { log "FATAL: could not obtain dotctl"; exit 1; }
   ensure_pkg_mgr || { log "FATAL: package manager unavailable"; exit 1; }
   "$DOTCTL" check || { log "FATAL: preflight failed"; exit 1; }
-  "$DOTCTL" install -file "$DOTFILES_ROOT/packages.csv" ${DOTCTL_YES:+--yes} || rc=1
+  "$DOTCTL" install -file "$DOTFILES_ROOT/packages.csv" || rc=1
   stow_all || rc=1
   email="$(prompt_email)"
   if [ -n "$email" ]; then "$DOTCTL" gitconfig -email "$email" || rc=1; else log "no email provided; skipping gitconfig (set DOTCTL_EMAIL or run interactively)"; fi

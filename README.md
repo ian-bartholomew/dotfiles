@@ -24,12 +24,12 @@ stow-packages/bootstrap.sh
 
 Each directory in `stow-packages/` represents a configuration package:
 
-- **git**: Git configuration (.gitconfig, .gitignore)
+- **git**: Git configuration (layered .gitconfig, .gitignore, allowed_signers)
 - **zsh**: Shell configuration (.zshrc) and modular zsh files
 - **vim**: Legacy Vim configuration (.vimrc and .vim directory)
 - **nvim**: Neovim configuration (in .config/nvim/)
 - **tmux**: Terminal multiplexer configuration (.tmux.conf)
-- **asdf**: Version manager configuration (.tool-versions)
+- **ssh**: SSH client configuration (.ssh/config)
 - **atuin**: Shell history manager configuration
 - **claude**: Claude Code user config (CLAUDE.md and skills/)
 
@@ -71,7 +71,7 @@ System dependencies are defined in `packages.csv`, a single shared list with per
 - **Arch Linux**: `pacman` (with `yay` for AUR packages)
 - **Ubuntu/Debian**: `apt-get`
 
-Required packages install automatically; you are prompted for any additional optional categories.
+Required packages install automatically. To add optional categories or individual packages, run `dotctl install` with `--categories`, `--packages`, or `--all`.
 
 ## Requirements
 
@@ -100,7 +100,7 @@ Everything else (including the package manager on macOS) is handled by `bootstra
 ## Customization
 
 - **Local configurations**: Create `~/.localrc` for environment variables and local settings
-- **Git configuration**: The bootstrap script will prompt for your Git author name and email
+- **Git configuration**: The bootstrap script prompts for your Git email; name and shared settings live in the committed base config, per-machine overrides in `~/.config/git/config.machine`
 - **Zsh plugins**: Managed through zgen, automatically installed on first shell startup
 
 ## Key Features
