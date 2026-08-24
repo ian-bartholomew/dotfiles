@@ -13,14 +13,9 @@ This repository contains configuration files for various development tools and a
 git clone https://github.com/ian-bartholomew/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles
 
-# Install system dependencies (detects your platform automatically)
-./install.sh
-
-# Install all dotfile packages
+# Bootstrap everything: fetches the dotctl helper, installs dependencies,
+# stows all packages, configures git, and switches your shell to zsh
 stow-packages/bootstrap.sh
-
-# Or do both in one step
-stow-packages/bootstrap.sh --install-deps
 ```
 
 ## Structure
@@ -70,18 +65,20 @@ Remove all packages:
 
 ### Dependencies
 
-System dependencies are defined in `packages.csv` — a single shared list with per-platform package names. Run `./install.sh` to install them for your platform:
+System dependencies are defined in `packages.csv`, a single shared list with per-platform package names. `bootstrap.sh` fetches a pinned, checksum-verified `dotctl` helper that installs them for your platform:
 
-- **macOS**: Generates a Brewfile and runs `brew bundle` (installs Homebrew if needed)
-- **Arch Linux**: Installs via `pacman` and `yay` (installs yay if needed)
-- **Ubuntu/Debian**: Installs via `apt-get`
+- **macOS**: `brew` (installs Homebrew if needed)
+- **Arch Linux**: `pacman` (with `yay` for AUR packages)
+- **Ubuntu/Debian**: `apt-get`
+
+Required packages install automatically; you are prompted for any additional optional categories.
 
 ## Requirements
 
 - macOS, Arch Linux, or Ubuntu/Debian
 - `git` and `bash`
 
-Everything else (including the package manager on macOS) is handled by `install.sh`.
+Everything else (including the package manager on macOS) is handled by `bootstrap.sh`.
 
 ## Installation
 
@@ -92,17 +89,13 @@ Everything else (including the package manager on macOS) is handled by `install.
    cd ~/.dotfiles
    ```
 
-2. **Install system dependencies**:
-
-   ```sh
-   ./install.sh
-   ```
-
-3. **Install configurations**:
+2. **Run the bootstrap**:
 
    ```sh
    stow-packages/bootstrap.sh
    ```
+
+   This fetches the `dotctl` helper, installs dependencies from `packages.csv`, stows all packages, configures git (prompting for your email), and switches your default shell to zsh.
 
 ## Customization
 
