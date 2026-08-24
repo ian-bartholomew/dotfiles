@@ -95,12 +95,12 @@ Everything else (including the package manager on macOS) is handled by `bootstra
    stow-packages/bootstrap.sh
    ```
 
-   This fetches the `dotctl` helper, installs dependencies from `packages.csv`, stows all packages, configures git (prompting for your email), and switches your default shell to zsh.
+   This fetches the `dotctl` helper, installs dependencies from `packages.csv`, stows all packages, configures git (prompting for your email on first run, or reusing the value already in `config.local`), and switches your default shell to zsh.
 
 ## Customization
 
 - **Local configurations**: Create `~/.localrc` for environment variables and local settings
-- **Git configuration**: The bootstrap script prompts for your Git email; name and shared settings live in the committed base config, per-machine overrides in `~/.config/git/config.machine`
+- **Git configuration**: On first run the bootstrap script prompts for your Git email (or reads `$DOTCTL_EMAIL`); on later runs it reuses the email already in `~/.config/git/config.local` without asking. Name and shared settings live in the committed base config, per-machine overrides in `~/.config/git/config.machine`
 - **Zsh plugins**: Managed through zgen, automatically installed on first shell startup
 
 ## Key Features
