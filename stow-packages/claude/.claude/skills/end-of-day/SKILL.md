@@ -1,18 +1,31 @@
 ---
 name: end-of-day
-description: This skill should be used when the user asks to "end of day", "EOD", "run end of day", "wrap up the day", or runs "/end-of-day". Captures the day's Zoom + Slack signal into the wiki (with FES support learnings published to Confluence), reviews meeting action items into Todoist, audits project log.md files for today's entries, runs a verify-status snapshot, and synthesizes today's daily-note EOD section. Friday adds a weekly retrospective.
-version: 0.4.0
+description: This skill should be used when the user asks to "end of day", "EOD", "run end of day", "wrap up the day", or runs "/end-of-day". Captures the day's Zoom + Slack signal into the wiki, reviews meeting action items into Todoist, audits project log.md files for today's entries, runs a verify-status snapshot, and synthesizes today's daily-note EOD section. Friday adds a weekly retrospective.
+version: 0.5.0
 argument-hint: "[--unattended]"
-allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, AskUserQuestion, Skill, Agent, TaskStop, PushNotification]
+allowed-tools:
+  [
+    Read,
+    Write,
+    Edit,
+    Bash,
+    Grep,
+    Glob,
+    AskUserQuestion,
+    Skill,
+    Agent,
+    TaskStop,
+    PushNotification,
+  ]
 ---
 
 # End-of-Day Skill
 
-Run the full end-of-day pipeline: pull the day's meetings, extract Slack learnings (FES support to Confluence, support + internal channels to `raw/`), review meeting action items into Todoist, audit project logs for today's work, compile everything into the wiki, run a verify-status snapshot, and synthesize today's daily-note EOD section.
+Run the full end-of-day pipeline: pull the day's meetings, extract Slack learnings (support + internal channels to `raw/`), review meeting action items into Todoist, audit project logs for today's work, compile everything into the wiki, run a verify-status snapshot, and synthesize today's daily-note EOD section.
 
 ## Purpose
 
-Provide a single command that runs the complete daily wrap-up workflow with interactive gates at every step. Chains together meeting ingestion, three Slack-learning extractions, meeting action item review, a project-log audit (enforcing the CLAUDE.md rule that any project work must produce a `log.md` entry), the full compile pipeline, a read-only verify-status snapshot, and finally a daily-note synthesis pass — so the user doesn't have to remember to run each one manually at end of day.
+Provide a single command that runs the complete daily wrap-up workflow with interactive gates at every step. Chains together meeting ingestion, two Slack-learning extractions, meeting action item review, a project-log audit (enforcing the CLAUDE.md rule that any project work must produce a `log.md` entry), the full compile pipeline, a read-only verify-status snapshot, and finally a daily-note synthesis pass — so the user doesn't have to remember to run each one manually at end of day.
 
 ## When to Use
 
@@ -25,7 +38,6 @@ Invoke this skill when:
 ## When NOT to Use
 
 - If the user only wants to pull meetings: use `/lyt-assistant:meeting-ingest`
-- If the user only wants FES support learnings to Confluence: use `/fes-support-learnings:fes-support-learnings`
 - If the user only wants the support channel into `raw/`: use `/lyt-assistant:support-learnings`
 - If the user only wants the internal channel into `raw/`: use `/lyt-assistant:internal-channel-learnings`
 - If the user only wants to review meeting action items into Todoist: use `/lyt-assistant:meeting-action-items`
@@ -48,9 +60,9 @@ listed here. If the `--unattended` token is absent, ignore this entire section.
   ([c]/[r]/[h]) and quit ([q]) prompt in the Error Handling section
   resolves automatically to Continue: log the failure and proceed best-effort.
   The sole exception is Step 0 pre-flight, which still halts.
-- **External/published writes are draft/dry-run only** (see Step 2). The local
-  daily note (Step 9) is the one surface auto-written, because it is local,
-  reversible, and idempotently upserted.
+- **All writes are local and reversible.** The daily note (Step 8) is
+  idempotently upserted; `raw/` (Steps 2, 3) and the wiki compile (Step 6) are
+  local and reviewable. No step publishes to an external service.
 - **End every run with a notification** (Observability, below).
 
 ### Concurrency lock (first action, unattended)
@@ -84,19 +96,13 @@ behavior, not an error.
 
 - **Step 0 (pre-flight):** unchanged; still HALTS on failure. On halt, send the
   failure notification and release the lock before exiting.
-- **Step 2 (FES support -> Confluence):** the background subagent must run
-  **draft/hold only** -- do NOT publish a live Confluence page. Instruct it: if
-  the fes-support-learnings skill supports draft pages, publish as DRAFT;
-  otherwise write the would-be page content to
-  `raw/support_learnings/_pending_confluence/<date>.md` and report it as
-  deferred. Live Confluence publish is for interactive runs.
-- **Steps 3, 4 (support / internal -> raw/):** run non-interactively using the
-  exact auto-default convention Step 2 already documents (classification ->
-  `knowledge`, resolution -> `unresolved`, domain -> keyword-map else
-  `general`, duplicate -> `skip`, any other -> the skip/no-action option).
-  Record every auto-default for the report. (These write to local `raw/`, which
-  is reviewable and compiled later, so auto-defaulting is acceptable.)
-- **Step 5 (meeting action items):** run inline, no interactive prompts:
+- **Steps 2, 3 (support / internal -> raw/):** run non-interactively with these
+  auto-defaults: classification -> `knowledge`, resolution -> `unresolved`,
+  domain -> keyword-map else `general`, duplicate -> `skip`, any other prompt ->
+  the skip/no-action option. Record every auto-default for the report. (These
+  write to local `raw/`, which is reviewable and compiled later, so
+  auto-defaulting is acceptable.)
+- **Step 4 (meeting action items):** run inline, no interactive prompts:
   1. `python3 <skill-dir>/meeting_action_items.py list` -> candidates with
      suggested title/due/priority.
   2. `td task list --project Work --all --json` -> existing open todos.
@@ -111,22 +117,22 @@ behavior, not an error.
      script independently dedups each `todo` against the live Work project and
      returns `duplicate` (non-terminal) for any it catches -- this is the
      deterministic backstop beneath the semantic pass.
-  Report created vs `skip` (semantic dupe) vs `duplicate` (script backstop);
-  never silently drop. (`<skill-dir>` is the meeting-action-items skill dir
-  announced when that skill loads.)
-- **Step 6 (project-log gate):** run the audit (detection) ONLY. Do NOT
+     Report created vs `skip` (semantic dupe) vs `duplicate` (script backstop);
+     never silently drop. (`<skill-dir>` is the meeting-action-items skill dir
+     announced when that skill loads.)
+- **Step 5 (project-log gate):** run the audit (detection) ONLY. Do NOT
   auto-write `log.md` entries. Record each gap in the report and add it to the
-  Step 9 daily-note Follow-ups for the next interactive session.
-- **Step 7 (compile):** run non-interactively. (If the compile sub-skill exposes
+  Step 8 daily-note Follow-ups for the next interactive session.
+- **Step 6 (compile):** run non-interactively. (If the compile sub-skill exposes
   any prompt, take its default.)
 - **Step 8.7 (alert-noise weekly):** local writes (report notes + a log line) are
   allowed unattended. Run non-interactively and catch-up; skip the skill's
   wiki-synthesis step. `pending` returning nothing is `nothing-to-do`, not a failure.
-- **Step 9 (daily-note synthesis):** auto-approve and write the drafted section.
+- **Step 8 (daily-note synthesis):** auto-approve and write the drafted section.
   The upsert and `grep -c '<!-- eod:begin'` post-write check are unchanged. If
   the check returns `0` or `>1`, do NOT proceed silently: record a failure
   marker and include it in the notification.
-- **Step 10 (report):** after writing the `wiki/_log.md` entry, send the
+- **Step 9 (report):** after writing the `wiki/_log.md` entry, send the
   end-of-run notification (below), then release the lock.
 
 ### Observability (unattended)
@@ -143,12 +149,11 @@ behavior, not an error.
 
 ### Success checklist (what "ran cleanly" means)
 
-A clean unattended run satisfies all of: pre-flight passed; Slack steps 2/3/4
-reached and produced output or an honest nothing-to-do; Confluence stayed
-draft/deferred; Step 5 reported created vs skip vs duplicate with no silent
-drop; the daily-note section was written and the post-write check returned
-exactly 1; the notification status is `ok`; and `wiki/_log.md` has the run entry
-for the resolved date.
+A clean unattended run satisfies all of: pre-flight passed; Slack steps 2/3
+reached and produced output or an honest nothing-to-do; Step 4 reported created
+vs skip vs duplicate with no silent drop; the daily-note section was written and
+the post-write check returned exactly 1; the notification status is `ok`; and
+`wiki/_log.md` has the run entry for the resolved date.
 
 ## Pipeline Overview
 
@@ -158,77 +163,72 @@ Step 1: Meetings (background)     ──┐  Pull Zoom transcripts into meetings
                                     │
 Step 1.5: Thread cache (fg)       ──┤  Fetch new #fes-platform-support thread
                                     │  bodies once to /tmp/eod-fes-support-cache.json
-                                    │  (consumed by Steps 2 and 3)
+                                    │  (consumed by Step 2)
                                     │
-Step 2: FES Support (background)  ──┤  Extract #fes-platform-support threads to Confluence
-                                    │  (fes-support-learnings:fes-support-learnings,
-                                    │   background subagent, non-interactive)
-                                    │
-Step 3: Support                     │  Extract support channel threads into raw/support_learnings/
+Step 2: Support                     │  Extract support channel threads into raw/support_learnings/
                                     │  (support-learnings, interactive)
                                     │
-Step 4: Internal                    │  Extract #fes-platform-internal threads into raw/internal_learnings/
+Step 3: Internal                    │  Extract #fes-platform-internal threads into raw/internal_learnings/
                                     │  (internal-channel-learnings, interactive)
                                     │
-Step 4.5: Join ─────────────────────┘  Wait for Steps 1 and 2 background subagents
+Step 3.5: Join ─────────────────────┘  Wait for the Step 1 background subagent
                                         to finish before running the remaining steps.
 
-Step 5: Meeting Action Items          Interactive review of the day's meeting action
+Step 4: Meeting Action Items          Interactive review of the day's meeting action
                                       items; creates Todoist tasks in the Work project
                                       (meeting-action-items — consumes Step 1 output)
 
-Step 6: Project-Log Gate              Audit projects/*/log.md for today's entries against
+Step 5: Project-Log Gate              Audit projects/*/log.md for today's entries against
                                       today's git/PR activity; invoke /project-log-entry
                                       interactively for each gap (consumes Step 1
                                       project mentions; runs before compile so any
-                                      added log entries are picked up by Step 7)
+                                      added log entries are picked up by Step 6)
 
-Step 7: Compile                       Ingest raw/ into wiki/ + validate + discover links
-                                      (compile workflow — consumes Steps 3 & 4 output)
+Step 6: Compile                       Ingest raw/ into wiki/ + validate + discover links
+                                      (compile workflow — consumes Steps 2 & 3 output)
 
-Step 8: Verify-Status                 Run /verify-status read-only snapshot — feeds the
+Step 7: Verify-Status                 Run /verify-status read-only snapshot — feeds the
                                       synthesis step with live JIRA / PR / git state
 
-Step 8.5: Work-board drift report     Run /work-board --dry-run --stale-days 7 — surface pending
+Step 7.5: Work-board drift report     Run /work-board --dry-run --stale-days 7 — surface pending
                                       moves, manual overrides, orphans, stale + sectionless cards
 
 Step 8.7: Alert-Noise Weekly          Generate #fes-platform-alerts noise report(s) for any completed
                                       week that lacks one (alert-noise-report, self-gating catch-up;
                                       writes local report notes only)
 
-Step 9: Daily-Note Synthesis          Draft today's EOD section into the daily note:
+Step 8: Daily-Note Synthesis          Draft today's EOD section into the daily note:
                                       accomplishments, decisions, follow-ups, tomorrow,
                                       blockers. On Fridays, add weekly retrospective +
                                       "pick up Monday" list. On Mondays, reconcile
                                       against last Friday's "pick up Monday" list and
                                       flag drift. (interactive: approve / edit / skip)
 
-Step 10: Report                       Summary of full pipeline run, appended to wiki/_log.md
+Step 9: Report                        Summary of full pipeline run, appended to wiki/_log.md
 ```
 
 Why this shape:
 
-- **Step 1 in parallel:** `meeting-ingest` writes to `meetings/` (not `raw/`), uses Zoom MCP (not Slack), and nothing downstream within Steps 2–4 reads its output. Fully independent, runs as a background subagent and overlaps with everything else.
-- **Step 2 in parallel:** `fes-support-learnings` reads `#fes-platform-support` and publishes to Confluence — the *same channel* Step 3 (`support-learnings`) reads. Because the user will already be reviewing those threads interactively in Step 3, Step 2 can run unattended in the background — any classification it would otherwise prompt on will get a second look during Step 3's review. Confluence output is reviewable post-hoc.
-- **Step 1.5 in the foreground:** the single thread fetch must complete before Step 2's subagent is dispatched so the cache exists when the subagent starts; the cost is a short serial block, the win is that each new thread's body is fetched once instead of once per consumer.
-- **Steps 3 and 4 sequential:** these two retain interactive per-thread review (classify / resolve / dismiss). They share the user's attention, so they run one at a time.
-- **Step 5 after the join:** `meeting-action-items` reads from `meetings/`, which Step 1 populates. Placing it after the join guarantees Step 1's background subagent has finished without pulling Step 1 foreground and killing the parallelism with Steps 2–4.
-- **Step 6 (project-log gate) before compile:** auditing `projects/*/log.md` against today's PR/JIRA/git activity belongs before compile so any new log entries created at this gate get indexed by Step 7's compile. The user's attention is already on today's work after Step 5's action-item review, so this is the natural moment to flag missing log entries. Enforces the CLAUDE.md rule.
-- **Step 7 (compile) after Steps 3, 4, 6:** `compile` reads from `raw/` (filled by Steps 3 + 4) and indirectly from `projects/*/log.md` (touched by Step 6). Running it after both means the wiki indexes a complete picture.
-- **Step 8 (verify-status) after compile:** read-only snapshot of JIRA / PR / git state. Feeds Step 9 synthesis with live data. Placed after compile because synthesis is the consumer; running verify-status earlier wouldn't change its output and would interleave with the user-attention steps.
-- **Step 9 (synthesis) after verify-status:** the daily-note EOD section draws from both the captured signal (Steps 1, 3, 4, 5) and the live state from Step 8. Interactive gate (approve / edit / skip) before writing to the daily note. Friday and Monday variants live inside this step.
-- **Step 10 (report) last:** unchanged role — write `wiki/_log.md` entry summarizing the run.
+- **Step 1 in parallel:** `meeting-ingest` writes to `meetings/` (not `raw/`), uses Zoom MCP (not Slack), and nothing downstream within Steps 2–3 reads its output. Fully independent, runs as a background subagent and overlaps with everything else.
+- **Step 1.5 in the foreground:** the single thread fetch runs before Step 2 so the cache exists when the interactive support step reads the channel. The win is that each new thread's body is fetched once here instead of re-read live during Step 2's per-thread review.
+- **Steps 2 and 3 sequential:** these two retain interactive per-thread review (classify / resolve / dismiss). They share the user's attention, so they run one at a time.
+- **Step 4 after the join:** `meeting-action-items` reads from `meetings/`, which Step 1 populates. Placing it after the join guarantees Step 1's background subagent has finished without pulling Step 1 foreground and killing the parallelism with Steps 2–3.
+- **Step 5 (project-log gate) before compile:** auditing `projects/*/log.md` against today's PR/JIRA/git activity belongs before compile so any new log entries created at this gate get indexed by Step 6's compile. The user's attention is already on today's work after Step 4's action-item review, so this is the natural moment to flag missing log entries. Enforces the CLAUDE.md rule.
+- **Step 6 (compile) after Steps 2, 3, 5:** `compile` reads from `raw/` (filled by Steps 2 + 3) and indirectly from `projects/*/log.md` (touched by Step 5). Running it after both means the wiki indexes a complete picture.
+- **Step 7 (verify-status) after compile:** read-only snapshot of JIRA / PR / git state. Feeds Step 8 synthesis with live data. Placed after compile because synthesis is the consumer; running verify-status earlier wouldn't change its output and would interleave with the user-attention steps.
+- **Step 8 (synthesis) after verify-status:** the daily-note EOD section draws from both the captured signal (Steps 1, 2, 3, 4) and the live state from Step 7. Interactive gate (approve / edit / skip) before writing to the daily note. Friday and Monday variants live inside this step.
+- **Step 9 (report) last:** unchanged role — write `wiki/_log.md` entry summarizing the run.
 
 ## Prerequisites
 
 Each sub-skill has its own requirements:
 
 - **Zoom MCP** (`claude.ai Zoom for Claude`) — for Step 1
-- **Slack MCP** (`claude.ai Slack`) — for Steps 2, 3, 4
-- **Atlassian MCP** — for Step 2 (publishes to Confluence)
-- **Todoist CLI (`td`) authenticated** — for Step 5 (creates Todoist tasks)
+- **Slack MCP** (`claude.ai Slack`) — for Steps 2, 3 (support + internal channels)
+- **Atlassian MCP** — for JIRA reads in Step 7 (verify-status) and Step 8 synthesis (and the JIRA signals the Step 5 project-log gate consults)
+- **Todoist CLI (`td`) authenticated** — for Step 4 (creates Todoist tasks)
 
-The three MCPs (Atlassian, Zoom, Slack) are verified up-front by Step 0 below. The pipeline halts loudly if any probe fails — the wiki compile downstream cannot recover from silently-missing Slack/Zoom/Atlassian data, so partial-data runs are refused by design. The Todoist CLI and `obsidian` CLI are not probed: `td` is used only in Step 5 and fails loudly without poisoning the wiki, and `obsidian` is used only by Step 9's daily-note write, which degrades to terminal output when Obsidian is not running.
+The three MCPs (Atlassian, Zoom, Slack) are verified up-front by Step 0 below. The pipeline halts loudly if any probe fails — the downstream steps cannot recover from silently-missing Slack/Zoom/Atlassian data, so partial-data runs are refused by design. The Todoist CLI and `obsidian` CLI are not probed: `td` is used only in Step 4 and fails loudly without poisoning the wiki, and `obsidian` is used only by Step 8's daily-note write, which degrades to terminal output when Obsidian is not running.
 
 ## Process Flow
 
@@ -265,41 +265,42 @@ End-of-Day pre-flight FAILED. The pipeline depends on three MCPs:
 
 Fix the failing MCP(s) (typically: run /plugin, reauthorize the affected
 server, then retry) and re-run /end-of-day. The pipeline will not run
-with partial data — meeting-ingest, fes-support-learnings, support-
-learnings, and internal-channel-learnings all depend on these MCPs, and
-silently degrading their output would corrupt the wiki compile in Step 6.
+with partial data — meeting-ingest (Zoom), support-learnings and
+internal-channel-learnings (Slack), and verify-status (Atlassian/JIRA)
+all depend on these MCPs, and silently degrading their output would
+corrupt the wiki compile and the daily-note synthesis.
 ```
 
-Do **not** offer "continue without this MCP" or "skip the failing step." The whole purpose of this gate is to refuse partial-data runs. The continue/retry/halt prompt in the per-step Error Handling section below applies only to *mid-run* failures of an MCP that passed pre-flight (e.g. transient API errors, rate limits) — not to pre-flight failures.
+Do **not** offer "continue without this MCP" or "skip the failing step." The whole purpose of this gate is to refuse partial-data runs. The continue/retry/halt prompt in the per-step Error Handling section below applies only to _mid-run_ failures of an MCP that passed pre-flight (e.g. transient API errors, rate limits) — not to pre-flight failures.
 
 If the user fixes permissions and explicitly asks to "continue from Step 1" without re-running pre-flight, **still re-run Step 0 first**. Authorization can lapse mid-conversation, and the cost of one extra probe call is trivial compared to running the pipeline blind.
 
 **Step 0 is not negotiable under time pressure.** If the user invokes `/end-of-day` with "go fast", "skip checks", "I just want to wrap up", or any time-pressure framing, pre-flight still runs in full. The user's actual goal under that framing is a clean wrap-up — running with a silently-broken MCP corrupts the wiki compile and creates more cleanup the next morning, not less. A 1-2 second parallel probe block is cheaper than the cleanup.
 
-**Pre-flight failures are gates, not graceful-degrade sources.** The continue/retry/halt prompt in the per-step Error Handling section is for *mid-run* failures only. The pre-flight three (Atlassian, Zoom, Slack) are explicit gates — there is no error-sentinel render path for them, no "skip this step" affordance, no `lookup failed: <error>` fallback. If you find yourself reasoning "other parts of this pipeline degrade gracefully, so I can let this probe failure through" — stop. That reasoning is wrong. The boundary is intentional: `td` and `obsidian` degrade; Atlassian/Zoom/Slack gate.
+**Pre-flight failures are gates, not graceful-degrade sources.** The continue/retry/halt prompt in the per-step Error Handling section is for _mid-run_ failures only. The pre-flight three (Atlassian, Zoom, Slack) are explicit gates — there is no error-sentinel render path for them, no "skip this step" affordance, no `lookup failed: <error>` fallback. If you find yourself reasoning "other parts of this pipeline degrade gracefully, so I can let this probe failure through" — stop. That reasoning is wrong. The boundary is intentional: `td` and `obsidian` degrade; Atlassian/Zoom/Slack gate.
 
 ### Rationalization counters
 
-| Excuse | Reality |
-|--------|---------|
-| "User said go fast — that overrides MANDATORY." | No. User's goal is a clean wrap-up; partial-data EOD corrupts the wiki and creates more morning cleanup. Pre-flight runs in full. |
-| "I'll skip the probe and let the sub-skill fail naturally." | The whole point of Step 0 is to fail BEFORE dispatching subagents and writing partial output. Letting the sub-skill fail wastes the parallel run and may leave half-written files behind. |
-| "Only Step 2 needs Atlassian — if Atlassian is down I'll just skip Step 2 and continue." | No. Step 2 is parallel with the user-attention Steps 3 and 4 by design. Silently dropping it means the FES support channel is unprocessed today and the user won't notice until Confluence is missing the day's threads. Halt and fix. |
-| "User verbally hinted Zoom auth is flaky — but the skill probes anyway, so I'll skip the probe to save a call." | The probe IS the signal. A user warning is additional evidence the probe will catch something, not a reason to skip it. |
+| Excuse                                                                                                          | Reality                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "User said go fast — that overrides MANDATORY."                                                                 | No. User's goal is a clean wrap-up; partial-data EOD corrupts the wiki and creates more morning cleanup. Pre-flight runs in full.                                                         |
+| "I'll skip the probe and let the sub-skill fail naturally."                                                     | The whole point of Step 0 is to fail BEFORE dispatching subagents and writing partial output. Letting the sub-skill fail wastes the parallel run and may leave half-written files behind. |
+| "Atlassian is only for JIRA reads late in the run — I'll start now and deal with it at verify-status."          | No. Pre-flight fails fast so you don't spend the whole interactive run only to hit a dead verify-status and synthesis at the end. Halt and fix Atlassian up front.                        |
+| "User verbally hinted Zoom auth is flaky — but the skill probes anyway, so I'll skip the probe to save a call." | The probe IS the signal. A user warning is additional evidence the probe will catch something, not a reason to skip it.                                                                   |
 
 ### Step 1: Meeting Ingest (background subagent)
 
-Dispatch meeting-ingest as a background subagent so it runs in parallel with Steps 2–4. Use the `Agent` tool with `subagent_type: general-purpose` (no specialized agent is needed — the work is "run this skill end-to-end and report a summary").
+Dispatch meeting-ingest as a background subagent so it runs in parallel with Steps 2–3. Use the `Agent` tool with `subagent_type: general-purpose` (no specialized agent is needed — the work is "run this skill end-to-end and report a summary").
 
 Agent prompt template:
 
 > Run the `lyt-assistant:meeting-ingest` skill end-to-end with no arguments. It pulls the past 5 days of Zoom transcripts into `~/Documents/Work/meetings/<date-slug>/`, skipping meetings that already have folders. The Zoom MCP (`mcp__claude_ai_Zoom_for_Claude__*`) must be authenticated — if it isn't, stop and report that, do not try to authenticate. When the skill finishes, report a single block: number of meetings ingested, list of new folder paths, and any meetings skipped because they already existed. Under 150 words.
 
-Set `run_in_background: true` so the orchestrator does not block on this. Note the agent ID so it can be joined later (at Step 4.5).
+Set `run_in_background: true` so the orchestrator does not block on this. Note the agent ID so it can be joined later (at Step 3.5).
 
 Do NOT poll or sleep waiting on it — the runtime notifies on completion. Proceed straight to Step 1.5.
 
-Track (recorded at the join in Step 4.5): meetings ingested, meetings skipped.
+Track (recorded at the join in Step 3.5): meetings ingested, meetings skipped.
 
 Record status as one of:
 
@@ -307,15 +308,15 @@ Record status as one of:
 - `nothing-to-do` — all meetings already ingested
 - `failed` — see failure-handling below
 
-### Step 1.5: Fetch fes-support threads to the shared cache (foreground)
+### Step 1.5: Fetch fes-support threads to the cache (foreground)
 
-Both Step 2 (Confluence) and Step 3 (raw/) read the same `#fes-platform-support`
-threads. Fetch the thread bodies once here so each consumer classifies from the
-cache instead of re-reading Slack.
+Step 2 (support → `raw/`) reads `#fes-platform-support` threads. Fetch the thread
+bodies once here so the interactive step classifies from the cache instead of
+re-reading Slack.
 
 1. Start clean: `rm -rf /tmp/eod-cache-threads && mkdir -p /tmp/eod-cache-threads`
    and `rm -f /tmp/eod-fes-support-cache.json`.
-2. Compute the widest window either consumer needs: read
+2. Compute the widest window the consumer needs: read
    `raw/support_learnings/_metadata.yml` and find the most recent
    `date_processed`. Compute two Unix timestamps: (a) local midnight at the
    start of that date via `date -j -f "%Y-%m-%d %H:%M:%S" "<date> 00:00:00" "+%s"`,
@@ -328,7 +329,7 @@ cache instead of re-reading Slack.
    `mcp__claude_ai_Slack__slack_read_thread`, then IMMEDIATELY write that one
    thread to `/tmp/eod-cache-threads/<ts>.json` via the Write tool as
    `{"parent": {"author", "ts", "text", "reactions"?}, "replies": [{"author",
-   "ts", "text"}, ...]}` (verbatim text; reactions optional). One file per
+"ts", "text"}, ...]}` (verbatim text; reactions optional). One file per
    thread; never hand-assemble the combined JSON.
 5. Assemble and validate:
 
@@ -339,45 +340,12 @@ cache instead of re-reading Slack.
    ```
 
    On a non-zero exit, delete `/tmp/eod-fes-support-cache.json` if present and
-   continue WITHOUT a cache: both consumers fall back to live fetches. Never
+   continue WITHOUT a cache: the consumer falls back to live fetches. Never
    halt the pipeline over the cache.
 
 Track: threads cached, cache path, or `no-cache (reason)`.
 
-### Step 2: FES Support Learnings → Confluence (background subagent)
-
-Dispatch fes-support-learnings as a second background subagent so it runs in parallel with meeting-ingest and Steps 3–4. It lives in the `fes-support-learnings` plugin (separate from `lyt-assistant`) — use the fully-qualified skill name.
-
-Agent prompt template:
-
-> Run the `fes-support-learnings:fes-support-learnings` skill end-to-end with no arguments. It extracts threads from `#fes-platform-support` (default 7-day lookback) and publishes domain-grouped pages to Confluence. The Slack MCP and Atlassian MCP must both be authenticated — if either is missing, stop and report that, do not try to authenticate.
->
-> A thread cache may exist at `/tmp/eod-fes-support-cache.json`. Before reading
-> any thread from Slack, run `python3 <skill-dir>/fes_support_cache.py check`
-> (the helper ships with the fes-support-learnings skill) (its base directory
-> is announced when that skill loads; substitute it for `<skill-dir>`); if trusted, take
-> thread bodies from the cache (`get <ts>`) and only call slack_read_thread for
-> threads the cache is missing. If untrusted, fetch live exactly as before.
->
-> **Run non-interactively** using these explicit auto-defaults so behavior is consistent run-to-run and the user knows what to spot-check at the join:
->
-> - Per-thread classification prompt → default to `knowledge` (the safest catch-all category; classifying as `incident` or `decision` requires evidence the auto-pass shouldn't infer).
-> - Per-thread resolution prompt → default to `unresolved` (let the foreground `support-learnings` step in Step 3 capture the resolution if there is one; do not guess from the thread body).
-> - Domain assignment prompt → default to the domain inferred from the thread's first message via the skill's own keyword map; if no map match, default to `general`.
-> - Duplicate-thread detection prompt → default to `skip` (do not overwrite or merge; surface as an auto-default).
-> - Any other prompt the skill exposes → default to the option labeled "skip" or "no action".
->
-> Record every auto-default applied (thread ID + prompt name + chosen default) so the user can spot-check at the Step 4.5 join. Do not block waiting for user input under any circumstance.
->
-> The user is independently reviewing the same channel's threads in the interactive `support-learnings` step running in the foreground, so anything ambiguous will get a second look there. When the skill finishes, report a single block: new threads processed, unresolved threads re-evaluated, Confluence page URL(s) created or updated, and the full list of auto-defaulted prompts. Under 250 words.
-
-Set `run_in_background: true`. Note the agent ID for the Step 4.5 join.
-
-Do NOT poll or sleep. Proceed straight to Step 3.
-
-Track (recorded at the join): new threads processed, unresolved threads re-evaluated, Confluence page URL(s), list of auto-defaulted prompts.
-
-### Step 3: Support Learnings → `raw/`
+### Step 2: Support Learnings → `raw/`
 
 Invoke the (lyt-assistant) support-learnings skill, which writes to `~/Documents/Work/raw/support_learnings/`:
 
@@ -392,7 +360,7 @@ pass.
 
 Track: number of new threads processed, output file path(s). These files become inputs for Step 6 (Compile).
 
-### Step 4: Internal Channel Learnings → `raw/`
+### Step 3: Internal Channel Learnings → `raw/`
 
 Invoke the internal-channel-learnings skill, which writes to `~/Documents/Work/raw/internal_learnings/`:
 
@@ -403,17 +371,16 @@ Args: (none — process new threads since last run)
 
 Track: number of new threads processed and their categories (decision / incident / knowledge / process-change / discussion), output file path(s). These files also feed Step 6 (Compile).
 
-### Step 4.5: Join — Wait for Background Subagents
+### Step 3.5: Join — Wait for the Background Subagent
 
-Before starting compile, ensure both Step 1 (meeting-ingest) and Step 2 (fes-support-learnings) background subagents have completed.
+Before starting compile, ensure the Step 1 (meeting-ingest) background subagent has completed.
 
-- For each subagent: if the runtime has already delivered its completion notification, read its result block and record status + summary. If still running, wait for the completion notification — do NOT poll, sleep, or proactively check; the runtime notifies on completion.
-- The two foreground interactive steps (3 and 4) almost always take longer than the background subagents, so this wait is usually instant.
-- **Missing-notification fallback:** if a subagent is still running 5 minutes after Steps 3 + 4 have both completed (or 10 minutes from initial dispatch, whichever is later) and no completion notification has arrived (e.g. the runtime dropped the event, or the subagent crashed silently without reporting), surface this to the user, treat the subagent as failed, and apply the continue / retry / halt prompt below. Do not hang Step 4.5 indefinitely. These thresholds are deliberately generous — `meeting-ingest` and `fes-support-learnings` typically finish well under 5 minutes, so a 5-minute post-Steps-3+4 budget catches genuine hangs without false positives.
-- If either subagent reported a failure (e.g. Zoom MCP unauthed, Atlassian MCP unauthed), apply the same continue / retry / halt prompt described in Error Handling below. Treat each subagent's failure independently — one can succeed while the other fails.
-- For fes-support-learnings specifically: surface its list of auto-defaulted prompts to the user as part of the join. They are not errors, but the user may want to spot-check them.
+- If the runtime has already delivered its completion notification, read its result block and record status + summary. If still running, wait for the completion notification — do NOT poll, sleep, or proactively check; the runtime notifies on completion.
+- The two foreground interactive steps (2 and 3) almost always take longer than the background subagent, so this wait is usually instant.
+- **Missing-notification fallback:** if the subagent is still running 5 minutes after Steps 2 + 3 have both completed (or 10 minutes from initial dispatch, whichever is later) and no completion notification has arrived (e.g. the runtime dropped the event, or the subagent crashed silently without reporting), surface this to the user, treat the subagent as failed, and apply the continue / retry / halt prompt below. Do not hang Step 3.5 indefinitely. These thresholds are deliberately generous — `meeting-ingest` typically finishes well under 5 minutes, so a 5-minute post-Steps-2+3 budget catches genuine hangs without false positives.
+- If the subagent reported a failure (e.g. Zoom MCP unauthed), apply the same continue / retry / halt prompt described in Error Handling below.
 
-### Step 5: Meeting Action Items
+### Step 4: Meeting Action Items
 
 Invoke the meeting-action-items skill with no arguments (its default lookback is "since last run, fallback 2 days"). Step 1 has finished by this point, so any meetings ingested in Step 1 are now visible to this step.
 
@@ -422,10 +389,10 @@ Skill: lyt-assistant:meeting-action-items
 Args: (none)
 ```
 
-**Must run interactively in the foreground session.** Invoke via the `Skill` tool in the main conversation — do NOT dispatch via `Agent` (background or foreground) and do NOT instruct it to "run non-interactively" like Step 2. The skill drives a per-item prompt loop that requires the user at the keyboard: `[t]` make todo / `[d]` dismiss / `[s]` skip / `[q]` quit, plus a bulk-triage shortcut. A subagent has no way to surface those prompts to the user, so dispatching it that way would either hang, auto-default every item, or silently dismiss work that should have become a todo.
+**Must run interactively in the foreground session.** Invoke via the `Skill` tool in the main conversation — do NOT dispatch via `Agent` (background or foreground) and do NOT instruct it to "run non-interactively." The skill drives a per-item prompt loop that requires the user at the keyboard: `[t]` make todo / `[d]` dismiss / `[s]` skip / `[q]` quit, plus a bulk-triage shortcut. A subagent has no way to surface those prompts to the user, so dispatching it that way would either hang, auto-default every item, or silently dismiss work that should have become a todo.
 
 In `--unattended` mode this step does NOT run interactively -- see Unattended
-Mode > Per-step deltas > Step 5 for the inline auto-todo + dedup flow.
+Mode > Per-step deltas > Step 4 for the inline auto-todo + dedup flow.
 
 Track for the run: number of items reviewed, number of new todos created, number dismissed, number skipped.
 
@@ -433,10 +400,10 @@ Record status:
 
 - `ok` — items reviewed and any todos created
 - `nothing-new` — no unhandled action items in the lookback window
-- `quit-early` — user quit mid-loop; still proceed to Step 6 with partial progress
+- `quit-early` — user quit mid-loop; still proceed to Step 5 with partial progress
 - `failed` — see Error Handling
 
-### Step 6: Project-Log Gate
+### Step 5: Project-Log Gate
 
 Audit `~/Documents/Work/projects/*/log.md` to find projects that were touched today but lack today's log entry. Enforces the CLAUDE.md rule that any project work must produce a `log.md` entry.
 
@@ -470,9 +437,9 @@ Record status:
 - `quit-early` — user skipped through some / all gaps; partial progress
 - `failed` — see Error Handling
 
-**Why this step runs before Compile (Step 7):** any new log entries written here become inputs for the compile step's link-discovery pass. Running this after compile would mean today's new log content doesn't get indexed until tomorrow's run.
+**Why this step runs before Compile (Step 6):** any new log entries written here become inputs for the compile step's link-discovery pass. Running this after compile would mean today's new log content doesn't get indexed until tomorrow's run.
 
-### Step 7: Compile
+### Step 6: Compile
 
 Invoke the compile skill, which itself chains ingest → validate → discover-links:
 
@@ -483,25 +450,25 @@ Args: (none)
 
 Track: articles created, articles updated, stubs created, validation fixes applied, new connections added. The compile skill handles its own logging to `wiki/_log.md`.
 
-### Step 8: Verify-Status (read-only snapshot)
+### Step 7: Verify-Status (read-only snapshot)
 
-Invoke the `verify-status` skill to produce a read-only snapshot of live JIRA / PR / git state. The snapshot feeds Step 9's synthesis.
+Invoke the `verify-status` skill to produce a read-only snapshot of live JIRA / PR / git state. The snapshot feeds Step 8's synthesis.
 
 ```
 Skill: verify-status
 Args: (none)
 ```
 
-`verify-status` is itself a multi-step pipeline (identity check, git fetch on active-work repos, JIRA In Progress/Blocked, GitHub open PRs, reconcile, NEXT: recommendation). Capture its full output verbatim — Step 9 reads it as input.
+`verify-status` is itself a multi-step pipeline (identity check, git fetch on active-work repos, JIRA In Progress/Blocked, GitHub open PRs, reconcile, NEXT: recommendation). Capture its full output verbatim — Step 8 reads it as input.
 
-Track: did verify-status run cleanly? Did it emit a `NEXT:` line? Capture any drift findings it produced — they get surfaced in Step 9's synthesis.
+Track: did verify-status run cleanly? Did it emit a `NEXT:` line? Capture any drift findings it produced — they get surfaced in Step 8's synthesis.
 
 Record status:
 
 - `ok` — snapshot captured
-- `failed` — verify-status itself errored; continue to Step 9 with reduced input (synthesis falls back to captured signal only)
+- `failed` — verify-status itself errored; continue to Step 8 with reduced input (synthesis falls back to captured signal only)
 
-### Step 8.5: Work-board drift report (dry-run)
+### Step 7.5: Work-board drift report (dry-run)
 
 Run the `work-board` skill with `--dry-run --stale-days 7`. Do not execute moves. Surface in the EOD
 summary: pending moves the morning sync will make, manual overrides (cards Ian parked
@@ -540,15 +507,15 @@ Record status:
 - `nothing-to-do` - no completed week was missing a note
 - `failed` - see Error Handling
 
-### Step 9: Daily-Note Synthesis
+### Step 8: Daily-Note Synthesis
 
 Draft today's end-of-day section into the daily note. Interactive: present the draft for approve / edit / skip before writing.
 
 **Inputs:**
 
-- Captured signal from Steps 1, 3, 4, 5 (meetings ingested, threads extracted, action items reviewed)
-- Live state from Step 8 verify-status (today's PR merges, JIRA transitions, drift findings, the NEXT: recommendation)
-- Project-log audit results from Step 6 (which projects got new entries today)
+- Captured signal from Steps 1, 2, 3, 4 (meetings ingested, threads extracted, action items reviewed)
+- Live state from Step 7 verify-status (today's PR merges, JIRA transitions, drift findings, the NEXT: recommendation)
+- Project-log audit results from Step 5 (which projects got new entries today)
 - **Stale-PR scan:** any open PR I authored where `updatedAt` is older than 5 days ago (computed from verify-status output — if absent, run `gh search prs --author=ian-at-fes --state=open --json number,title,url,updatedAt` inline). These feed the Follow-ups section as nudge candidates.
 - **Todoist overdue audit:** run `td list --filter "(overdue | today) & #work" --json` to surface today/overdue items in the work project. Items still open at EOD feed the Follow-ups section so they're explicit in tomorrow's planning rather than implicit-in-Todoist.
 - **Tomorrow's calendar:** query the Google Calendar MCP (`mcp__claude_ai_Google_Calendar__*`) for events scheduled tomorrow between 00:00 and 23:59 local time. The first meeting's start time and topic feed the Tomorrow section so the priorities respect the day's shape. If the MCP is unavailable or unauthed, skip this input — don't block the synthesis.
@@ -560,7 +527,7 @@ Draft today's end-of-day section into the daily note. Interactive: present the d
 
 Never construct the path manually. Do NOT write to `raw/daily/<date>.md`: that directory remains in use by memory-flush hooks (session logs) and by lyt-assistant's compile (`/compile daily` source), but the EOD section no longer lives there. Pre-2026-06-09 EOD sections remain in `raw/daily/` and are not migrated.
 
-**Obsidian-not-running fallback:** if `obsidian daily` or `obsidian daily:path` exits non-zero, emit the fully rendered EOD section to the terminal as a one-time fallback, skip the file write, and record Step 9 status as `ok (terminal fallback)`. Do not fall back to the old `raw/daily/` path. Re-running Step 9 after opening Obsidian upserts cleanly.
+**Obsidian-not-running fallback:** if `obsidian daily` or `obsidian daily:path` exits non-zero, emit the fully rendered EOD section to the terminal as a one-time fallback, skip the file write, and record Step 8 status as `ok (terminal fallback)`. Do not fall back to the old `raw/daily/` path. Re-running Step 8 after opening Obsidian upserts cleanly.
 
 **Default section template (append to existing daily note):**
 
@@ -570,24 +537,29 @@ Never construct the path manually. Do NOT write to `raw/daily/<date>.md`: that d
 <!-- eod:begin generated=<ISO-8601 UTC timestamp> -->
 
 ### Accomplishments
+
 - <PRs merged today (from verify-status)>
 - <JIRA tickets transitioned today (from verify-status)>
 - <Meetings attended (from Step 1)>
-- <Project log entries written today (from Step 6)>
+- <Project log entries written today (from Step 5)>
 
 ### Decisions
+
 <Pulled from today's meeting summaries via meeting-section-extract or inline summarization>
 
 ### Follow-ups
-- <Open action items created in Step 5>
+
+- <Open action items created in Step 4>
 - <verify-status drift findings>
 - <Stale PRs (open, mine, updatedAt > 5 days ago) — nudge or close>
 - <Overdue or due-today Todoist #work items still open — snooze, complete, or carry forward>
 
 ### Tomorrow
+
 <Top 2-3 priorities, drawn from verify-status NEXT: + In-Progress JIRA tickets + tomorrow's first-meeting topic if calendar available. Anchor priorities around the calendar shape — e.g. if first meeting is at 09:00, surface what needs to be done before vs after it.>
 
 ### Blockers
+
 <Any JIRA tickets in Blocked state from verify-status, with the most recent blocker comment>
 
 <!-- eod:end -->
@@ -597,6 +569,7 @@ Never construct the path manually. Do NOT write to `raw/daily/<date>.md`: that d
 
 ```markdown
 ### Weekly Retrospective — Week of <Monday's date>
+
 **Highlights:** <pulled from Mon-Fri daily-note Accomplishments sections (canonical notes at `raw/daily_notes/YYYY/MM/<date>-<Weekday>.md`; pre-2026-06-09 EOD sections live in `raw/daily/<date>.md`) + this week's PR merges>
 **Lowlights:** <pulled from this week's Blockers + carried-over Follow-ups>
 **Pick up Monday:** <2-4 items, explicit and concrete — these become Monday's reconcile input>
@@ -639,7 +612,7 @@ PY
 
 The splice runs from the `## End of Day` heading line through and including `<!-- eod:end -->` (the heading precedes the begin marker, so both markers are removed and re-inserted together).
 
-**Post-write verification:** `grep -c '<!-- eod:begin' "$DAILY_NOTE_PATH"` must return exactly `1`. On `0` or `>1`, print a diagnostic with the path and halt Step 9 (do not proceed to Step 10 silently).
+**Post-write verification:** `grep -c '<!-- eod:begin' "$DAILY_NOTE_PATH"` must return exactly `1`. On `0` or `>1`, print a diagnostic with the path and halt Step 8 (do not proceed to Step 9 silently).
 
 Track: daily-note path written, sections included (standard / + weekly retro / + Friday→Today reconcile), and the user's choice.
 
@@ -649,7 +622,7 @@ Record status:
 - `skipped` — user skipped the synthesis
 - `failed` — see Error Handling
 
-### Step 10: Final Report
+### Step 9: Final Report
 
 Summarize the full end-of-day run in one block:
 
@@ -660,47 +633,38 @@ End-of-Day Complete
     New meetings: 3
     Skipped (already present): 2
 
-  Step 2 — FES Support → Confluence (parallel):
-    New threads: 4
-    Unresolved revisited: 2
-    Confluence page: https://.../2026-05-12-learnings
-    Auto-defaulted prompts: 1 (thread T1234 classified as "knowledge" by default)
-
-  Step 3 — Support → raw/:
+  Step 2 — Support → raw/:
     New threads: 4
     Files written: 1 (raw/support_learnings/2026-05-12.md)
 
-  Step 4 — Internal → raw/:
+  Step 3 — Internal → raw/:
     New threads: 6 (2 decision, 1 incident, 3 knowledge)
     Files written: 1 (raw/internal_learnings/2026-05-12.md)
 
-  Step 5 — Meeting Action Items:
+  Step 4 — Meeting Action Items:
     Items reviewed: 5
     Todos created: 3
     Dismissed: 1
     Skipped: 1
 
-  Step 6 — Project-Log Gate:
+  Step 5 — Project-Log Gate:
     Projects audited: 4
     Missing today-entry: 2
     New entries created: 2
     Skipped: 0
 
-  Step 7 — Compile:
+  Step 6 — Compile:
     Articles created: 4
     Articles updated: 2
     Stubs created: 1
     Validation fixes: 1
     New connections: 7
 
-  Step 8 — Verify-Status:
+  Step 7 — Verify-Status:
     NEXT: merge PR #1842 (approved, clean, mine)
     Drift findings: 1 (load-testing-environment/log.md stale-pr)
 
-  Step 8.7 - Alert-Noise Weekly:
-    Weeks generated: 1 (2026-07-09: 62 events, 40 triggers)  [or: nothing-to-do]
-
-  Step 9 — Daily-Note Synthesis:
+  Step 8 — Daily-Note Synthesis:
     Daily note: <output of obsidian daily:path>
     Sections written: standard + Friday weekly retro
     User action: approved
@@ -714,7 +678,6 @@ Then append an end-of-day block to `wiki/_log.md`:
 ## [2026-05-12] end-of-day | Daily Pipeline
 
 - Meetings ingested: 3
-- FES support threads → Confluence: 4 new, 2 revisited
 - Support threads → raw/: 4
 - Internal threads → raw/: 6 (2 decision, 1 incident, 3 knowledge)
 - Meeting action items: 5 reviewed, 3 created, 1 dismissed, 1 skipped
@@ -739,9 +702,9 @@ Unattended Mode > Global rules.
 The sub-skill will tell the user to authenticate. Don't try to authenticate on its behalf. Surface the message and prompt:
 
 ```
-Step 2 (FES Support) couldn't run: Atlassian MCP not authenticated.
+Step 2 (Support Learnings) couldn't run: Slack MCP not authenticated.
 
-The sub-skill suggests running `/plugin` and authenticating Atlassian, then retrying.
+The sub-skill suggests running `/plugin` and authenticating Slack, then retrying.
 
   [c] Continue — skip this step and move to Step 3
   [r] Retry — user authenticates now, then retry Step 2
@@ -762,42 +725,40 @@ This is not an error. Mark the step `nothing-to-do` and continue without prompti
 
 ### `meeting-action-items` Quits Early
 
-If the user hits `[q]` partway through Step 5's per-item loop, treat that as `ok` (partial-progress), report how far the run got, and continue to Step 6 — compile and the final report are still useful.
+If the user hits `[q]` partway through Step 4's per-item loop, treat that as `ok` (partial-progress), report how far the run got, and continue to Step 5 — compile and the final report are still useful.
 
 ### Pipeline Interruption
 
-If the user cancels mid-pipeline, also stop any background subagents (Steps 1 and 2) that are still running — use `TaskStop` on each agent ID. Then report what was completed and what remains:
+If the user cancels mid-pipeline, also stop the Step 1 background subagent, if still running — use `TaskStop` on its agent ID. Then report what was completed and what remains:
 
 ```
-End-of-Day interrupted after Step 3 (Support Learnings).
+End-of-Day interrupted after Step 2 (Support Learnings).
 
 Completed:
   - Step 1: Meetings — 3 new (background subagent finished before interrupt)
-  - Step 2: FES Support — 4 new threads → Confluence (background subagent finished before interrupt)
-  - Step 3: Support → raw/ — 4 new threads
+  - Step 2: Support → raw/ — 4 new threads
 
 Not yet run:
-  - Step 4: Internal Channel — run /lyt-assistant:internal-channel-learnings
-  - Step 5: Meeting Action Items — run /lyt-assistant:meeting-action-items
-  - Step 6: Project-Log Gate — run /project-log-entry per affected project
-  - Step 7: Compile — run /lyt-assistant:compile (will pick up Step 3 output plus Step 4 if you run it)
-  - Step 8: Verify-Status — run /verify-status
-  - Step 9: Daily-Note Synthesis — manually draft today's EOD section in the canonical daily note (`obsidian daily:path`)
+  - Step 3: Internal Channel — run /lyt-assistant:internal-channel-learnings
+  - Step 4: Meeting Action Items — run /lyt-assistant:meeting-action-items
+  - Step 5: Project-Log Gate — run /project-log-entry per affected project
+  - Step 6: Compile — run /lyt-assistant:compile (will pick up Step 2 output plus Step 3 if you run it)
+  - Step 7: Verify-Status — run /verify-status
+  - Step 8: Daily-Note Synthesis — manually draft today's EOD section in the canonical daily note (`obsidian daily:path`)
 ```
 
-If a background subagent was still running when the interrupt happened, mark it `cancelled` instead of `ok` and note what its last reported progress was, if available.
+If the background subagent was still running when the interrupt happened, mark it `cancelled` instead of `ok` and note what its last reported progress was, if available.
 
 ## Related Skills
 
 - **/lyt-assistant:meeting-ingest** — Pull Zoom transcripts (Step 1)
-- **/fes-support-learnings:fes-support-learnings** — FES support → Confluence (Step 2; lives in the `fes-support-learnings` plugin)
-- **/lyt-assistant:support-learnings** — Support channel → `raw/support_learnings/` (Step 3)
-- **/lyt-assistant:internal-channel-learnings** — Internal channel → `raw/internal_learnings/` (Step 4)
-- **/lyt-assistant:meeting-action-items** — Interactive review of meeting action items into Todoist (Step 5)
+- **/lyt-assistant:support-learnings** — Support channel → `raw/support_learnings/` (Step 2)
+- **/lyt-assistant:internal-channel-learnings** — Internal channel → `raw/internal_learnings/` (Step 3)
+- **/lyt-assistant:meeting-action-items** — Interactive review of meeting action items into Todoist (Step 4)
 - **/lyt-assistant:compile** — Full compilation pipeline (Step 6; itself chains `/lyt-assistant:ingest` → `/lyt-assistant:lint` → `/lyt-assistant:discover-links`)
 - **/alert-noise-report** - #fes-platform-alerts weekly noise report; self-gating catch-up (Step 8.7)
 - **/start-of-day** — Morning counterpart; lists today + overdue Todoist tasks with an inline edit loop (user-private skill at `~/.claude/skills/start-of-day/`)
 
 ## Summary
 
-The end-of-day skill runs the full daily wrap-up: pull the day's Zoom meetings, extract three Slack channels' worth of learnings (FES support to Confluence, support and internal channels to `raw/`), review the day's meeting action items into Todoist, then compile `raw/` into the wiki. It chains six skills in order so the day's commitments and Slack-derived notes get captured and into the wiki the same day rather than waiting until the next compile. Use `/end-of-day` as the single command to wrap up the workday.
+The end-of-day skill runs the full daily wrap-up: pull the day's Zoom meetings, extract two Slack channels' worth of learnings (support and internal channels to `raw/`), review the day's meeting action items into Todoist, then compile `raw/` into the wiki. It chains the sub-skills in order so the day's commitments and Slack-derived notes get captured and into the wiki the same day rather than waiting until the next compile. Use `/end-of-day` as the single command to wrap up the workday.

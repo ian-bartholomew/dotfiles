@@ -49,6 +49,12 @@
 	prompt = true
 [mergetool "nvimdiff"]
 	cmd = "nvim -d \"$LOCAL\" \"$MERGED\" \"$BASE\" \"$REMOTE\" -c 'wincmd w' -c 'wincmd J'"
+# Syntax-aware auto-merge driver; enabled per-path via ~/.config/git/attributes.
+# Resolves conflicts git's line merge can't; falls back to markers, then nvimdiff.
+# Driver string is mergiraf's documented invocation (mergiraf.org/usage).
+[merge "mergiraf"]
+	name = mergiraf
+	driver = mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L
 [pull]
 	rebase = false
 [gpg]

@@ -1,6 +1,6 @@
 ---
 name: start-ticket
-description: Start working on a JIRA ticket — fetches ticket details, creates a git worktree on a new branch, and plans the implementation using superpowers.
+description: Start working on a JIRA ticket — fetches ticket details, creates a git worktree on a new branch, and plans the implementation using a grill session.
 arguments:
   - name: ticket
     description: JIRA ticket key (e.g. FANDEVX-1234)
@@ -46,7 +46,8 @@ Create an isolated git worktree for this work:
 
 Once in the worktree:
 
-- Use the `superpowers:brainstorm` skill from superpowers to create an implementation plan
+- Use the `mattpocock-skills:grill-with-docs` skill to create an plan
+- Any docs from that session should be saved to the project folder, if one exists. If one doesn't exist, ask the user if they would like to make one, using the `lyt-assistant:create-project` skill. Otherwise ask them where they would like to save the created docs.
 - Feed the JIRA ticket details (summary, description, AC, parent context) into the brainstorm
 - The plan should identify:
   - What files need to be created or modified
@@ -56,9 +57,14 @@ Once in the worktree:
   - If the review comes back with feedback, integrate it and run a review again
   - Do a maximum of 2 review rounds
 
+## Step 4: Start the work
+
+- If there is work to do, ask the user if they would like to start the work.
+- If the user wants to start the work, evaluate if it would be possible, or beneficial, to use an agent team to finish the work. If it is, spawn teammates to hand the work. Otherwise, use `/subagent-driven-development` to do the work.
+
 ## Important Notes
 
-- Always use superpowers to plan the work
+- Always use `mattpock-skils:grill-with-docs` to plan the work
 - Always do a code review before making a PR
 - If the ticket is already "In Progress", warn the user that work may already be underway
 - If the ticket has blockers that aren't resolved, warn the user
