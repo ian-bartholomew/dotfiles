@@ -3,7 +3,20 @@ name: end-of-day
 description: This skill should be used when the user asks to "end of day", "EOD", "run end of day", "wrap up the day", or runs "/end-of-day". Captures the day's Zoom + Slack signal into the wiki, reviews meeting action items into Todoist, audits project log.md files for today's entries, runs a verify-status snapshot, and synthesizes today's daily-note EOD section. Friday adds a weekly retrospective.
 version: 0.5.0
 argument-hint: "[--unattended]"
-allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, AskUserQuestion, Skill, Agent, TaskStop, PushNotification]
+allowed-tools:
+  [
+    Read,
+    Write,
+    Edit,
+    Bash,
+    Grep,
+    Glob,
+    AskUserQuestion,
+    Skill,
+    Agent,
+    TaskStop,
+    PushNotification,
+  ]
 ---
 
 # End-of-Day Skill
@@ -104,14 +117,17 @@ behavior, not an error.
      script independently dedups each `todo` against the live Work project and
      returns `duplicate` (non-terminal) for any it catches -- this is the
      deterministic backstop beneath the semantic pass.
-  Report created vs `skip` (semantic dupe) vs `duplicate` (script backstop);
-  never silently drop. (`<skill-dir>` is the meeting-action-items skill dir
-  announced when that skill loads.)
+     Report created vs `skip` (semantic dupe) vs `duplicate` (script backstop);
+     never silently drop. (`<skill-dir>` is the meeting-action-items skill dir
+     announced when that skill loads.)
 - **Step 5 (project-log gate):** run the audit (detection) ONLY. Do NOT
   auto-write `log.md` entries. Record each gap in the report and add it to the
   Step 8 daily-note Follow-ups for the next interactive session.
 - **Step 6 (compile):** run non-interactively. (If the compile sub-skill exposes
   any prompt, take its default.)
+- **Step 8.7 (alert-noise weekly):** local writes (report notes + a log line) are
+  allowed unattended. Run non-interactively and catch-up; skip the skill's
+  wiki-synthesis step. `pending` returning nothing is `nothing-to-do`, not a failure.
 - **Step 8 (daily-note synthesis):** auto-approve and write the drafted section.
   The upsert and `grep -c '<!-- eod:begin'` post-write check are unchanged. If
   the check returns `0` or `>1`, do NOT proceed silently: record a failure
@@ -176,6 +192,10 @@ Step 7: Verify-Status                 Run /verify-status read-only snapshot — 
 
 Step 7.5: Work-board drift report     Run /work-board --dry-run --stale-days 7 — surface pending
                                       moves, manual overrides, orphans, stale + sectionless cards
+
+Step 8.7: Alert-Noise Weekly          Generate #fes-platform-alerts noise report(s) for any completed
+                                      week that lacks one (alert-noise-report, self-gating catch-up;
+                                      writes local report notes only)
 
 Step 8: Daily-Note Synthesis          Draft today's EOD section into the daily note:
                                       accomplishments, decisions, follow-ups, tomorrow,
@@ -251,22 +271,22 @@ all depend on these MCPs, and silently degrading their output would
 corrupt the wiki compile and the daily-note synthesis.
 ```
 
-Do **not** offer "continue without this MCP" or "skip the failing step." The whole purpose of this gate is to refuse partial-data runs. The continue/retry/halt prompt in the per-step Error Handling section below applies only to *mid-run* failures of an MCP that passed pre-flight (e.g. transient API errors, rate limits) — not to pre-flight failures.
+Do **not** offer "continue without this MCP" or "skip the failing step." The whole purpose of this gate is to refuse partial-data runs. The continue/retry/halt prompt in the per-step Error Handling section below applies only to _mid-run_ failures of an MCP that passed pre-flight (e.g. transient API errors, rate limits) — not to pre-flight failures.
 
 If the user fixes permissions and explicitly asks to "continue from Step 1" without re-running pre-flight, **still re-run Step 0 first**. Authorization can lapse mid-conversation, and the cost of one extra probe call is trivial compared to running the pipeline blind.
 
 **Step 0 is not negotiable under time pressure.** If the user invokes `/end-of-day` with "go fast", "skip checks", "I just want to wrap up", or any time-pressure framing, pre-flight still runs in full. The user's actual goal under that framing is a clean wrap-up — running with a silently-broken MCP corrupts the wiki compile and creates more cleanup the next morning, not less. A 1-2 second parallel probe block is cheaper than the cleanup.
 
-**Pre-flight failures are gates, not graceful-degrade sources.** The continue/retry/halt prompt in the per-step Error Handling section is for *mid-run* failures only. The pre-flight three (Atlassian, Zoom, Slack) are explicit gates — there is no error-sentinel render path for them, no "skip this step" affordance, no `lookup failed: <error>` fallback. If you find yourself reasoning "other parts of this pipeline degrade gracefully, so I can let this probe failure through" — stop. That reasoning is wrong. The boundary is intentional: `td` and `obsidian` degrade; Atlassian/Zoom/Slack gate.
+**Pre-flight failures are gates, not graceful-degrade sources.** The continue/retry/halt prompt in the per-step Error Handling section is for _mid-run_ failures only. The pre-flight three (Atlassian, Zoom, Slack) are explicit gates — there is no error-sentinel render path for them, no "skip this step" affordance, no `lookup failed: <error>` fallback. If you find yourself reasoning "other parts of this pipeline degrade gracefully, so I can let this probe failure through" — stop. That reasoning is wrong. The boundary is intentional: `td` and `obsidian` degrade; Atlassian/Zoom/Slack gate.
 
 ### Rationalization counters
 
-| Excuse | Reality |
-|--------|---------|
-| "User said go fast — that overrides MANDATORY." | No. User's goal is a clean wrap-up; partial-data EOD corrupts the wiki and creates more morning cleanup. Pre-flight runs in full. |
-| "I'll skip the probe and let the sub-skill fail naturally." | The whole point of Step 0 is to fail BEFORE dispatching subagents and writing partial output. Letting the sub-skill fail wastes the parallel run and may leave half-written files behind. |
-| "Atlassian is only for JIRA reads late in the run — I'll start now and deal with it at verify-status." | No. Pre-flight fails fast so you don't spend the whole interactive run only to hit a dead verify-status and synthesis at the end. Halt and fix Atlassian up front. |
-| "User verbally hinted Zoom auth is flaky — but the skill probes anyway, so I'll skip the probe to save a call." | The probe IS the signal. A user warning is additional evidence the probe will catch something, not a reason to skip it. |
+| Excuse                                                                                                          | Reality                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "User said go fast — that overrides MANDATORY."                                                                 | No. User's goal is a clean wrap-up; partial-data EOD corrupts the wiki and creates more morning cleanup. Pre-flight runs in full.                                                         |
+| "I'll skip the probe and let the sub-skill fail naturally."                                                     | The whole point of Step 0 is to fail BEFORE dispatching subagents and writing partial output. Letting the sub-skill fail wastes the parallel run and may leave half-written files behind. |
+| "Atlassian is only for JIRA reads late in the run — I'll start now and deal with it at verify-status."          | No. Pre-flight fails fast so you don't spend the whole interactive run only to hit a dead verify-status and synthesis at the end. Halt and fix Atlassian up front.                        |
+| "User verbally hinted Zoom auth is flaky — but the skill probes anyway, so I'll skip the probe to save a call." | The probe IS the signal. A user warning is additional evidence the probe will catch something, not a reason to skip it.                                                                   |
 
 ### Step 1: Meeting Ingest (background subagent)
 
@@ -309,7 +329,7 @@ re-reading Slack.
    `mcp__claude_ai_Slack__slack_read_thread`, then IMMEDIATELY write that one
    thread to `/tmp/eod-cache-threads/<ts>.json` via the Write tool as
    `{"parent": {"author", "ts", "text", "reactions"?}, "replies": [{"author",
-   "ts", "text"}, ...]}` (verbatim text; reactions optional). One file per
+"ts", "text"}, ...]}` (verbatim text; reactions optional). One file per
    thread; never hand-assemble the combined JSON.
 5. Assemble and validate:
 
@@ -457,6 +477,36 @@ Next Up / In Progress with no Todoist activity in 7 days - ask whether each is s
 and any sectionless cards in the Work project
 (`td task list --project "Work" --json` entries with null sectionId) as filing candidates.
 
+### Step 8.7: Alert-Noise Weekly (catch-up)
+
+Generate the weekly #fes-platform-alerts noise report when a new week has closed.
+Self-gating and cheap on days with nothing to do.
+
+Invoke the `alert-noise-report` skill (catch-up is its default). It runs its
+`pending` check first: on most days that returns nothing and this step is
+`nothing-to-do`. When one or more completed Thursday-weeks lack a note, it fetches
+those windows (with a 24h overlap margin so no boundary events are clipped),
+writes one dated report note per week to `output/reports/alert-noise/`, and
+appends a `wiki/_log.md` line. Do NOT run the skill's wiki-synthesis step here
+(chronic-offenders curation is left for standalone interactive runs); the Obsidian
+Base renders the trend from the notes automatically.
+
+```
+Skill: alert-noise-report
+Args: (none - catch-up default; generate pending week notes only, skip wiki synthesis)
+```
+
+Slack MCP is already verified in Step 0. This writes local files only (report
+notes + a log line), so it is safe unattended.
+
+Track: weeks generated (with event / trigger counts) or `nothing-to-do`.
+
+Record status:
+
+- `ok` - one or more week notes written
+- `nothing-to-do` - no completed week was missing a note
+- `failed` - see Error Handling
+
 ### Step 8: Daily-Note Synthesis
 
 Draft today's end-of-day section into the daily note. Interactive: present the draft for approve / edit / skip before writing.
@@ -487,24 +537,29 @@ Never construct the path manually. Do NOT write to `raw/daily/<date>.md`: that d
 <!-- eod:begin generated=<ISO-8601 UTC timestamp> -->
 
 ### Accomplishments
+
 - <PRs merged today (from verify-status)>
 - <JIRA tickets transitioned today (from verify-status)>
 - <Meetings attended (from Step 1)>
 - <Project log entries written today (from Step 5)>
 
 ### Decisions
+
 <Pulled from today's meeting summaries via meeting-section-extract or inline summarization>
 
 ### Follow-ups
+
 - <Open action items created in Step 4>
 - <verify-status drift findings>
 - <Stale PRs (open, mine, updatedAt > 5 days ago) — nudge or close>
 - <Overdue or due-today Todoist #work items still open — snooze, complete, or carry forward>
 
 ### Tomorrow
+
 <Top 2-3 priorities, drawn from verify-status NEXT: + In-Progress JIRA tickets + tomorrow's first-meeting topic if calendar available. Anchor priorities around the calendar shape — e.g. if first meeting is at 09:00, surface what needs to be done before vs after it.>
 
 ### Blockers
+
 <Any JIRA tickets in Blocked state from verify-status, with the most recent blocker comment>
 
 <!-- eod:end -->
@@ -514,6 +569,7 @@ Never construct the path manually. Do NOT write to `raw/daily/<date>.md`: that d
 
 ```markdown
 ### Weekly Retrospective — Week of <Monday's date>
+
 **Highlights:** <pulled from Mon-Fri daily-note Accomplishments sections (canonical notes at `raw/daily_notes/YYYY/MM/<date>-<Weekday>.md`; pre-2026-06-09 EOD sections live in `raw/daily/<date>.md`) + this week's PR merges>
 **Lowlights:** <pulled from this week's Blockers + carried-over Follow-ups>
 **Pick up Monday:** <2-4 items, explicit and concrete — these become Monday's reconcile input>
@@ -628,6 +684,7 @@ Then append an end-of-day block to `wiki/_log.md`:
 - Project-log gate: 4 audited, 2 missing entries, 2 created
 - Compile: 4 created, 2 updated, 7 new connections
 - Verify-status: NEXT: merge PR #1842; 1 drift finding
+- Alert-noise weekly: 1 week generated (2026-07-09) [or nothing-to-do]
 - Daily-note synthesis: standard + Friday weekly retro (approved)
 - Step failures: none
 ```
@@ -699,6 +756,7 @@ If the background subagent was still running when the interrupt happened, mark i
 - **/lyt-assistant:internal-channel-learnings** — Internal channel → `raw/internal_learnings/` (Step 3)
 - **/lyt-assistant:meeting-action-items** — Interactive review of meeting action items into Todoist (Step 4)
 - **/lyt-assistant:compile** — Full compilation pipeline (Step 6; itself chains `/lyt-assistant:ingest` → `/lyt-assistant:lint` → `/lyt-assistant:discover-links`)
+- **/alert-noise-report** - #fes-platform-alerts weekly noise report; self-gating catch-up (Step 8.7)
 - **/start-of-day** — Morning counterpart; lists today + overdue Todoist tasks with an inline edit loop (user-private skill at `~/.claude/skills/start-of-day/`)
 
 ## Summary

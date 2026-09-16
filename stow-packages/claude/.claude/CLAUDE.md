@@ -132,6 +132,7 @@ When creating or working with JIRA tickets:
 - ALWAYS review the description for readability and understanding.
 - Do not write overly verbose tickets and keep the description as brief as possible, without sacrificing understanding.
 - ALWAYS present me with a draft of the ticket description before making the ticket. Do not make tickets without first getting my approval of the draft. When making multiple tickets, present the drafts one by one for my approval.
+- Always verify live status of JIRA tickets and PRs before suggesting next actions. Do not rely on stale README files, daily notes, or local git state. Run `git fetch` and check live JIRA/GitHub status first.
 
 ## Projects
 

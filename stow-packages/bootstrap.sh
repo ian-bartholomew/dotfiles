@@ -89,11 +89,32 @@ print_key_instructions() {
   [ -f "$HOME/.ssh/id_ed25519.pub" ] && log "$(cat "$HOME/.ssh/id_ed25519.pub")"
 }
 
+# list_other_ssh_keys prints existing SSH keypairs (comma-separated basenames)
+# other than id_ed25519, detected by their public half, so we can warn before
+# generating a dedicated key instead of silently leaving a second one on disk.
+# A private key with no matching .pub is not detected; the warning is advisory
+# only and never gates key generation.
+list_other_ssh_keys() {
+  local f names=""
+  for f in "$HOME"/.ssh/*.pub; do
+    [ -e "$f" ] || continue
+    case "$f" in */id_ed25519.pub) continue ;; esac
+    [ -f "${f%.pub}" ] && names="${names:+$names, }$(basename "${f%.pub}")"
+  done
+  printf '%s' "$names"
+}
+
 setup_ssh_key() {
   local email="${1:-}"
   mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
   if uses_1password_signing; then log "1Password signing detected (config.machine); skipping on-disk key generation"; return 0; fi
-  [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+  if [ -f "$HOME/.ssh/id_ed25519" ]; then
+    log "reusing existing ~/.ssh/id_ed25519"
+  else
+    local others; others="$(list_other_ssh_keys)"
+    [ -n "$others" ] && log "note: existing SSH key(s) present ($others); leaving them untouched and generating a dedicated ~/.ssh/id_ed25519 for git signing"
+    ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+  fi
   if [ -n "$email" ]; then
     "$DOTCTL" allowed-signers add \
       -file "$DOTFILES_ROOT/stow-packages/git/.config/git/allowed_signers" \
@@ -146,8 +167,21 @@ main() {
   "$DOTCTL" check || { log "FATAL: preflight failed"; exit 1; }
   "$DOTCTL" install -file "$DOTFILES_ROOT/packages.csv" || rc=1
   stow_all || rc=1
-  email="$(prompt_email)"
-  if [ -n "$email" ]; then "$DOTCTL" gitconfig -email "$email" || rc=1; else log "no email provided; skipping gitconfig (set DOTCTL_EMAIL or run interactively)"; fi
+  # Reuse an already-configured git email instead of re-prompting. Gate on
+  # user.email actually being set, not on config.local merely existing: stow
+  # can fold ~/.config/git into a symlink and a partial prior run can leave the
+  # file present but empty, either of which would otherwise skip the prompt and
+  # leave signing unregistered.
+  local cfg_local="$HOME/.config/git/config.local" configured_email=""
+  [ -f "$cfg_local" ] && configured_email="$(git config -f "$cfg_local" --get user.email 2>/dev/null || true)"
+  if [ -n "$configured_email" ]; then
+    email="$configured_email"
+    log "git email already configured ($email); leaving config.local as-is"
+  else
+    email="$(prompt_email)"
+    if [ -n "$email" ]; then "$DOTCTL" gitconfig -email "$email" || rc=1
+    else log "no email provided; skipping gitconfig (set DOTCTL_EMAIL or run interactively)"; fi
+  fi
   setup_ssh_key "$email" || rc=1
   set_default_shell || rc=1
   "$DOTCTL" verify || rc=1
