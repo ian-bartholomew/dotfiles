@@ -119,6 +119,9 @@ behavior, not an error.
   Step 9 daily-note Follow-ups for the next interactive session.
 - **Step 7 (compile):** run non-interactively. (If the compile sub-skill exposes
   any prompt, take its default.)
+- **Step 8.7 (alert-noise weekly):** local writes (report notes + a log line) are
+  allowed unattended. Run non-interactively and catch-up; skip the skill's
+  wiki-synthesis step. `pending` returning nothing is `nothing-to-do`, not a failure.
 - **Step 9 (daily-note synthesis):** auto-approve and write the drafted section.
   The upsert and `grep -c '<!-- eod:begin'` post-write check are unchanged. If
   the check returns `0` or `>1`, do NOT proceed silently: record a failure
@@ -188,6 +191,10 @@ Step 8: Verify-Status                 Run /verify-status read-only snapshot — 
 
 Step 8.5: Work-board drift report     Run /work-board --dry-run --stale-days 7 — surface pending
                                       moves, manual overrides, orphans, stale + sectionless cards
+
+Step 8.7: Alert-Noise Weekly          Generate #fes-platform-alerts noise report(s) for any completed
+                                      week that lacks one (alert-noise-report, self-gating catch-up;
+                                      writes local report notes only)
 
 Step 9: Daily-Note Synthesis          Draft today's EOD section into the daily note:
                                       accomplishments, decisions, follow-ups, tomorrow,
@@ -503,6 +510,36 @@ Next Up / In Progress with no Todoist activity in 7 days - ask whether each is s
 and any sectionless cards in the Work project
 (`td task list --project "Work" --json` entries with null sectionId) as filing candidates.
 
+### Step 8.7: Alert-Noise Weekly (catch-up)
+
+Generate the weekly #fes-platform-alerts noise report when a new week has closed.
+Self-gating and cheap on days with nothing to do.
+
+Invoke the `alert-noise-report` skill (catch-up is its default). It runs its
+`pending` check first: on most days that returns nothing and this step is
+`nothing-to-do`. When one or more completed Thursday-weeks lack a note, it fetches
+those windows (with a 24h overlap margin so no boundary events are clipped),
+writes one dated report note per week to `output/reports/alert-noise/`, and
+appends a `wiki/_log.md` line. Do NOT run the skill's wiki-synthesis step here
+(chronic-offenders curation is left for standalone interactive runs); the Obsidian
+Base renders the trend from the notes automatically.
+
+```
+Skill: alert-noise-report
+Args: (none - catch-up default; generate pending week notes only, skip wiki synthesis)
+```
+
+Slack MCP is already verified in Step 0. This writes local files only (report
+notes + a log line), so it is safe unattended.
+
+Track: weeks generated (with event / trigger counts) or `nothing-to-do`.
+
+Record status:
+
+- `ok` - one or more week notes written
+- `nothing-to-do` - no completed week was missing a note
+- `failed` - see Error Handling
+
 ### Step 9: Daily-Note Synthesis
 
 Draft today's end-of-day section into the daily note. Interactive: present the draft for approve / edit / skip before writing.
@@ -660,6 +697,9 @@ End-of-Day Complete
     NEXT: merge PR #1842 (approved, clean, mine)
     Drift findings: 1 (load-testing-environment/log.md stale-pr)
 
+  Step 8.7 - Alert-Noise Weekly:
+    Weeks generated: 1 (2026-07-09: 62 events, 40 triggers)  [or: nothing-to-do]
+
   Step 9 — Daily-Note Synthesis:
     Daily note: <output of obsidian daily:path>
     Sections written: standard + Friday weekly retro
@@ -681,6 +721,7 @@ Then append an end-of-day block to `wiki/_log.md`:
 - Project-log gate: 4 audited, 2 missing entries, 2 created
 - Compile: 4 created, 2 updated, 7 new connections
 - Verify-status: NEXT: merge PR #1842; 1 drift finding
+- Alert-noise weekly: 1 week generated (2026-07-09) [or nothing-to-do]
 - Daily-note synthesis: standard + Friday weekly retro (approved)
 - Step failures: none
 ```
@@ -754,6 +795,7 @@ If a background subagent was still running when the interrupt happened, mark it 
 - **/lyt-assistant:internal-channel-learnings** — Internal channel → `raw/internal_learnings/` (Step 4)
 - **/lyt-assistant:meeting-action-items** — Interactive review of meeting action items into Todoist (Step 5)
 - **/lyt-assistant:compile** — Full compilation pipeline (Step 6; itself chains `/lyt-assistant:ingest` → `/lyt-assistant:lint` → `/lyt-assistant:discover-links`)
+- **/alert-noise-report** - #fes-platform-alerts weekly noise report; self-gating catch-up (Step 8.7)
 - **/start-of-day** — Morning counterpart; lists today + overdue Todoist tasks with an inline edit loop (user-private skill at `~/.claude/skills/start-of-day/`)
 
 ## Summary
