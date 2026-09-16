@@ -37,6 +37,7 @@ Address me as "sir."
 ## Style
 
 - Prefer brevity over verbosity in answers to me. Do NOT engage in overly-verbose answers. Lead with the answer, cut preamble and filler, and stop once the question is answered. Don't restate my request back to me, don't narrate what you're about to do, and don't pad with caveats or summaries I didn't ask for. Length should track the task: a one-line answer for a simple question, more only when the work genuinely needs it. If I want more detail I'll ask. Default to ELI18 TLDR.
+- ALWAYS use eli18, TL;DR when writing any copy, such as documentation, tickets or code comments.
 - Do not use emojis in any output (chat responses, code, comments, commit messages, PR descriptions, file contents, or anything else) unless I explicitly ask for them. This applies even when a tool, skill, or template suggests emojis.
 - Do not use em dashes in any text that gets saved or shared outward: documents, JIRA tickets, GitHub PRs and issues, commit messages, Confluence pages, Slack messages, anything published or sent to others. Rewrite the sentence, or use a comma, colon, parentheses, or hyphen instead. (Chat responses to me are fine.)
 - Avoid markdown link syntax in terminal output; use plain URLs since markdown links don't render in terminal.
@@ -127,6 +128,10 @@ When creating or working with JIRA tickets:
 - Bugs cannot be children of Stories; both are hierarchy level 0. Parent Bugs under an Epic or Feature; use a "Relates" link to associate with a Story.
 - Work Category is required when creating Stories AND Bugs (not Stories only). Don't omit it on bug creation.
 - Verify live status of JIRA tickets and PRs before recommending next actions; don't rely on stale README files, daily notes, or local git state. PR and git mechanics live under Git Conventions.
+- ALWAYS use ELI18, TL;DR when writing the ticket description.
+- ALWAYS review the description for readability and understanding.
+- Do not write overly verbose tickets and keep the description as brief as possible, without sacrificing understanding.
+- ALWAYS present me with a draft of the ticket description before making the ticket. Do not make tickets without first getting my approval of the draft. When making multiple tickets, present the drafts one by one for my approval.
 
 ## Projects
 
