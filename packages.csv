@@ -38,6 +38,7 @@ shell |  | CASK:ghostty | ghostty | - |
 dev | yes | git | git | git |
 dev | yes | tig | tig | tig |
 dev | yes | gh | github-cli | gh | GitHub CLI
+dev |  | mergiraf | mergiraf | - | syntax-aware merge driver; not in apt (cargo install mergiraf)
 dev |  | difftastic | difftastic | - | not in apt
 dev |  | colordiff | colordiff | colordiff |
 dev |  | dwdiff | AUR:dwdiff | dwdiff |
