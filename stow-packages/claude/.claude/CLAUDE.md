@@ -37,11 +37,12 @@ Address me as "sir."
 ## Style
 
 - Prefer brevity over verbosity in answers to me. Do NOT engage in overly-verbose answers. Lead with the answer, cut preamble and filler, and stop once the question is answered. Don't restate my request back to me, don't narrate what you're about to do, and don't pad with caveats or summaries I didn't ask for. Length should track the task: a one-line answer for a simple question, more only when the work genuinely needs it. If I want more detail I'll ask. Default to ELI18 TLDR.
-- ALWAYS use eli18, TL;DR when writing any copy, such as documentation, tickets or code comments.
+- ALWAYS use ELI18 wording when writing any copy, such as documentation, tickets or code comments. Lead with the point, but don't add a "TL;DR" label unless I ask for one.
 - Do not use emojis in any output (chat responses, code, comments, commit messages, PR descriptions, file contents, or anything else) unless I explicitly ask for them. This applies even when a tool, skill, or template suggests emojis.
 - Do not use em dashes in any text that gets saved or shared outward: documents, JIRA tickets, GitHub PRs and issues, commit messages, Confluence pages, Slack messages, anything published or sent to others. Rewrite the sentence, or use a comma, colon, parentheses, or hyphen instead. (Chat responses to me are fine.)
 - Avoid markdown link syntax in terminal output; use plain URLs since markdown links don't render in terminal.
 - Be succinct in PR descriptions, commit messages, and code comments. State what / why / when-to-remove in the fewest lines that still answer those questions. Don't restate the diff in prose, don't pad with context the reader can find in the ticket or git history, and don't over-explain. If the explanation is long, put the long version in the PR description and keep the code comment to the load-bearing summary.
+- Write Confluence comments, PR descriptions and Jira replies as plain prose paragraphs, not bullet lists, unless I ask for bullets. Keep PR descriptions short and simple.
 - Comment code very sparingly. The code should be obvious to the reader on its own; well-named identifiers and clear structure are the default, not comments. Only add a comment when the logic is genuinely confusing, non-obvious, or counterintuitive (a workaround, a constraint that isn't visible locally, a subtle ordering dependency, a deliberate deviation from the obvious approach). If you feel the need to comment because the code is hard to follow, prefer making the code clearer first. Do not comment to narrate what obvious code already says.
 - Never reference a task or step from a plan or spec in code, comments, or commit messages (e.g. "Task 0 decision", "per step 3 of the plan"). Plans and specs are not a durable shared resource the reader will have. Ticket IDs (e.g. FANDEVX-1234) are fine because they are durable and shared; plan-internal task/step numbers are not. State the actual reason inline instead of pointing at the plan.
 - Use contractions. "It's," "don't," "won't."
@@ -127,8 +128,9 @@ When creating or working with JIRA tickets:
 - Always use the `/start-ticket` skill when starting work on a JIRA ticket: it fetches ticket details, creates the worktree on a properly named branch, and produces an initial plan.
 - Bugs cannot be children of Stories; both are hierarchy level 0. Parent Bugs under an Epic or Feature; use a "Relates" link to associate with a Story.
 - Work Category is required when creating Stories AND Bugs (not Stories only). Don't omit it on bug creation.
+- When setting a Jira assignee, use the user's display name (or an accountId looked up first). A bare email or username has failed silently. After every `editJiraIssue` call, re-fetch the issue to confirm the change applied.
 - Verify live status of JIRA tickets and PRs before recommending next actions; don't rely on stale README files, daily notes, or local git state. PR and git mechanics live under Git Conventions.
-- ALWAYS use ELI18, TL;DR when writing the ticket description.
+- ALWAYS use ELI18 wording when writing the ticket description. No "TL;DR" label unless I ask for one.
 - ALWAYS review the description for readability and understanding.
 - Do not write overly verbose tickets and keep the description as brief as possible, without sacrificing understanding.
 - ALWAYS present me with a draft of the ticket description before making the ticket. Do not make tickets without first getting my approval of the draft. When making multiple tickets, present the drafts one by one for my approval.
@@ -137,6 +139,16 @@ When creating or working with JIRA tickets:
 ## Projects
 
 When working on anything tied to a project under `~/Documents/Work/projects/<project>/`, always append an entry to that project's `log.md` capturing what was done, decisions made, and any follow-ups. Update `log.md` as work progresses, not just at the end of the session.
+
+## Shell Scripts
+
+- Run shellcheck at full severity (`shellcheck -S style`), not just warnings.
+- Test stubs must write to stderr or a file, never to stdout that gets redirected to `/dev/null`.
+
+## Tooling
+
+- The shell guard has blocked the `td` CLI. For one-off Todoist actions (closing or updating cards), use the Todoist MCP tools (`mcp__todoist__*`) instead.
+- When I ask "what should I work on next", list every unblocked, unassigned To Do story from Jira (plus the project's `timeline.md`, if it has one), not a single recommendation.
 
 ## AWS Guidance
 
@@ -152,6 +164,8 @@ When working on anything tied to a project under `~/Documents/Work/projects/<pro
 ## Terraform Risk Assessment
 
 Always run `fes-terraform-plan-risk` and show me the verdict before you either (a) present a Terraform plan or change to me, or (b) ask me to approve or dispatch a Terraform GitHub Actions workflow (plan run, apply job, deployment-environment approval). No exceptions for "simple" diffs: plan output is the source of truth, not the file diff, and a destroy-and-recreate only shows up in the plan. If the plan isn't available yet, say so and wait for it rather than asking me to approve something unassessed.
+
+Before flagging any change in the plan as risky (a destroy, replace, IAM or `aws_auth` change, a missing role, a networking change), confirm it against live cluster or AWS state with read-only commands (`aws ... describe/get/list`, `kubectl get`), using the right `--profile` for the target account. Label every finding `verified` (quote the command and what it showed) or `unverified` (say why it couldn't be checked). A plan diff on its own is not proof of an outage risk.
 
 ## Verification
 

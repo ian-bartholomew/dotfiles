@@ -1,0 +1,2 @@
+# Used only when a repo has no .yamllint of its own.
+extends: relaxed
