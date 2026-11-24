@@ -56,6 +56,7 @@ if [[ ! -s "$HOME/.zgen/init.zsh" ]]; then
   # Essential plugins
   zgen oh-my-zsh
   zgen oh-my-zsh plugins/git
+  zgen oh-my-zsh plugins/aws
   zgen load chrissicool/zsh-256color
   zgen load spaceship-prompt/spaceship-prompt spaceship
   zgen load zsh-users/zsh-history-substring-search

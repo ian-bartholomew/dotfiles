@@ -16,9 +16,7 @@ You are starting work on JIRA ticket `$ARGUMENTS.ticket`. Follow these steps in 
 Use the Atlassian MCP tools to fetch the ticket details:
 
 - Get the issue summary, description, acceptance criteria, and status
-- If the ticket is a sub-task, also fetch the parent story for context
-- If the ticket is a story, also fetch the parent epic for context
-- Note any linked/blocking tickets
+- Note the parent key and any linked/blocking ticket keys, and warn the user about unresolved blockers. Don't read them in full here; the ticket agent in Step 3 does that
 - If the ticket has subtasks, prompt the user if they want to work on one task in particular.
   - If the user does want to work on one ticket in particular, focus the current work on that ticket.
     - Use the Ticket Workflow outlined in this skill to work on the ticket (assign the ticket to the user, worktree, plan, etc)
@@ -44,15 +42,26 @@ Create an isolated git worktree for this work:
 
 ## Step 3: Plan the work
 
-Once in the worktree:
+Once in the worktree, gather context with three agents dispatched in parallel (one message, three Agent calls). Brief each one with the ticket key, summary, description and AC from Step 1, and the worktree path. Each returns a short findings summary with file paths, ticket keys or page URLs as citations, not raw dumps:
 
-- Use the `mattpocock-skills:grill-with-docs` skill to create an plan
+1. Ticket agent (`general-purpose`): read the parent (story or epic), every linked and blocking issue, and the ticket's comments. Report the status of each blocker, scope or AC set by the parent, and decisions or constraints recorded in comments.
+2. Docs agent (`general-purpose`): read the matching project folder under `~/Documents/Work/projects/` (README, log.md, decisions.md, epics or timeline docs), the wiki (start at `~/Documents/Work/wiki/_index.md`), and any Confluence pages the ticket links. Report prior decisions, conventions and gotchas that bear on the ticket.
+3. Code agent (`Explore`, "very thorough"): search the worktree for the code, modules and config the ticket touches. Report the files likely to change, existing patterns to follow, and anything that conflicts with the ticket's approach.
+
+When all three return, combine their findings into round 1 of the plan: write `plans/<TICKET>.md` (see below), flag where the agents disagree, and turn the gaps into the round 1 questions. If an agent fails or comes back empty, say so in the plan file rather than planning around the gap silently.
+
+- Use the `mattpocock-skills:grilling` skill, then `mattpocock-skills:domain-modeling`, to create a plan (these are what `grill-with-docs` wraps; `grill-with-docs` itself is user-invoke-only)
 - Any docs from that session should be saved to the project folder, if one exists. If one doesn't exist, ask the user if they would like to make one, using the `lyt-assistant:create-project` skill. Otherwise ask them where they would like to save the created docs.
-- Feed the JIRA ticket details (summary, description, AC, parent context) into the brainstorm
+- Feed the combined agent findings and the ticket details into the grilling session
 - The plan should identify:
   - What files need to be created or modified
   - What the implementation approach is
   - How to verify the work is complete (based on AC)
+- Keep a running plan file at `plans/<TICKET>.md` in the worktree (e.g. `plans/FANDEVX-4290.md`) so a session can end mid-planning and the next one picks up from it:
+  - Before the first grilling round, keep the file out of git: `echo 'plans/' >> "$(git rev-parse --git-common-dir)/info/exclude"` (skip if the line is already there). This is a local ignore, so the plan never gets staged into a PR.
+  - Before asking each round of planning questions, write or update the file with three sections: `## Acceptance Criteria` (current wording, including any rewrite the user approved), `## Decisions` (what was settled and why), `## Open Questions` (the questions about to be asked).
+  - After the user answers, move answered questions into Decisions, then update the file again before the next round.
+  - If `plans/<TICKET>.md` already exists when this skill starts, read it first, re-fetch the ticket for changes, and resume from its Open Questions instead of starting over.
 - Use `adversarial-review` skill to validate the plan
   - If the review comes back with feedback, integrate it and run a review again
   - Do a maximum of 2 review rounds
@@ -64,7 +73,8 @@ Once in the worktree:
 
 ## Important Notes
 
-- Always use `mattpock-skils:grill-with-docs` to plan the work
+- Always use `mattpocock-skills:grilling` + `mattpocock-skills:domain-modeling` to plan the work
+- Always update `plans/<TICKET>.md` before asking a round of planning questions
 - Always do a code review before making a PR
 - If the ticket is already "In Progress", warn the user that work may already be underway
 - If the ticket has blockers that aren't resolved, warn the user

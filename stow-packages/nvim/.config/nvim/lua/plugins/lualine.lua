@@ -5,6 +5,9 @@ return {
 			options = {
 				theme = "gruvbox-material",
 			},
+			sections = {
+				lualine_z = { "%l/%L:%c" },
+			},
 		})
 	end,
 }
